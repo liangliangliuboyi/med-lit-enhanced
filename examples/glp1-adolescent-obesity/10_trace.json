@@ -1,13 +1,19 @@
 {
   "constraints": "人群为青少年或年轻人；2015 年后",
   "timings": {
-    "plan": 37.0,
-    "read": 33.3,
-    "cross_check": 458.8,
-    "critique": 107.1,
-    "write": 53.2,
-    "write_rewrite": 51.3,
-    "verify_claims": 76.1
+    "plan": 24.1,
+    "search": 3.6,
+    "expand_queries": 0.0,
+    "expand_links": 2.3,
+    "expand_snowball": 0.0,
+    "filter": 0.0,
+    "rerank": 1.8,
+    "read": 149.8,
+    "cross_check": 9.2,
+    "critique": 117.4,
+    "write": 90.6,
+    "write_rewrite": 90.2,
+    "verify_claims": 17.4
   },
   "models": {
     "planner": "deepseek-ai/DeepSeek-V3.2",
@@ -17,42 +23,42 @@
   },
   "errors": [],
   "counts": {
-    "papers": 35,
+    "papers": 32,
     "evidence": 5
   },
   "tokens": {
-    "planner": 1344,
-    "reader": 27218,
-    "critic": 6205,
-    "writer": 8421
+    "planner": 1286,
+    "reader": 14622,
+    "critic": 6292,
+    "writer": 9424
   },
   "cost_estimate": {
-    "total_tokens": 43188,
-    "priced_tokens": 43188,
+    "total_tokens": 31624,
+    "priced_tokens": 31624,
     "unpriced_models": [],
-    "estimated_cny": 0.0988,
+    "estimated_cny": 0.0758,
     "breakdown": {
       "planner": {
-        "tokens": 1344,
-        "cny": 0.0027,
+        "tokens": 1286,
+        "cny": 0.0026,
         "priced": true,
         "model": "deepseek-ai/DeepSeek-V3.2"
       },
       "reader": {
-        "tokens": 27218,
-        "cny": 0.0544,
+        "tokens": 14622,
+        "cny": 0.0292,
         "priced": true,
         "model": "deepseek-ai/DeepSeek-V3.2"
       },
       "critic": {
-        "tokens": 6205,
-        "cny": 0.0248,
+        "tokens": 6292,
+        "cny": 0.0252,
         "priced": true,
         "model": "deepseek-ai/DeepSeek-R1"
       },
       "writer": {
-        "tokens": 8421,
-        "cny": 0.0168,
+        "tokens": 9424,
+        "cny": 0.0188,
         "priced": true,
         "model": "deepseek-ai/DeepSeek-V3.2"
       }
@@ -68,9 +74,10 @@
     "used": []
   },
   "quick_mode": false,
+  "stages": "full",
   "relevance_cross_check": {
     "changed": 1,
-    "avg_delta": 0.4,
+    "avg_delta": 0.2,
     "divergent": 0,
     "failed": 0,
     "adopted": 1
@@ -82,11 +89,11 @@
     "section_citation_counts": {
       "一句话结论": 1,
       "证据概况": 1,
-      "核心发现": 3,
+      "核心发现": 4,
       "证据冲突与不确定性": 1,
       "证据空隙": 0,
       "检索覆盖说明": 0,
-      "适用边界": 1,
+      "适用边界": 0,
       "对你的具体启示": 0
     }
   },
@@ -97,21 +104,21 @@
     "section_citation_counts": {
       "一句话结论": 1,
       "证据概况": 1,
-      "核心发现": 3,
+      "核心发现": 4,
       "证据冲突与不确定性": 1,
       "证据空隙": 0,
       "检索覆盖说明": 0,
-      "适用边界": 1,
+      "适用边界": 0,
       "对你的具体启示": 0
     }
   },
   "claim_verification": {
     "checked": 12,
-    "total_claims": 15,
+    "total_claims": 14,
     "supported": [
       {
-        "index": 5,
-        "text": "一项针对司美格鲁肽的RCT显示，治疗68周后，司美格鲁肽组BMI较基线平均下降16.1%，而安慰剂组上升0.6%，估计差异为-16.7个百分点",
+        "index": 1,
+        "text": "一项为期68周的随机对照试验（RCT）显示，司美格鲁肽（semaglutide）可使BMI较基线降低16.1%，而安慰剂组为0.6%（估计差异 -16.7个百分点）",
         "citations": [
           {
             "type": "pmid",
@@ -119,47 +126,39 @@
           }
         ],
         "verdict": "支持",
-        "reason": "文献1关键结果直接报告司美格鲁肽组BMI下降16.1%，安慰剂组上升0.6%，差异-16.7个百分点。"
+        "reason": "文献关键结果直接报告了司美格鲁肽组BMI较基线降低16.1%，安慰剂组0.6%，差异-16.7个百分点。"
+      },
+      {
+        "index": 2,
+        "text": "系统综述也证实了其减重和降糖效果，但效应量大小存在差异",
+        "citations": [
+          {
+            "type": "pmid",
+            "value": "40269110"
+          },
+          {
+            "type": "pmid",
+            "value": "40952752"
+          }
+        ],
+        "verdict": "支持",
+        "reason": "两篇系统综述均报告GLP-1RA在儿童青少年中降低体重和血糖（HbA1c/空腹血糖），但效应量数值不同。"
+      },
+      {
+        "index": 5,
+        "text": "一项为期68周的RCT（STEP TEENS）显示，与安慰剂相比，每周一次皮下注射司美格鲁肽（2.4 mg）使BMI从基线至第68周的平均百分比变化差异达到-16.7个百分点（95% CI：-20.3 至 -13.2）",
+        "citations": [
+          {
+            "type": "pmid",
+            "value": "36322838"
+          }
+        ],
+        "verdict": "支持",
+        "reason": "关键结果直接报告BMI百分比变化差异为-16.7个百分点（95%CI -20.3至-13.2）。"
       },
       {
         "index": 6,
-        "text": "另一项针对利拉鲁肽的RCT显示，治疗56周后，利拉鲁肽组BMI平均百分比变化为-5.8%，安慰剂组为1.6%，估计差异为-7.4个百分点",
-        "citations": [
-          {
-            "type": "pmid",
-            "value": "39258838"
-          }
-        ],
-        "verdict": "支持",
-        "reason": "文献1关键结果直接报告了论断中的BMI百分比变化数值与估计差异。"
-      },
-      {
-        "index": 9,
-        "text": "利拉鲁肽的RCT也报告了类似的不良事件模式",
-        "citations": [
-          {
-            "type": "pmid",
-            "value": "39258838"
-          }
-        ],
-        "verdict": "支持",
-        "reason": "文献1关键结果报告利拉鲁肽组胃肠道不良事件更常见（80% vs. 54%），支持不良事件模式类似。"
-      },
-      {
-        "index": 10,
-        "text": "一篇系统综述指出，这些药物在青少年人群中有特定的安全性考虑",
-        "citations": [
-          {
-            "type": "pmid",
-            "value": "40716192"
-          }
-        ],
-        "verdict": "支持",
-        "reason": "文献1标题和关键结果均明确指出这些药物在青少年人群中有特定的安全性考虑。"
-      },
-      {
-        "index": 12,
-        "text": "另一篇系统综述也报告了腰围的显著减少（SMD -0.40）",
+        "text": "95% CI：-0.89 至 -0.44）",
         "citations": [
           {
             "type": "pmid",
@@ -167,41 +166,97 @@
           }
         ],
         "verdict": "支持",
-        "reason": "文献关键结果直接报告腰围SMD -0.40，与论断一致。"
+        "reason": "文献1关键结果中体重SMD的95% CI为-0.89至-0.44，与论断完全一致。"
+      },
+      {
+        "index": 8,
+        "text": "STEP TEENS试验中，司美格鲁肽组胃肠道不良事件发生率（62%）高于安慰剂组（42%）",
+        "citations": [
+          {
+            "type": "pmid",
+            "value": "36322838"
+          }
+        ],
+        "verdict": "支持",
+        "reason": "文献1关键结果明确报告司美格鲁肽组胃肠道不良事件发生率62%高于安慰剂组42%。"
+      },
+      {
+        "index": 9,
+        "text": "该试验还报告了司美格鲁肽组胆石症发生率为4%，而安慰剂组为0%",
+        "citations": [
+          {
+            "type": "pmid",
+            "value": "36322838"
+          }
+        ],
+        "verdict": "支持",
+        "reason": "文献1关键结果明确报告司美格鲁肽组胆石症发生率4%（5/131），安慰剂组0%。"
+      },
+      {
+        "index": 10,
+        "text": "另一篇综述指出，每种年龄组都有特定的安全性考虑",
+        "citations": [
+          {
+            "type": "pmid",
+            "value": "40716192"
+          }
+        ],
+        "verdict": "支持",
+        "reason": "文献1关键结果明确写道'每种年龄组都有特定的安全性考虑'。"
+      },
+      {
+        "index": 11,
+        "text": "关于自杀意念，现有证据有限，一项系统综述报告了组间无显著差异，但置信区间较宽",
+        "citations": [
+          {
+            "type": "pmid",
+            "value": "40952752"
+          }
+        ],
+        "verdict": "支持",
+        "reason": "文献1关键结果报告自杀意念组间无显著差异，与论断一致。"
+      },
+      {
+        "index": 12,
+        "text": "一篇2025年的综述性文章（非系统综述或RCT）指出，GLP-1 RAs因其在体重管理方面的有效性和改善肥胖相关疾病的能力而备受关注，可以作为儿科患者综合治疗计划的一部分",
+        "citations": [
+          {
+            "type": "pmid",
+            "value": "40031990"
+          }
+        ],
+        "verdict": "支持",
+        "reason": "文献1标题与关键结果均直接支持论断内容。"
       }
     ],
     "unsupported": [
       {
         "index": 3,
-        "text": "本轮检索最终纳入5篇直接相关文献，包括2项随机对照试验（RCT）和3篇系统综述，发表年份为2019年至2026年",
+        "text": "本轮检索最终纳入5篇文献，包括1项RCT 和3项系统综述 ，发表年份为2022年至2025年",
         "citations": [
           {
             "type": "pmid",
             "value": "36322838"
-          },
-          {
-            "type": "pmid",
-            "value": "39258838"
-          },
-          {
-            "type": "pmid",
-            "value": "40269110"
-          },
-          {
-            "type": "pmid",
-            "value": "40952752"
           },
           {
             "type": "pmid",
             "value": "40716192"
+          },
+          {
+            "type": "pmid",
+            "value": "40269110"
+          },
+          {
+            "type": "pmid",
+            "value": "40952752"
           }
         ],
         "verdict": "不支持",
-        "reason": "文献发表年份（2022-2025）与论断年份（2019-2026）不完全匹配。"
+        "reason": "论断称纳入5篇文献，但信息卡仅提供4篇文献，数量不符。"
       },
       {
         "index": 4,
-        "text": "对5项研究进行合并分析，显示标准化均数差（SMD）为-0.32（95% CI，-0.64至0.002），但异质性极高（I²=92.7%），提示效应量在不同研究间存在显著差异",
+        "text": "一项针对5项研究的荟萃分析合并效应量显示，标准化均数差（SMD）为-0.32（95% CI：-0.64 至 0.00），但异质性极高（I² = 92.7%）",
         "citations": [
           {
             "type": "pmid",
@@ -213,85 +268,31 @@
           }
         ],
         "verdict": "不支持",
-        "reason": "文献1和2的SMD数值与论断的SMD -0.32不符，且未提及5项研究合并分析及I²=92.7%。"
-      }
-    ],
-    "partial": [
-      {
-        "index": 1,
-        "text": "在12-18岁肥胖青少年中，GLP-1受体激动剂（如司美格鲁肽、利拉鲁肽）能有效降低体重和BMI，但效应量在不同药物间差异较大，且胃肠道不良事件风险增加",
-        "citations": [
-          {
-            "type": "pmid",
-            "value": "36322838"
-          },
-          {
-            "type": "pmid",
-            "value": "39258838"
-          }
-        ],
-        "verdict": "部分支持",
-        "reason": "文献1支持司美格鲁肽降低BMI和增加胃肠道风险，文献2人群为6-12岁儿童，与论断的12-18岁青少年不完全匹配。"
+        "reason": "文献1和2均未报告论断中SMD -0.32 (95% CI: -0.64 to 0.00)且I²=92.7%的结果。"
       },
       {
         "index": 7,
-        "text": "一篇系统综述汇总多项研究，报告GLP-1受体激动剂平均降低体重3.02 kg",
+        "text": "95% CI：-4.39 至 -1.65）",
         "citations": [
           {
             "type": "pmid",
             "value": "40952752"
           }
         ],
-        "verdict": "部分支持",
-        "reason": "文献1报告体重降低3.02 kg，但人群为儿童和青少年，论断未限定人群。"
-      },
-      {
-        "index": 8,
-        "text": "在司美格鲁肽的RCT中，恶心、呕吐和腹泻的发生率在司美格鲁肽组分别为62%、46%和36%，显著高于安慰剂组（分别为42%、20%和18%）",
-        "citations": [
-          {
-            "type": "pmid",
-            "value": "36322838"
-          }
-        ],
-        "verdict": "部分支持",
-        "reason": "文献1关键结果仅报告司美格鲁肽组胃肠道不良事件总发生率62% vs 安慰剂组42%，未细分恶心、呕吐、腹泻的具体数据。"
-      },
-      {
-        "index": 11,
-        "text": "一篇系统综述显示，GLP-1受体激动剂能显著降低糖化血红蛋白（-0.44%）、空腹血糖（-9.92 mg/dL）和腰围（-3.02 cm）",
-        "citations": [
-          {
-            "type": "pmid",
-            "value": "40952752"
-          }
-        ],
-        "verdict": "部分支持",
-        "reason": "文献支持HbA1c(-0.44%)和空腹血糖(-9.92 mg/dL)，但腰围(-3.02 cm)与文献报告的体重(-3.02 kg)不符。"
+        "verdict": "不支持",
+        "reason": "论断的置信区间与文献中体重、BMI等任何结局的置信区间均不匹配。"
       }
     ],
-    "uncertain": [
-      {
-        "index": 2,
-        "text": "证据确定性为中等，主要受效应量异质性和部分研究不精确性的影响",
-        "citations": [
-          {
-            "type": "pmid",
-            "value": "40269110"
-          }
-        ],
-        "verdict": "无法判断",
-        "reason": "文献摘要未报告证据确定性评估或异质性、不精确性信息。"
-      }
-    ],
+    "partial": [],
+    "uncertain": [],
     "failed": [],
-    "summary": "共 15 条带引用论断，实际核验 12 条：支持 5 条、不支持 2 条、部分支持 4 条、无法判断或无法核对 1 条、核对失败 0 条，另有 3 条因超过核验上限未核验。",
+    "summary": "共 14 条带引用论断，实际核验 12 条：支持 9 条、不支持 3 条、部分支持 0 条、无法判断或无法核对 0 条、核对失败 0 条，另有 2 条因超过核验上限未核验。",
     "note": "本结果由模型辅助产出，用于提示「引用」与「文献内容」可能对不上，不构成人工审阅，也不评价研究质量。"
   },
   "prisma": {
-    "identified": 3276,
-    "deduplicated": 35,
-    "screened": 35,
+    "identified": 594,
+    "deduplicated": 32,
+    "screened": 32,
     "excluded_screening": 0,
     "fulltext_assessed": 5,
     "included": 5,
@@ -305,7 +306,7 @@
     "cited_count": 5,
     "cited_pmid_count": 5,
     "cited_doi_count": 0,
-    "pool_size": 35,
+    "pool_size": 32,
     "doi_pool_size": 0,
     "orphan_pmids": [],
     "orphan_dois": [],
@@ -320,8 +321,8 @@
       "RCT",
       "系统综述",
       "系统综述",
-      "RCT",
-      "系统综述"
+      "系统综述",
+      "其他"
     ],
     "downgrades": [
       "不一致性：SMD 异质性 I²=93%（>50%，存在实质不一致）",
@@ -336,5 +337,5 @@
     "reason": "研究设计起始等级：高；降级因素 2 项（不一致性：SMD 异质性 I²=93%（>50%，存在实质不一致）；不精确性：SMD 置信区间很宽且跨越无效线）；升级因素 1 项（SMD 效应量大（-0.32）） → 中。5 篇证据，发表偏倚需人工用漏斗图/小样本效应量另行评估（程序未据此降级）",
     "note": "程序侧机械定级，供审查环节复核"
   },
-  "elapsed_total": 825.8
+  "elapsed_total": 426.7
 }
