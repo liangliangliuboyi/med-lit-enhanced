@@ -12,6 +12,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import datetime
 
 import config as cfgmod
@@ -188,6 +189,7 @@ class Run:
         self._log_lines: list[str] = []
         self._ft_lock = threading.Lock()
         self._ft_claimed = 0
+        self._token_lock = threading.Lock()
         self.cache = None
         self.cache_stats = None
         self._checkpoint: dict = {}
@@ -223,29 +225,45 @@ class Run:
         self.log(f'!! {stage} 出错：{e}')
 
     def _track_tokens(self, role: str, res: dict):
-        """D3：记录每角色 token 用量与估算费用。"""
-        n = res.get('tokens')
-        if n:
-            self.trace['tokens'][role] = self.trace['tokens'].get(role, 0) + int(n)
-        if pricingmod:
-            # N9：按模型分档计价，不同模型价格差很多
-            table = (self.cfg.get('runtime') or {}).get('price_table')
-            usage = dict(self.trace['tokens'])
-            role_models = dict(self.trace.get('models') or {})
-            try:
-                self.trace['cost_estimate'] = pricingmod.estimate_cost(
-                    usage, table, role_models)
-            except Exception:  # noqa: BLE001
-                self.trace['cost_estimate'] = {}
-            return
-        price = (self.cfg.get('runtime') or {}).get('price_per_million_tokens')
-        if price and self.trace['tokens']:
-            total = sum(self.trace['tokens'].values())
-            self.trace['cost_estimate'] = {
-                'total_tokens': total,
-                'estimated_cny': round(total / 1_000_000 * price, 4),
-                'price_per_million_tokens': price,
-            }
+        """D3：记录每角色 token 用量与估算费用。
+
+        精读阶段是多线程并发的，所以计数与计价都要加锁——
+        不加锁可能丢计数，或者算出半成品成本。
+
+        模型名必须在这里统一记录：漏记 reader 会让占 token 大头的精读开销
+        全部算成「无单价」，成本估算直接低估一个量级（实测 76% 的 token
+        因为没记模型名而没被计价）。
+        """
+        # 测试里常用 Run.__new__ 绕过 __init__，那时没有锁
+        lock = getattr(self, '_token_lock', None)
+        ctx = lock if lock is not None else nullcontext()
+        with ctx:
+            model = res.get('model')
+            if model:
+                self.trace['models'][role] = model
+            n = res.get('tokens')
+            if n:
+                self.trace['tokens'][role] = self.trace['tokens'].get(role, 0) + int(n)
+            if pricingmod:
+                # N9：按模型分档计价，不同模型价格差很多
+                table = (self.cfg.get('runtime') or {}).get('price_table')
+                usage = dict(self.trace['tokens'])
+                role_models = dict(self.trace.get('models') or {})
+                try:
+                    self.trace['cost_estimate'] = pricingmod.estimate_cost(
+                        usage, table, role_models)
+                except Exception as e:  # noqa: BLE001
+                    # 计价失败不能静默吞掉——否则用户以为没花钱
+                    self.trace['cost_estimate'] = {'error': str(e)[:200]}
+                return
+            price = (self.cfg.get('runtime') or {}).get('price_per_million_tokens')
+            if price and self.trace['tokens']:
+                total = sum(self.trace['tokens'].values())
+                self.trace['cost_estimate'] = {
+                    'total_tokens': total,
+                    'estimated_cny': round(total / 1_000_000 * price, 4),
+                    'price_per_million_tokens': price,
+                }
 
     # ---------- 断点续跑（D4）----------
     def _ckpt_path(self) -> str:
@@ -833,6 +851,7 @@ class Run:
             return
         self.log(f'   · 相关度交叉验证：{model_a} vs {model_b}')
 
+        t0 = time.time()
         try:
             before = len(self.evidence)
             self.evidence = verifymod.cross_check_relevance(
@@ -863,6 +882,9 @@ class Run:
                      f'{gain.get("divergent", 0)} 篇两模型分歧大')
         except Exception as e:  # noqa: BLE001
             self.err('cross_check', e)
+        finally:
+            # B8 要跑两遍模型，是最贵的一步，耗时必须单独记
+            self.trace['timings']['cross_check'] = round(time.time() - t0, 1)
 
     # ---------- 8. 效应量合并（B4） ----------
     def pool_effects(self):
@@ -1142,6 +1164,10 @@ class Run:
                                         temperature=0.2,
                                         max_tokens=self.cfg['runtime']['max_tokens'] + 2000)
                 self._track_tokens('writer', res2)
+                # 结构重写是独立的一次模型调用，耗时必须单独记，
+                # 否则「一次查询要多久」这个问题无法回答
+                self.trace['timings']['write_rewrite'] = round(
+                    self.trace['timings'].get('write_rewrite', 0) + res2['elapsed'], 1)
                 check2 = self.check_answer_structure(res2['content'])
                 self.trace['answer_structure_retry'] = check2
                 if check2['ok']:
@@ -1219,7 +1245,30 @@ class Run:
             self.trace['errors'].append({'stage': 'citation_check',
                                          'err': '正文中未出现任何 [PMID:xxx] / [DOI:xxx] 引用标记'})
         self.pmid_check = check
+        self._check_retraction_mentioned(cited_pmids)
         return check
+
+    def _check_retraction_mentioned(self, cited_pmids: set[str]):
+        """被引用的撤稿/勘误文献，正文里必须提到这件事。
+
+        writer 的提示词要求它写，但提示词只是建议——没有程序侧校验，
+        就可能出现"正文拿撤稿文献的结论当有效证据"的情况。
+        这里做一道兜底：撤稿文献被引用了、正文却一个字没提，就报警。
+        """
+        flagged = [d for d in (self.evidence or [])
+                   if d.get('_retraction') and d.get('pmid') in cited_pmids]
+        if not flagged:
+            return
+        answer = self.answer or ''
+        # 正文里只要出现过"撤稿/勘误/retract"任一说法，就算已经交代过
+        if any(k in answer for k in ('撤稿', '勘误', 'retract', 'Retract')):
+            self.log(f'   ✓ 已引用 {len(flagged)} 篇撤稿/勘误文献，正文有相应交代')
+            return
+        pids = '、'.join(str(d.get('pmid')) for d in flagged[:6])
+        msg = (f'正文引用了 {len(flagged)} 篇撤稿/勘误文献（PMID {pids}），'
+               f'但正文完全没有提及撤稿这件事——读者会把它当有效证据')
+        self.trace['errors'].append({'stage': 'retraction_check', 'err': msg})
+        self.log(f'!! 撤稿提示缺失：{msg}')
 
     def _verify_claims(self):
         """B5：正文论断与被引文献的语义比对。
@@ -1240,6 +1289,7 @@ class Run:
                 return res
             return self.router.chat(role, messages, temperature, max_tokens)
 
+        t0 = time.time()
         try:
             res = verifymod.verify_claims(self.answer, self.evidence, chat_fn,
                                           max_checks=int(
@@ -1254,6 +1304,9 @@ class Run:
                          f' {item.get("citations", [])}')
         except Exception as e:  # noqa: BLE001
             self.err('verify_claims', e)
+        finally:
+            # B5 也要跑模型，耗时必须单独记
+            self.trace['timings']['verify_claims'] = round(time.time() - t0, 1)
 
     # ---------- 13. 落盘 ----------
     def _w(self, name: str, content: str):
@@ -1345,6 +1398,14 @@ class Run:
     # ---------- 编排 ----------
     def execute(self, quick: bool = False, resume: bool = False):
         ret = self.cfg['retrieval']
+        self.trace['quick_mode'] = bool(quick)
+        if quick:
+            # 快速模式：关掉两项后置校验（B8 交叉验证每篇跑两遍模型、
+            # B5 语义比对最多 12 条论断各跑一遍）。它们是纯成本项，
+            # 不影响检索质量。不关的话「快速」模式的成本并不低。
+            ret['cross_check_relevance'] = False
+            ret['verify_claims'] = False
+            self.log('   · 快速模式：已关闭相关度交叉验证与论断语义比对（省时省钱）')
 
         if resume and self.plan:
             self.log('↻ 断点续跑：跳过规划与检索阶段')

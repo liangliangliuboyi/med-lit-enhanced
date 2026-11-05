@@ -308,17 +308,31 @@ def apply_clinical_query(term: str, cq_query: str) -> str:
 
 
 # ---------- 动物/体外研究排除（A6：官方 MeSH 写法，比自由词 NOT 稳）----------
-ANIMAL_EXCLUSION = 'NOT ("Animals"[MeSH] NOT "Humans"[MeSH])'
+#
+# ⚠️⚠️ 这里曾经写错过一次，代价很大——记下来别再改错。
+#
+# 错误写法：`NOT ("Animals"[MeSH] NOT "Humans"[MeSH])`
+#   PubMed 会**丢弃外层的 NOT**，实际执行成 `AND ("Animals" NOT "Humans")`
+#   ——语义正好反了：只留下"有动物标记、没有 Humans 标记"的**纯动物研究**，
+#   把所有人体研究全滤掉了。
+#   实测（2026-11，semaglutide AND obesity）：
+#     裸检索式                                    3107
+#     AND NOT (Animals NOT Humans)   ← 错误写法   137   （掉了 95.6%）
+#     AND NOT (Animals AND NOT Humans) ← 正确     1876  （只掉 39.6%）
+#
+# 正确写法：NOT (A AND NOT B)  —— 排除"有动物、无人类"的纯动物研究，保留人体研究。
+ANIMAL_EXCLUSION = 'NOT ("Animals"[MeSH] AND NOT "Humans"[MeSH])'
 
 
 def apply_animal_exclusion(term: str, enabled: bool = True) -> str:
     """在检索式里排除纯动物实验（官方 MeSH 写法）。
 
-    ⚠️ 实测（2026-11）：这个过滤器**只降噪、不能完全把关**。
-    同一个检索式，带这个过滤器命中从 473 降到 102，但一篇纯小鼠研究
-    （MeSH 含 Animals、不含 Humans）**仍在结果里**——PubMed 对
-    `NOT (A NOT B)` 这种复合表达式的处理与直觉不同。
-    因此**最终把关必须放在程序侧**：`is_animal_only()` 按抓回来的 MeSH 再判一次。
+    写法必须是 `NOT (A AND NOT B)`，不能写成 `NOT (A NOT B)`——
+    后者会被 PubMed 丢掉外层 NOT，语义反转成"只保留纯动物研究"。
+
+    检索式侧只是**降噪**（少抓一些无用题录），**最终把关在程序侧**：
+    `is_animal_only()` 按抓回来的 MeSH 再判一次，因为只有 efetch 回来的
+    MeSH 才是该文献的真实标注。
     """
     if not enabled:
         return term

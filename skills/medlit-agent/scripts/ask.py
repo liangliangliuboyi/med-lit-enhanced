@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -201,11 +202,20 @@ def cmd_setup():
 def _write_provider_config(key: str, base: str, env_name: str):
     import copy
     src = cfgmod.EXAMPLE_CONFIG
+    # 优先以**已有的 config.local.json** 为基底，只改 provider 段。
+    # 否则会用模板整体覆盖，把使用者在这个文件里改过的其他设置全丢掉。
+    data = {}
     try:
-        with open(src, encoding='utf-8') as f:
+        with open(cfgmod.LOCAL_CONFIG, encoding='utf-8') as f:
             data = json.load(f)
     except Exception:  # noqa: BLE001
         data = {}
+    if not data:
+        try:
+            with open(src, encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            data = {}
     prov = data.setdefault('provider', {})
     prov['name'] = key
     prov['base_url'] = base
@@ -330,6 +340,9 @@ def cmd_compare(cfg, args):
             'grading': run.mech_grading,
             'query': run.plan.get('core_question_en', ''),
             'dir': out_dir,
+            # 表格要在这里就取好：写文件时循环变量 run 指向的是最后一个 arm，
+            # 直接在循环里调 run.evidence_table() 会让所有 arm 的文件内容都是最后一个的
+            'evidence_table': run.evidence_table(),
         })
         print(f'  → 纳入 {len(run.evidence)} 篇，'
               f'GRADE {run.mech_grading.get("certainty", "未评估")}')
@@ -348,14 +361,21 @@ def cmd_compare(cfg, args):
         f.write('## 结论措辞\n\n' + wording + '\n')
     for arm in arms:
         if arm.get('dir'):
-            with open(os.path.join(out_dir, f'evidence_{arm["label"]}.md'),
+            # label 是用户输入的中文干预名，可能带 / \ : * 等非法文件名字符
+            safe = re.sub(r'[\\/:*?"<>|]+', '_', str(arm['label']))[:40] or 'arm'
+            with open(os.path.join(out_dir, f'evidence_{safe}.md'),
                       'w', encoding='utf-8') as f:
-                f.write(run.evidence_table() + '\n')
+                f.write(arm.get('evidence_table', '') + '\n')
     with open(os.path.join(out_dir, 'comparison.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
+    # 对比模式跑的是 N 份完整流程（含各自的交叉验证与语义比对），
+    # 成本与耗时都是单次的数倍——必须告诉使用者，否则容易意外超支
+    n = len(arms)
     print('\n' + '=' * 70)
-    print('对比结果：', out_dir)
+    print(f'对比结果：{out_dir}')
+    print(f'提示：本次共跑了 {n} 份完整检索流程，'
+          f'模型调用与耗时约为单次查询的 {n} 倍。')
     print('=' * 70)
     print(table)
     print('\n结论措辞：\n' + wording)
@@ -488,9 +508,15 @@ def main():
         # N11：快速模式只关掉「第二轮扩写」与两种链接扩展，
         # **保留检索式质量闸门**（max_revisions）——检索式写歪了才是最大的坑，
         # 快速模式同样要能自我修正。
+        #
+        # 另外关掉两项**后置校验**：B8 相关度交叉验证（每篇文献跑两遍模型）
+        # 与 B5 论断语义比对（最多 12 条论断各跑一遍模型）。这两项是纯成本项，
+        # 不影响检索与写作质量，留给完整模式即可。
         cfg['retrieval'].update({'rounds': 1, 'retmax_per_query': 12,
                                  'max_papers': 4, 'fulltext_limit': 2,
-                                 'expand_by_links': False, 'expand_by_references': False})
+                                 'expand_by_links': False, 'expand_by_references': False,
+                                 'cross_check_relevance': False,
+                                 'verify_claims': False})
     if args.max_papers:
         cfg['retrieval']['max_papers'] = args.max_papers
     if args.fulltext_limit is not None:

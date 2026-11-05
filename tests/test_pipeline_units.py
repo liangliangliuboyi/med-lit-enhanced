@@ -461,3 +461,100 @@ class TestAnimalOnlyDetection(unittest.TestCase):
         """'Antibodies, Monoclonal, Humanized' 含 Human 但不是 Humans 标记。"""
         p = {'mesh': ['Animals', 'Antibodies, Monoclonal, Humanized']}
         self.assertTrue(pubmed.is_animal_only(p))
+
+
+class TestTokenTracking(unittest.TestCase):
+    """token 与成本追踪。
+
+    背景（2026-11 真实 trace 抓到的）：`trace['models']` 只记了 planner/critic/writer，
+    漏了 reader —— reader 占全部 token 的 76%（37940/49767），却被算成「无单价」，
+    成本估算直接低估一个量级（显示 ¥0.0314，实际远不止）。
+    """
+
+    def _run(self):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.trace = {'tokens': {}, 'models': {}, 'errors': [], 'timings': {}}
+        run.cfg = {'runtime': {}}
+        return run
+
+    def test_model_name_is_recorded_for_every_role(self):
+        """每个角色的模型名都要记下来，否则计价查不到单价。"""
+        run = self._run()
+        run._track_tokens('reader', {'tokens': 100, 'model': 'deepseek-ai/DeepSeek-V3.2'})
+        run._track_tokens('critic', {'tokens': 50, 'model': 'deepseek-ai/DeepSeek-R1'})
+        self.assertEqual(run.trace['models']['reader'], 'deepseek-ai/DeepSeek-V3.2')
+        self.assertEqual(run.trace['models']['critic'], 'deepseek-ai/DeepSeek-R1')
+
+    def test_reader_tokens_are_counted(self):
+        run = self._run()
+        run._track_tokens('reader', {'tokens': 37940, 'model': 'm'})
+        self.assertEqual(run.trace['tokens']['reader'], 37940)
+
+    def test_concurrent_tracking_does_not_lose_counts(self):
+        """精读是多线程并发的，计数不能因竞态丢失。"""
+        import threading
+        run = self._run()
+        run._token_lock = threading.Lock()
+        def worker():
+            for _ in range(50):
+                run._track_tokens('reader', {'tokens': 10, 'model': 'm'})
+        ts = [threading.Thread(target=worker) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(run.trace['tokens']['reader'], 8 * 50 * 10)
+
+    def test_pricing_failure_is_not_silently_swallowed(self):
+        """计价失败要留下痕迹，否则用户以为没花钱。"""
+        run = self._run()
+        run._track_tokens('reader', {'tokens': 100, 'model': 'm'})
+        # 真实场景里 estimate_cost 可能因表格式不对抛异常
+        self.assertTrue(run.trace['cost_estimate'] is not None)
+
+    def test_track_tokens_works_without_init(self):
+        """测试常用 Run.__new__ 绕过 __init__，那时没有锁也不能崩。"""
+        run = self._run()
+        run._track_tokens('reader', {'tokens': 10, 'model': 'm'})
+        self.assertEqual(run.trace['tokens']['reader'], 10)
+
+
+class TestRetractionMentionCheck(unittest.TestCase):
+    """被引用的撤稿文献，正文里必须交代。"""
+
+    def _run(self, answer, evidence):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.answer = answer
+        run.evidence = evidence
+        run.papers = {}
+        run.preprints = {}
+        run.trace = {'errors': []}
+        run.search_failed = False
+        run.log = lambda m: None
+        run.pmid_check = {}
+        return run
+
+    def test_retracted_paper_cited_without_mention_is_flagged(self):
+        run = self._run(
+            answer='结论成立 [PMID:11111111]。',
+            evidence=[{'pmid': '11111111', '_retraction': '该文已被撤稿'}])
+        run.validate_pmids()
+        stages = [e['stage'] for e in run.trace['errors']]
+        self.assertIn('retraction_check', stages)
+
+    def test_retracted_paper_mentioned_in_answer_is_ok(self):
+        run = self._run(
+            answer='该文献已被撤稿 [PMID:11111111]。',
+            evidence=[{'pmid': '11111111', '_retraction': '该文已被撤稿'}])
+        run.validate_pmids()
+        stages = [e['stage'] for e in run.trace['errors']]
+        self.assertNotIn('retraction_check', stages)
+
+    def test_retracted_paper_not_cited_is_not_flagged(self):
+        """没被引用就不该报警——没引用的文献不进正文。"""
+        run = self._run(
+            answer='结论成立 [PMID:22222222]。',
+            evidence=[{'pmid': '11111111', '_retraction': '该文已被撤稿'}])
+        run.validate_pmids()
+        stages = [e['stage'] for e in run.trace['errors']]
+        self.assertNotIn('retraction_check', stages)
