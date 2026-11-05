@@ -270,15 +270,21 @@ def _norm_verdict(raw: Any) -> Optional[str]:
 
 
 def _to_score(raw: Any) -> Optional[float]:
-    """把模型给的相关度分转成 1-5 之间的数；认不出返回 None。"""
+    """把模型给的相关度分转成 1-5 之间的数；认不出返回 None。
+
+    **越界不算"勉强能用"，算无效**：模型给出 0 或 7，说明它没按 1–5 的
+    量表打分（或者在胡编）。把它夹到 1 或 5 会**把无效输出伪装成合法分数**，
+    然后这个分数还会被采纳为有效 relevance 覆盖掉原来的评分。
+    宁可判失败，也不要污染分数。
+    """
     try:
         val = float(raw)
     except (TypeError, ValueError):
         return None
-    if val < 1:
-        val = 1.0
-    if val > 5:
-        val = 5.0
+    if val != val:          # NaN
+        return None
+    if val < 1 or val > 5:
+        return None
     return val
 
 
@@ -296,16 +302,24 @@ def _fmt_list(value: Any, limit: int = 6) -> str:
     return '；'.join(parts[:limit])
 
 
-def _evidence_card(ev: dict) -> str:
+def _evidence_card(ev: dict, max_chars: int = 3000) -> str:
     """把一条证据压成给模型看的「文献信息卡」。
 
     注意：**不输出 relevance**。交叉验证要的是两个模型各自独立判断，把原有分数
     喂进去会造成锚定，第二个模型只会跟着第一个走。
+
+    `max_chars` 是**总长度上限**：单条证据的 key_findings / effect_sizes /
+    population 都可能很长，全塞进去会让 prompt 变长。
+    本仓库吃过教训——"并发打长文本会超时"（Qwen3.5 系列 26000 字就超时），
+    所以这里必须给个硬上限，不能指望每个字段都短。
     """
     rows: list[str] = []
-    title = ev.get('_title') or ''
-    journal = ev.get('_journal') or ''
-    year = ev.get('_year') or ''
+    # 内部字段（_title / _journal / _year）是精读阶段写进去的，
+    # 但**必须留兜底**：证据条目可能来自断点恢复或外部构造，那时只有
+    # 普通字段。没有兜底的话标题会整个丢失（信息卡变成"引用标识 + 研究设计"）。
+    title = ev.get('_title') or ev.get('title') or ''
+    journal = ev.get('_journal') or ev.get('journal') or ''
+    year = ev.get('_year') or ev.get('year') or ''
     cite_key = ev.get('_citation_key') or ev.get('pmid') or ''
 
     rows.append('引用标识: ' + str(cite_key))
@@ -332,7 +346,11 @@ def _evidence_card(ev: dict) -> str:
         rows.append('文本来源: ' + str(ev['_text_source']))
     if ev.get('_retraction'):
         rows.append('撤稿/勘误提示: ' + str(ev['_retraction']))
-    return '\n'.join(rows)
+    text = '\n'.join(rows)
+    if max_chars and len(text) > max_chars:
+        # 截断时保留开头（引用标识、标题、设计、样本量在前面，信息密度最高）
+        text = text[:max_chars].rstrip() + '…（内容过长已截断）'
+    return text
 
 
 def _build_index(evidence: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
@@ -638,7 +656,8 @@ def _chat_accepts_model(chat_fn: Callable[..., dict]) -> bool:
 def _score_once(chat_fn: Callable[..., dict], role: str, msgs: list[dict],
                 model: Optional[str]) -> dict:
     """让一个模型打一次分。返回 {'score', 'reason', 'model', 'error'}。"""
-    out: dict[str, Any] = {'score': None, 'reason': '', 'model': None, 'error': None}
+    out: dict[str, Any] = {'score': None, 'reason': '', 'model': None,
+                           'error': None, 'model_ignored': False}
     try:
         kwargs: dict[str, Any] = {'temperature': 0.1, 'max_tokens': 400}
         if model:
@@ -650,6 +669,9 @@ def _score_once(chat_fn: Callable[..., dict], role: str, msgs: list[dict],
                 # 这次"交叉验证"是不是退化成了同一个模型打两次分。
                 out['error'] = ('chat_fn 不支持 model 参数，无法指定模型 '
                                  + str(model) + '（已退化为按角色路由）')
+                # 专门标记：这才是"模型没生效"。别的失败（网络超时、返回解析不了）
+                # 不该被算到这一类里——两种失败的含义完全不同。
+                out['model_ignored'] = True
         res = chat_fn(role, msgs, **kwargs)
         content = res.get('content') if isinstance(res, dict) else res
         if isinstance(res, dict) and res.get('model'):
@@ -833,8 +855,11 @@ def cross_check_relevance(evidence: list[dict],
         # 调用方没能指定模型（例如 chat_fn 不接受 model 参数）→ 两次打分可能
         # 来自同一个模型，交叉验证就退化成了"同一个人打两遍分"。记下来，
         # 让上层能判断这次交叉验证还有没有意义。
-        new['relevance_model_ignored'] = bool(a['error'] or b['error']) and bool(
-            (model_a and a['error']) or (model_b and b['error']))
+        new['relevance_model_ignored'] = bool(a.get('model_ignored')
+                                               or b.get('model_ignored'))
+        # 某一侧调用失败（网络、超时、返回解析不了）——与"模型没生效"是两回事，
+        # 单独记一个字段，别混在一起让人误判。
+        new['relevance_side_failed'] = bool(a['error'] or b['error'])
 
         if a['score'] is not None and b['score'] is not None:
             new['relevance_cross'] = round((a['score'] + b['score']) / 2.0, 1)
