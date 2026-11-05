@@ -909,8 +909,12 @@ class Run:
         t0 = time.time()
         try:
             before = len(self.evidence)
+            # **必须传 question**：原来 reader 打分是带着核心问题打的，
+            # 交叉验证如果拿不到问题就变成"盲评"，而盲评结果会被采纳为
+            # 有效 relevance 覆盖掉带问题打分——口径不一致，排序就乱了。
             self.evidence = verifymod.cross_check_relevance(
-                self.evidence, chat_fn, model_a=model_a, model_b=model_b)
+                self.evidence, chat_fn, model_a=model_a, model_b=model_b,
+                question=self.plan.get('core_question_en') or self.question)
             after = self.evidence
             if len(after) != before:
                 self.evidence = after

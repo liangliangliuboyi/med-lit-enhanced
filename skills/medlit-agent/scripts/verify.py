@@ -37,6 +37,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
 __all__ = [
@@ -148,6 +149,26 @@ _VERDICT_FAILED = '核对失败'
 _VERDICT_UNMAPPED = '无法核对'
 
 _MAX_CLAIM_TEXT = 300
+
+# ============================================================================
+# 并发度
+# ============================================================================
+# 为什么这里能并发、并发多少
+# ------------------------
+# B8 交叉验证是整个流水线里最慢的一步：N 篇文献 × 2 个模型 = 2N 次模型调用。
+# 原来全串行，5 篇就要 458 秒（实测 trace）。而这两次调用的 prompt 是**短**的
+# （只喂结构化字段，不喂全文），实测单次 0.7~2.5 秒——同仓库的 pipeline.read_all
+# 用同样的 ThreadPoolExecutor 并发跑精读，5 篇只要 33 秒。
+#
+# 但并发度不能开大：
+#   1. 模型服务商会限流（429），并发太高会成片失败；
+#   2. 本仓库吃过教训——「并发打长文本会超时」。这里 prompt 短，所以 4~6 安全，
+#      但仍留出上限，不让调用方无脑拉到几十。
+#
+# 因此默认 4，且做成可配置（模块常量 + 关键字参数），上限硬性钉在 _WORKERS_CAP。
+CROSS_CHECK_WORKERS = 4        # B8 交叉验证默认并发度
+CLAIM_CHECK_WORKERS = 4        # B5 论断比对默认并发度
+_WORKERS_CAP = 8               # 硬上限：无论调用方怎么传，都不超过这个数
 
 NOTE_TEXT = ('本结果由模型辅助产出，用于提示「引用」与「文献内容」可能对不上，'
              '不构成人工审阅，也不评价研究质量。')
@@ -403,8 +424,54 @@ def parse_claims(answer: str) -> list[dict]:
 # ============================================================================
 # 公开 API 2：论断—文献语义比对（B5）
 # ============================================================================
+def _verify_one(chat_fn: Callable[..., dict], claim: dict,
+                matched: list[dict], unmatched: list[dict]) -> dict:
+    """核对单条论断，返回一条记录。
+
+    任何异常都在这里就地兜住 → 该条记为「核对失败」，**不向上抛**：
+    校验是"体检"不是"门禁"，而且并发时一条坏数据不能牵连其它条。
+    """
+    record: dict[str, Any] = {
+        'index': claim['index'],
+        'text': claim['text'],
+        'citations': claim['citations'],
+        'verdict': '',
+        'reason': '',
+    }
+    try:
+        cards = '\n\n'.join(
+            ('文献 ' + str(i + 1) + '\n' + _evidence_card(ev))
+            for i, ev in enumerate(matched))
+        msgs = [
+            {'role': 'system', 'content': CLAIM_VERIFY_SYSTEM},
+            {'role': 'user', 'content': CLAIM_VERIFY_USER.format(
+                claim=claim['text'], cards=cards)},
+        ]
+        res = chat_fn('reader', msgs, temperature=0.1, max_tokens=600)
+        content = res.get('content') if isinstance(res, dict) else res
+        data = _extract_json(content)
+        if not isinstance(data, dict):
+            raise ValueError('模型返回内容不是合法 JSON')
+        verdict = _norm_verdict(
+            data.get('verdict', data.get('judgement', data.get('judgment'))))
+        if not verdict:
+            raise ValueError('模型返回的判定值无法识别: '
+                             + str(data.get('verdict'))[:60])
+        reason = str(data.get('reason', data.get('explanation', '')) or '').strip()
+        if unmatched:
+            reason = (reason + '（另有 ' + str(len(unmatched))
+                      + ' 条引用未在证据表中找到，未纳入判断）').strip()
+        record['verdict'] = verdict
+        record['reason'] = reason[:300]
+    except Exception as e:  # noqa: BLE001
+        record['verdict'] = _VERDICT_FAILED
+        record['reason'] = str(e)[:150]
+    return record
+
+
 def verify_claims(answer: str, evidence: list[dict],
-                  chat_fn: Callable[..., dict], *, max_checks: int = 12) -> dict:
+                  chat_fn: Callable[..., dict], *, max_checks: int = 12,
+                  max_workers: Optional[int] = None) -> dict:
     """逐条核对答案里的论断是否真的被它引用的文献支持。
 
     参数
@@ -414,6 +481,8 @@ def verify_claims(answer: str, evidence: list[dict],
     chat_fn : callable      模型调用回调，形如 `router.chat`；
                             由调用方注入，本模块不自己建连接。
     max_checks : int        最多核验多少条论断（按正文出现顺序），控制成本。
+    max_workers : int|None  并发度上限（同时在跑的模型调用数）。None 用默认值
+                            CLAIM_CHECK_WORKERS；实际值被硬性夹在 [1, _WORKERS_CAP]。
 
     返回
     ----
@@ -430,6 +499,14 @@ def verify_claims(answer: str, evidence: list[dict],
       也不抛异常（可能是预印本没进池子）。
     - 单条失败（模型异常 / 返回值不是合法 JSON）→ 记入 failed，继续下一条。
     - `checked` 是**实际发起过模型调用**的条数（含调用失败的）。
+    - 各判定列表里的条目**按论断在正文中出现的顺序排列**（并发下完成顺序是
+      乱的，所以先按 index 收集、再排序还原）。
+
+    并发说明
+    --------
+    每条论断的核对彼此独立（互不影响、互不依赖），所以改成并发执行。
+    并发结束后必须**按论断在正文中的位置重新排序**再分桶——否则结果列表的
+    顺序会随网络快慢乱掉，报告里"第 3 条"可能变成别的论断。
     """
     result: dict[str, Any] = {
         'checked': 0,
@@ -453,6 +530,7 @@ def verify_claims(answer: str, evidence: list[dict],
 
     # 先做纯本地的映射（不花钱、不调模型）：分出"可核对"与"无法核对"。
     checkable: list[tuple[dict, list[dict], list[dict]]] = []
+    unmapped: list[dict] = []
     for claim in claims:
         matched: list[dict] = []
         unmatched: list[dict] = []
@@ -463,7 +541,7 @@ def verify_claims(answer: str, evidence: list[dict],
             else:
                 matched.append(ev)
         if not matched:
-            result['uncertain'].append({
+            unmapped.append({
                 'index': claim['index'],
                 'text': claim['text'],
                 'citations': claim['citations'],
@@ -474,52 +552,55 @@ def verify_claims(answer: str, evidence: list[dict],
         checkable.append((claim, matched, unmatched))
 
     budget = max(0, int(max_checks))
-    for claim, matched, unmatched in checkable[:budget]:
-        record: dict[str, Any] = {
-            'index': claim['index'],
-            'text': claim['text'],
-            'citations': claim['citations'],
-            'verdict': '',
-            'reason': '',
-        }
-        try:
-            cards = '\n\n'.join(
-                ('文献 ' + str(i + 1) + '\n' + _evidence_card(ev))
-                for i, ev in enumerate(matched))
-            msgs = [
-                {'role': 'system', 'content': CLAIM_VERIFY_SYSTEM},
-                {'role': 'user', 'content': CLAIM_VERIFY_USER.format(
-                    claim=claim['text'], cards=cards)},
-            ]
-            res = chat_fn('reader', msgs, temperature=0.1, max_tokens=600)
-            content = res.get('content') if isinstance(res, dict) else res
-            data = _extract_json(content)
-            if not isinstance(data, dict):
-                raise ValueError('模型返回内容不是合法 JSON')
-            verdict = _norm_verdict(
-                data.get('verdict', data.get('judgement', data.get('judgment'))))
-            if not verdict:
-                raise ValueError('模型返回的判定值无法识别: '
-                                 + str(data.get('verdict'))[:60])
-            reason = str(data.get('reason', data.get('explanation', '')) or '').strip()
-            if unmatched:
-                reason = (reason + '（另有 ' + str(len(unmatched))
-                          + ' 条引用未在证据表中找到，未纳入判断）').strip()
-            record['verdict'] = verdict
-            record['reason'] = reason[:300]
-            if verdict == _VERDICT_SUPPORTED:
-                result['supported'].append(record)
-            elif verdict == _VERDICT_UNSUPPORTED:
-                result['unsupported'].append(record)
-            elif verdict == _VERDICT_PARTIAL:
-                result['partial'].append(record)
-            else:
-                result['uncertain'].append(record)
-        except Exception as e:  # noqa: BLE001
-            record['verdict'] = _VERDICT_FAILED
-            record['reason'] = str(e)[:150]
-            result['failed'].append(record)
-        result['checked'] += 1
+    todo = checkable[:budget]
+
+    # 并发核对：每条论断一个任务。完成后按 index 收集——顺序要还原，
+    # 不能按完成顺序直接 append（并发下完成顺序是乱的）。
+    workers = _resolve_workers(max_workers, CLAIM_CHECK_WORKERS)
+    records: dict[int, dict] = {}
+    if todo:
+        with ThreadPoolExecutor(max_workers=min(workers, len(todo))) as ex:
+            futs = {}
+            for claim, matched, unmatched in todo:
+                idx = int(claim['index'])
+                futs[ex.submit(_verify_one, chat_fn, claim, matched, unmatched)] = (idx, claim)
+            for fut in as_completed(futs):
+                idx, claim = futs[fut]
+                try:
+                    records[idx] = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    # _verify_one 内部已兜底，这里是最后一道防线
+                    records[idx] = {
+                        'index': idx,
+                        'text': claim['text'],
+                        'citations': claim['citations'],
+                        'verdict': _VERDICT_FAILED,
+                        'reason': str(e)[:150],
+                    }
+
+    # 按论断在正文中的位置排序后分桶：并发打乱了完成顺序，
+    # 报告里引用的"第几条"必须仍然对应正文里的第几条。
+    ordered = sorted(records.values(), key=lambda r: r.get('index') or 0)
+    for rec in ordered:
+        verdict = rec.get('verdict')
+        if verdict == _VERDICT_SUPPORTED:
+            result['supported'].append(rec)
+        elif verdict == _VERDICT_UNSUPPORTED:
+            result['unsupported'].append(rec)
+        elif verdict == _VERDICT_PARTIAL:
+            result['partial'].append(rec)
+        elif verdict == _VERDICT_FAILED:
+            result['failed'].append(rec)
+        else:
+            result['uncertain'].append(rec)
+
+    # "引用映射不到证据"的条目同样按论断位置混进 uncertain，
+    # 让 uncertain 整体保持正文顺序。
+    for rec in sorted(unmapped, key=lambda r: r.get('index') or 0):
+        result['uncertain'].append(rec)
+    result['uncertain'].sort(key=lambda r: r.get('index') or 0)
+
+    result['checked'] = len(ordered)
 
     skipped = len(checkable) - min(len(checkable), budget)
     result['summary'] = (
@@ -588,6 +669,42 @@ def _score_once(chat_fn: Callable[..., dict], role: str, msgs: list[dict],
     return out
 
 
+def _failed_side(error: Any) -> dict:
+    """构造一次"打分失败"的侧结果，形状与 _score_once 的返回值一致。"""
+    return {'score': None, 'reason': '', 'model': None, 'error': str(error)[:200]}
+
+
+def _score_side(chat_fn: Callable[..., dict], role: str, msgs: list[dict],
+                model: Optional[str]) -> dict:
+    """并发 worker：跑一次打分，并把 worker 自身的异常也兜住。
+
+    兜异常的理由：并发下任何一次 worker 抛异常都不能掀翻整个函数，更不能
+    让这篇文献从结果里消失。这里返回与 _score_once 同形的失败结果，并打上
+    `worker_failed` 标记——上层据此把该篇当作"两个模型都失败"处理
+    （保留原 relevance + 标记 relevance_cross_failed）。
+    """
+    try:
+        return _score_once(chat_fn, role, msgs, model)
+    except Exception as e:  # noqa: BLE001
+        out = _failed_side(e)
+        out['worker_failed'] = True
+        return out
+
+
+def _resolve_workers(requested: Optional[int], default: int) -> int:
+    """把调用方给的并发度规整成 [1, _WORKERS_CAP] 之间的整数。
+
+    上限是硬性的：模型服务商会限流，而且本仓库吃过教训——"并发打长文本
+    会超时"。这里 prompt 短（只喂结构化字段），4~6 并发实测没问题，
+    但也不能让调用方一把拉到几十把服务端打挂。
+    """
+    try:
+        n = int(requested) if requested is not None else int(default)
+    except (TypeError, ValueError):
+        n = int(default)
+    return max(1, min(n, _WORKERS_CAP))
+
+
 def cross_check_relevance(evidence: list[dict],
                            chat_fn: Callable[..., dict],
                            model_a: Optional[str] = None,
@@ -595,7 +712,8 @@ def cross_check_relevance(evidence: list[dict],
                            *,
                            question: str = '',
                            role_a: str = 'reader',
-                           role_b: str = 'critic') -> list[dict]:
+                           role_b: str = 'critic',
+                           max_workers: Optional[int] = None) -> list[dict]:
     """用两个不同模型各打一次相关性分，取平均。
 
     参数
@@ -609,6 +727,8 @@ def cross_check_relevance(evidence: list[dict],
                              对应两条不同的模型链）。
     question : str           核心问题，用于相关性打分。
     role_a / role_b : str    两次打分使用的路由角色。
+    max_workers : int | None 并发度上限（同时在跑的模型调用数）。None 用默认值
+                             CROSS_CHECK_WORKERS；实际值被硬性夹在 [1, _WORKERS_CAP]。
 
     返回**新的** evidence 列表，每条新增：
         relevance_cross       两模型平均分（保留 1 位小数；单边成功时为该侧分数）
@@ -620,18 +740,32 @@ def cross_check_relevance(evidence: list[dict],
         relevance_models      两次实际使用的模型名
         relevance_same_model  两侧实际用了同一个模型（交叉验证形同虚设）
         relevance_model_ignored  调用方指定的模型没能生效（chat_fn 不支持 model）
+
+    并发说明
+    --------
+    这一步原来是最慢的一环（N 篇 × 2 个模型 = 2N 次调用，全串行，实测 5 篇
+    要 458 秒），现在改成内部并行。
+
+    **同一篇文献的两次打分之间没有依赖**：`_score_once` 只吃
+    (chat_fn, role, msgs, model)，返回 score/reason/model/error，不读对方的
+    结果；两侧喂进去的是**同一份** msgs，且 `_evidence_card` 刻意不输出
+    relevance、系统提示也写明"独立打分"——就是为了避免第二个模型跟着第一个
+    走。所以 2N 次调用可以全部铺平进同一个线程池，不必"一篇一个任务、篇内
+    串行两次"（后者在 N 为奇数时会多空转一轮）。
+
+    **返回顺序必须与输入顺序一致**：并发下完成顺序是乱的（谁先返回取决于
+    网络），所以结果按 (篇序号, 打分侧) 收进字典，再按篇序号顺序组装——
+    上游 pipeline 依赖这个顺序做后续排序与展示。
     """
     if not evidence or not isinstance(evidence, (list, tuple)):
         return []
 
-    out: list[dict] = []
+    # 先在主线程把 prompt 建好（纯本地计算，不涉及模型调用）。
+    # 同时筛掉非 dict 条目——与原串行版的过滤规则保持一致。
+    items: list[tuple[int, dict, list[dict]]] = []
     for ev in evidence:
         if not isinstance(ev, dict):
             continue
-        new = dict(ev)
-        original = ev.get('relevance')
-        new['_relevance_original'] = original
-
         card = _evidence_card(ev)
         msgs = [
             {'role': 'system', 'content': RELEVANCE_SCORE_SYSTEM},
@@ -640,9 +774,57 @@ def cross_check_relevance(evidence: list[dict],
                                      '一个循证医学问题的相关性）',
                 card=card)},
         ]
+        items.append((len(items), ev, msgs))
 
-        a = _score_once(chat_fn, role_a, msgs, model_a)
-        b = _score_once(chat_fn, role_b, msgs, model_b)
+    if not items:
+        return []
+
+    workers = _resolve_workers(max_workers, CROSS_CHECK_WORKERS)
+
+    # 把 2N 次打分全部摊平成任务：A、B 两侧互不依赖，可以真正并发。
+    # 每侧一个任务 → 负载更均衡（N 为奇数时不会多空转一轮）。
+    tasks: list[tuple[int, str]] = []
+    for pos, _ev, _msgs in items:
+        tasks.append((pos, 'a'))
+        tasks.append((pos, 'b'))
+
+    # 结果按 (篇序号, 侧) 收集，最后按篇序号顺序组装——并发下完成顺序是乱的，
+    # 直接按完成顺序 append 会让返回列表的顺序乱掉，上游依赖顺序做后续处理。
+    scores: dict[tuple[int, str], dict] = {}
+    by_pos = {pos: msgs for pos, _ev, msgs in items}
+    with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as ex:
+        futs = {}
+        for pos, side in tasks:
+            role = role_a if side == 'a' else role_b
+            model = model_a if side == 'a' else model_b
+            # 给每个任务一份独立的 messages 列表副本：并发下不想让两个
+            # 任务共用同一个 list 对象（万一 chat_fn 内部动了它）。
+            futs[ex.submit(_score_side, chat_fn, role, list(by_pos[pos]), model)] = (pos, side)
+        for fut in as_completed(futs):
+            key = futs[fut]
+            try:
+                scores[key] = fut.result()
+            except Exception as e:  # noqa: BLE001
+                # worker 兜底：理论上 _score_side 已经吞掉了异常，这里是
+                # 最后一道防线——绝不让一篇文献因为并发而整个消失。
+                failed = _failed_side(e)
+                failed['worker_failed'] = True
+                scores[key] = failed
+
+    out: list[dict] = []
+    for pos, ev, _msgs in items:
+        a = scores.get((pos, 'a'), _failed_side('未执行'))
+        b = scores.get((pos, 'b'), _failed_side('未执行'))
+
+        new = dict(ev)
+        original = ev.get('relevance')
+        new['_relevance_original'] = original
+
+        # worker 自身抛异常（不是模型调用失败）时，按"该篇两个模型都失败"处理：
+        # 宁可保守，也不能因为并发把半成品结果当成可信分数用出去。
+        if a.get('worker_failed') or b.get('worker_failed'):
+            a = _failed_side(a.get('error') or 'worker 执行失败')
+            b = _failed_side(b.get('error') or 'worker 执行失败')
 
         new['relevance_by_model'] = {'modelA': a['score'], 'modelB': b['score']}
         new['relevance_models'] = {'modelA': a['model'], 'modelB': b['model']}

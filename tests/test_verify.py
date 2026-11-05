@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(
@@ -397,6 +399,184 @@ class TestCrossCheckGain(unittest.TestCase):
         self.assertAlmostEqual(gain['avg_delta'], 0.0)
         self.assertEqual(gain['divergent'], 0)
         self.assertEqual(gain['failed'], 0)
+
+
+class TestParallelExecution(unittest.TestCase):
+    """并发执行的行为约束。
+
+    背景（2026-11-05 实测）：B8 相关度交叉验证原来是**串行**的，
+    5 篇文献 × 2 个模型 = 10 次调用一次跑，实测 458.8 秒，
+    占全文模型调用数的 40%。改成并发后实测加速比 3.31 倍。
+    """
+
+    def _evidence(self, n=5):
+        return [{'pmid': str(i), 'relevance': 3, 'title': f'T{i}',
+                 'key_findings': ['x'], 'study_design': 'RCT'}
+                for i in range(n)]
+
+    def _tracker(self, delay=0.03):
+        """返回 (chat_fn, 状态字典)。状态里有峰值并发数。"""
+        state = {'inflight': 0, 'peak': 0, 'calls': 0}
+        lock = threading.Lock()
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
+            with lock:
+                state['inflight'] += 1
+                state['peak'] = max(state['peak'], state['inflight'])
+                state['calls'] += 1
+            try:
+                time.sleep(delay)
+                return {'content': '{"relevance": 4, "reason": "ok"}',
+                        'model': model or role, 'tokens': 10}
+            finally:
+                with lock:
+                    state['inflight'] -= 1
+        return chat_fn, state
+
+    def test_return_order_matches_input_order(self):
+        """并发下完成顺序是乱的，返回顺序必须按输入还原。"""
+        ev = self._evidence(6)
+        # 让不同文献的延迟不同，制造乱序完成
+        delays = [0.06, 0.01, 0.05, 0.02, 0.04, 0.03]
+        call_n = {'i': 0}
+        lock = threading.Lock()
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
+            with lock:
+                i = call_n['i']
+                call_n['i'] += 1
+            time.sleep(delays[i % len(delays)])
+            return {'content': '{"relevance": 4, "reason": "ok"}',
+                    'model': model or role, 'tokens': 10}
+
+        out = verify.cross_check_relevance(ev, chat_fn, model_a='A', model_b='B')
+        self.assertEqual([d['pmid'] for d in out], [e['pmid'] for e in ev],
+                         '并发后返回顺序必须与输入一致')
+
+    def test_concurrency_actually_happens(self):
+        """峰值并发必须 > 1，否则等于没并行。"""
+        chat_fn, state = self._tracker()
+        ev = self._evidence(6)
+        verify.cross_check_relevance(ev, chat_fn, model_a='A', model_b='B')
+        self.assertGreater(state['peak'], 1,
+                           f'峰值并发只有 {state["peak"]}，并行没生效')
+
+    def test_parallel_is_faster_than_serial(self):
+        """并发必须真的比串行快。"""
+        ev = self._evidence(5)
+        chat_fn, _ = self._tracker(delay=0.05)
+        t0 = time.time()
+        verify.cross_check_relevance(ev, chat_fn, model_a='A', model_b='B')
+        par = time.time() - t0
+
+        chat_fn2, _ = self._tracker(delay=0.05)
+        t0 = time.time()
+        verify.cross_check_relevance(ev, chat_fn2, model_a='A', model_b='B',
+                                     max_workers=1)
+        ser = time.time() - t0
+        self.assertLess(par, ser, f'并行 {par:.3f}s 不应慢于串行 {ser:.3f}s')
+
+    def test_one_side_failure_does_not_lose_papers(self):
+        """某一侧打分失败不能导致整篇文献丢失。"""
+        ev = self._evidence(4)
+        calls = {'n': 0}
+        lock = threading.Lock()
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
+            with lock:
+                calls['n'] += 1
+                n = calls['n']
+            if n % 3 == 0:
+                raise RuntimeError('boom')
+            return {'content': '{"relevance": 5, "reason": "ok"}',
+                    'model': model or role, 'tokens': 10}
+
+        out = verify.cross_check_relevance(ev, chat_fn, model_a='A', model_b='B')
+        self.assertEqual(len(out), len(ev), '并发失败不能让文献变少')
+        for d in out:
+            self.assertIn('relevance_cross', d)
+            self.assertIn('relevance_cross_failed', d)
+
+    def test_original_evidence_not_mutated(self):
+        ev = self._evidence(3)
+        chat_fn, _ = self._tracker()
+        verify.cross_check_relevance(ev, chat_fn, model_a='A', model_b='B')
+        for e in ev:
+            self.assertNotIn('relevance_cross', e,
+                             '不能原地改调用方传入的 evidence')
+
+    def test_result_fields_unchanged(self):
+        """返回结构不能变（上游 pipeline 依赖这些字段）。"""
+        ev = self._evidence(2)
+        chat_fn, _ = self._tracker()
+        out = verify.cross_check_relevance(ev, chat_fn, model_a='A', model_b='B')
+        for d in out:
+            for k in ('relevance_cross', 'relevance_by_model',
+                      'relevance_divergent', 'relevance_cross_failed',
+                      '_relevance_original', 'relevance_models'):
+                self.assertIn(k, d, f'缺少字段 {k}')
+
+    def test_verify_claims_order_is_preserved(self):
+        """论断列表的顺序要按正文出现顺序，不能被并发打乱。"""
+        answer = ('结论一 [PMID:11111111]。\n'
+                  '结论二 [PMID:22222222]。\n'
+                  '结论三 [PMID:33333333]。\n'
+                  '结论四 [PMID:44444444]。')
+        ev = [{'pmid': p, 'title': 'T', 'study_design': 'RCT',
+               'key_findings': ['x'], 'relevance': 4}
+              for p in ('11111111', '22222222', '33333333', '44444444')]
+        delays = [0.05, 0.01, 0.04, 0.02]
+        call_n = {'i': 0}
+        lock = threading.Lock()
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
+            with lock:
+                i = call_n['i']
+                call_n['i'] += 1
+            time.sleep(delays[i % len(delays)])
+            return {'content': '{"verdict": "支持", "reason": "ok"}',
+                    'model': 'm', 'tokens': 10}
+
+        res = verify.verify_claims(answer, ev, chat_fn, max_checks=10)
+        self.assertEqual(res['checked'], 4)
+        self.assertEqual(len(res['supported']), 4)
+        texts = [s['text'] for s in res['supported']]
+        self.assertTrue(texts[0].startswith('结论一'), texts[:1])
+        self.assertTrue(texts[-1].startswith('结论四'), texts[-1:])
+
+    def test_verify_claims_failure_is_isolated(self):
+        """一条核验失败不影响其他条，也不能抛异常。"""
+        answer = ('甲 [PMID:11111111]。\n'
+                  '乙 [PMID:22222222]。\n'
+                  '丙 [PMID:33333333]。')
+        ev = [{'pmid': p, 'title': 'T', 'key_findings': ['x'], 'relevance': 4}
+              for p in ('11111111', '22222222', '33333333')]
+        calls = {'n': 0}
+        lock = threading.Lock()
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
+            with lock:
+                calls['n'] += 1
+                n = calls['n']
+            if n == 2:
+                raise RuntimeError('boom')
+            return {'content': '{"verdict": "支持", "reason": "ok"}',
+                    'model': 'm', 'tokens': 10}
+
+        res = verify.verify_claims(answer, ev, chat_fn, max_checks=10)
+        self.assertEqual(res['checked'], 3)
+        self.assertEqual(len(res['failed']), 1, '失败的应单独记进 failed')
+        self.assertGreaterEqual(len(res['supported']), 1)
+
+    def test_verify_claims_result_keys_unchanged(self):
+        answer = '甲 [PMID:11111111]。'
+        ev = [{'pmid': '11111111', 'title': 'T', 'key_findings': ['x'],
+               'relevance': 4}]
+        chat_fn, _ = self._tracker()
+        res = verify.verify_claims(answer, ev, chat_fn, max_checks=10)
+        for k in ('checked', 'total_claims', 'unsupported', 'partial',
+                  'uncertain', 'failed', 'summary', 'note'):
+            self.assertIn(k, res, f'缺少键 {k}')
 
 
 if __name__ == '__main__':
