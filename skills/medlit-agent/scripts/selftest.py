@@ -199,14 +199,20 @@ def main():
         if not items:
             raise RuntimeError('doctor 返回空')
         names = [i['item'] for i in items]
-        for must in ('模型服务密钥', 'NCBI API key（选填）', 'Python 版本'):
-            if must not in names:
+        # 必填项的名称后缀会随版本变化，这里按前缀匹配
+        for must in ('模型服务密钥', 'NCBI API key', 'Python 版本', 'NCBI 邮箱'):
+            if not any(n.startswith(must) for n in names):
                 raise RuntimeError(f'doctor 缺少检查项：{must}')
         miss = [i for i in items if not i['ok']]
         for i in miss:
             if not i['detail'].strip():
                 raise RuntimeError(f"缺项 {i['item']} 没给出补救说明")
-        return f'{len(items)} 项检查，{len(miss)} 项待补（提示文案齐备）'
+        # 必填项必须附带「该怎么问用户」，否则智能体不知道怎么向用户开口
+        for i in items:
+            if i.get('required') and not i['ok'] and not i.get('ask'):
+                raise RuntimeError(f"必填项 {i['item']} 缺少「该怎么问用户」的提示")
+        return (f'{len(items)} 项检查，{len(miss)} 项待补'
+                f'（提示文案齐备，必填项带「该怎么问」）')
 
     check('环境体检 doctor', t_doctor)
 

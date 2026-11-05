@@ -594,6 +594,7 @@ class Run:
         research_only = ret.get('research_only', False)
         min_abs = int(ret.get('min_abstract_chars', 200))
         research_min = int(ret.get('research_min_abstract_chars', 300))
+        exclude_animals = bool(ret.get('exclude_animals', True))
         before = len(self.papers)
         dropped = 0
         for pid in list(self.papers.keys()):
@@ -617,11 +618,19 @@ class Run:
                                       'reason': '已撤稿（Retracted Publication）'})
                 del self.papers[pid]
                 dropped += 1
+                continue
+            # 纯动物实验：检索式里的过滤器只降噪、不能完全把关，
+            # 这里按抓回来的 MeSH 再判一次（程序侧才是最终把关）
+            if exclude_animals and pm.is_animal_only(p):
+                self.excluded.append({'pmid': pid, 'title': p.get('title', ''),
+                                      'reason': '纯动物实验（MeSH 无 Humans 标记）'})
+                del self.papers[pid]
+                dropped += 1
         self.prisma['deduplicated'] = before
         self.prisma['screened'] = len(self.papers)
         self.prisma['excluded_screening'] = before - len(self.papers)
         self.log(f'③ 过滤后保留 {len(self.papers)} 篇（剔除 {dropped} 篇：'
-                 f'非研究论文 / 摘要过短 / 已撤稿）')
+                 f'非研究论文 / 摘要过短 / 已撤稿 / 纯动物实验）')
         self._save_checkpoint()
         return list(self.papers.keys())
 

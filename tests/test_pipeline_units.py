@@ -40,6 +40,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import pipeline  # noqa: E402  （必须在 sys.path 调整之后导入）
+import pubmed  # noqa: E402
 
 
 def make_run(**fields):
@@ -430,3 +431,33 @@ class TestPreprintCitations(unittest.TestCase):
         self.assertEqual(len(chk['orphan_dois']), 1)
         self.assertEqual(chk['cited_pmid_count'], 1)
         self.assertEqual(chk['cited_doi_count'], 1)
+
+
+class TestAnimalOnlyDetection(unittest.TestCase):
+    """纯动物实验的程序侧判定。
+
+    背景：实测发现 PubMed 的 `NOT ("Animals"[MeSH] NOT "Humans"[MeSH])`
+    **只降噪、不能完全把关**（同一检索式 473 → 102，但纯小鼠文献仍在结果里），
+    所以最终把关必须放在程序侧。
+    """
+
+    def test_pure_mouse_study_is_animal_only(self):
+        p = {'mesh': ['Animals', 'Mice', 'Activins',
+                      'Antibodies, Monoclonal, Humanized', 'Obesity', 'Weight Loss']}
+        self.assertTrue(pubmed.is_animal_only(p))
+
+    def test_human_study_is_not_animal_only(self):
+        p = {'mesh': ['Humans', 'Adult', 'Obesity', 'Weight Loss']}
+        self.assertFalse(pubmed.is_animal_only(p))
+
+    def test_translational_mixed_study_is_kept(self):
+        p = {'mesh': ['Humans', 'Animals', 'Mice', 'Disease Models, Animal']}
+        self.assertFalse(pubmed.is_animal_only(p))
+
+    def test_no_mesh_is_not_animal_only(self):
+        self.assertFalse(pubmed.is_animal_only({'mesh': []}))
+
+    def test_humanized_is_not_humans(self):
+        """'Antibodies, Monoclonal, Humanized' 含 Human 但不是 Humans 标记。"""
+        p = {'mesh': ['Animals', 'Antibodies, Monoclonal, Humanized']}
+        self.assertTrue(pubmed.is_animal_only(p))

@@ -312,10 +312,47 @@ ANIMAL_EXCLUSION = 'NOT ("Animals"[MeSH] NOT "Humans"[MeSH])'
 
 
 def apply_animal_exclusion(term: str, enabled: bool = True) -> str:
-    """排除纯动物实验。官方 MeSH 写法不会像自由词 NOT 那样被 PubMed 错解析。"""
+    """在检索式里排除纯动物实验（官方 MeSH 写法）。
+
+    ⚠️ 实测（2026-11）：这个过滤器**只降噪、不能完全把关**。
+    同一个检索式，带这个过滤器命中从 473 降到 102，但一篇纯小鼠研究
+    （MeSH 含 Animals、不含 Humans）**仍在结果里**——PubMed 对
+    `NOT (A NOT B)` 这种复合表达式的处理与直觉不同。
+    因此**最终把关必须放在程序侧**：`is_animal_only()` 按抓回来的 MeSH 再判一次。
+    """
     if not enabled:
         return term
     return f'({term}) AND {ANIMAL_EXCLUSION}'
+
+
+# MeSH 里代表"动物"的树节点（用前缀匹配覆盖 Mice, Inbred C57BL 之类）
+_ANIMAL_ROOTS = (
+    'animals', 'mice', 'rats', 'swine', 'cattle', 'dogs', 'rabbits', 'chickens',
+    'sheep', 'goats', 'horses', 'zebrafish', 'drosophila', 'insects', 'mollusca',
+    'crayfish', 'reptiles', 'birds', 'fishes', 'primates', 'hamsters', 'guinea pig',
+    'muridae', 'cricetidae', 'lepidoptera', 'diptera', 'arthropods',
+)
+
+
+def is_animal_only(paper: dict) -> bool:
+    """判断一篇文献是否为**纯动物实验**（无人类受试者）。
+
+    判据（用 efetch 回来的 MeSH 判定，不依赖 PubMed 的检索式行为）：
+      MeSH 里出现动物族词，且**没有** Humans 标记。
+
+    注意要精确匹配 'Humans'——像 'Antibodies, Monoclonal, Humanized'
+    这种含 "Human" 的词不算人类研究标记。
+    """
+    mesh = [str(m).strip().lower() for m in (paper.get('mesh') or []) if str(m).strip()]
+    if not mesh:
+        return False
+    has_human = any(m == 'humans' or m.startswith('humans ') for m in mesh)
+    if has_human:
+        return False
+    for m in mesh:
+        if m.startswith(_ANIMAL_ROOTS):
+            return True
+    return False
 
 
 # ---------- 语种限制 ----------
