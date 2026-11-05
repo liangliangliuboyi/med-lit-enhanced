@@ -156,11 +156,21 @@ class ModelRouter:
     """按角色路由：先探活，命中第一个可用模型；失败则顺延到下一个。"""
 
     def __init__(self, provider: Provider, chain: dict[str, list[str]],
-                 call_budget: int = 240):
+                 call_budget: int = 240, fail_threshold: int = 2):
         self.p = provider
         self.chain = chain or {}
         self._resolved: dict[str, str] = {}
-        self._fail: dict[str, set[str]] = {r: set() for r in self.chain}
+        # 角色 → 模型 → 连续失败次数
+        #
+        # 这里**不能用「一次失败就永久拉黑」**：精读是多线程并发的，
+        # 某个线程的一次偶发失败会把首选模型拉黑，导致**所有后续调用**
+        # （包括本该很快成功的）都改用降级链上的下一个模型。
+        # 实测 2026-11-05：首选 DeepSeek-V3.2 失败一次后，精读全部切到
+        # 处理长文本会超时的 Qwen3.5-35B-A3B，每个调用耗满 240 秒预算，
+        # 整轮检索看起来像卡死。
+        # 现在改成「连续失败 N 次才降级」，偶发失败不再污染整个角色。
+        self._fail: dict[str, dict[str, int]] = {r: {} for r in self.chain}
+        self.fail_threshold = max(1, int(fail_threshold or 2))
         # 一次 chat 调用的**总时长预算**（秒）。
         # 没有它的话，最坏耗时 = 降级链长度 × timeout × retries
         # （reader 链有 4 个模型，180s×3 重试 → 36 分钟一次调用），
@@ -169,7 +179,9 @@ class ModelRouter:
         self.last_errors: dict[str, list[str]] = {}
 
     def chain_of(self, role: str) -> list[str]:
-        return [m for m in self.chain.get(role, []) if m not in self._fail.get(role, set())]
+        fails = self._fail.get(role) or {}
+        return [m for m in self.chain.get(role, [])
+                if fails.get(m, 0) < self.fail_threshold]
 
     def _pick(self, role: str) -> str:
         cands = self.chain_of(role)
@@ -214,6 +226,7 @@ class ModelRouter:
                 errors.append(f'{model}: 空返回')
             except Exception as e:  # noqa: BLE001
                 errors.append(f'{model}: {e}')
-                self._fail.setdefault(role, set()).add(model)
+                fails = self._fail.setdefault(role, {})
+                fails[model] = fails.get(model, 0) + 1
         self.last_errors[role] = errors
         raise RuntimeError(f'角色 {role} 全部模型失败 → ' + ' | '.join(errors[-3:]))

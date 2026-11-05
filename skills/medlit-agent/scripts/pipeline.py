@@ -853,10 +853,16 @@ class Run:
         chain = self.cfg['models']['chain']
         reader_chain = chain.get('reader') or []
         critic_chain = chain.get('critic') or []
+        fast_chain = chain.get('fast') or []
         model_a = (reader_chain[0] if reader_chain else None)
-        # 第二个模型刻意跨厂商/跨家族取，交叉验证才有意义
+        # 第二个模型刻意跨厂商/跨家族取，交叉验证才有意义。
+        # 优先从 **fast 链**取：交叉验证只是给个相关度分，是轻量判断任务，
+        # 用大模型纯属浪费。实测同一份打分 prompt：
+        #   DeepSeek-V3.2 2.5s ／ Qwen3.5-35B-A3B 53.2s ／ Qwen3.5-27B 57.2s
+        #   ／ Qwen3.5-9B 直接超时／Qwen3-14B 1.5s／Qwen2.5-7B 0.7s
+        # 慢模型串行跑 5 篇就是好几分钟，看起来像卡死。
         model_b = None
-        for cand in (reader_chain[2:] + critic_chain):
+        for cand in (fast_chain + reader_chain[2:] + critic_chain):
             if cand and cand != model_a:
                 model_b = cand
                 break

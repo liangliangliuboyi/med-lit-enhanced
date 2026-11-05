@@ -27,29 +27,29 @@
       "planner": [
         "deepseek-ai/DeepSeek-V3.2",
         "deepseek-ai/DeepSeek-V3.1-Terminus",
-        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3-14B",
         "Qwen/Qwen3-32B"
       ],
       "reader": [
         "deepseek-ai/DeepSeek-V3.2",
         "deepseek-ai/DeepSeek-V3.1-Terminus",
-        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3-14B",
         "Qwen/Qwen2.5-72B-Instruct"
       ],
       "critic": [
         "deepseek-ai/DeepSeek-R1",
         "deepseek-ai/DeepSeek-V3.2",
-        "Qwen/Qwen3.5-27B"
+        "Qwen/Qwen3-14B"
       ],
       "writer": [
         "deepseek-ai/DeepSeek-V3.2",
         "deepseek-ai/DeepSeek-V3.1-Terminus",
-        "Qwen/Qwen3.5-35B-A3B"
+        "Qwen/Qwen3-14B"
       ],
       "fast": [
-        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen2.5-7B-Instruct",
         "Qwen/Qwen3-14B",
-        "Qwen/Qwen2.5-7B-Instruct"
+        "Qwen/Qwen3.5-9B"
       ]
     }
   },

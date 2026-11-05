@@ -160,5 +160,85 @@ class TestRouterBudget(unittest.TestCase):
         self.assertIn('boom', ' '.join(router.last_errors['reader']))
 
 
+class TestFailCounting(unittest.TestCase):
+    """失败计数：偶发失败不能污染整个角色。
+
+    背景（2026-11-05 实测）：精读是多线程并发的，原来「一次失败就永久拉黑
+    首选模型」，导致一个线程的偶发失败让**所有后续调用**都切到降级链上
+    处理长文本会超时的模型，每个调用耗满 240 秒预算，整轮检索卡死。
+    """
+
+    class _P:
+        name = 'fake'
+        base = 'http://fake'
+        timeout = 180
+
+        def __init__(self, fail_times=0):
+            self.fail_times = fail_times
+            self.calls = []
+
+        def available_models(self):
+            return []
+
+        def chat(self, model, messages, temperature=0.2, max_tokens=4000,
+                 timeout=None):
+            self.calls.append(model)
+            if self.fail_times > 0:
+                self.fail_times -= 1
+                raise RuntimeError('boom')
+            return {'content': 'ok', 'model': model, 'elapsed': 0, 'tokens': 1}
+
+    def test_one_failure_does_not_blacklist_model(self):
+        """偶发失败一次后，首选模型仍在链上。"""
+        prov = self._P(fail_times=1)
+        router = sf.ModelRouter(prov, {'reader': ['m1', 'm2']},
+                                call_budget=60, fail_threshold=2)
+        # 第一次调用：m1 失败一次（计数 1），顺延到 m2 成功
+        router.chat('reader', [{'role': 'user', 'content': 'x'}])
+        # 第二次调用：m1 只失败过 1 次 < 阈值 2 → 仍应先用 m1
+        prov.fail_times = 0
+        router.chat('reader', [{'role': 'user', 'content': 'x'}])
+        self.assertEqual(prov.calls[-1], 'm1',
+                         '偶发失败不应把首选模型踢出降级链')
+
+    def test_consecutive_failures_reach_threshold_and_fallback(self):
+        """连续失败达到阈值后，才真正降级。"""
+        prov = self._P(fail_times=0)
+        router = sf.ModelRouter(prov, {'reader': ['m1', 'm2']},
+                                call_budget=60, fail_threshold=2)
+        prov.fail_times = 99
+        for _ in range(3):
+            try:
+                router.chat('reader', [{'role': 'user', 'content': 'x'}])
+            except Exception:
+                pass
+        # m1 连续失败 ≥2 次后，链上不该再有 m1
+        self.assertNotIn('m1', router.chain_of('reader'))
+
+    def test_fail_counts_are_per_role(self):
+        """失败计数按角色隔离，reader 失败不影响 writer。"""
+        prov = self._P(fail_times=99)
+        router = sf.ModelRouter(prov, {'reader': ['m1'], 'writer': ['m1']},
+                                call_budget=60, fail_threshold=2)
+        for _ in range(2):
+            try:
+                router.chat('reader', [{'role': 'user', 'content': 'x'}])
+            except Exception:
+                pass
+        self.assertNotIn('m1', router.chain_of('reader'))
+        self.assertIn('m1', router.chain_of('writer'))
+
+    def test_chain_never_empty_raises_clearly(self):
+        """链上模型全被拉黑时要给出明确错误，而不是静默返回空。"""
+        prov = self._P(fail_times=99)
+        router = sf.ModelRouter(prov, {'reader': ['m1']},
+                                call_budget=60, fail_threshold=1)
+        with self.assertRaises(Exception):
+            router.chat('reader', [{'role': 'user', 'content': 'x'}])
+        with self.assertRaises(Exception):
+            router.chat('reader', [{'role': 'user', 'content': 'x'}])
+        self.assertEqual(router.chain_of('reader'), [])
+
+
 if __name__ == '__main__':
     unittest.main()
