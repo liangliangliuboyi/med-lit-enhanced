@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""主流程：规划 → 检索 → 扩写 → 题录 → 过滤 → 重排 → 精读 → 审查 → 成文 → 校验 → 落盘。
+"""主流程：规划 → 检索（含预检修订）→ 链接扩展 → 题录 → 过滤 → 重排 → 精读 → 审查 → 成文 → 校验 → 落盘。
 
-九段流水线的编排层。所有"机械活"（计数、过滤、排序、参考文献、校验）都在这里，
-模型只负责需要判断力的四件事：怎么问、怎么抽、怎么挑矛盾、怎么写。
+设计原则：模型只做需要判断力的事；计数、过滤、排序、拼接、校验、定级全部在程序侧。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -15,24 +15,44 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import config as cfgmod
+import grading
 import prompts
 import pubmed as pm
 import sf
 
+try:
+    import meta as metamod
+except Exception:  # noqa: BLE001
+    metamod = None
+try:
+    import preprints as preprintmod
+except Exception:  # noqa: BLE001
+    preprintmod = None
+
 
 # ---------------- 通用工具 ----------------
 def load_config(path: str | None = None) -> dict:
-    """向后兼容旧调用方式。"""
     return cfgmod.load_config(path)
 
 
 def _slug(text: str, n: int = 16) -> str:
+    """生成目录名片段。
+
+    末尾附加短哈希：同一分钟内跑两个相似问题（例如同一个课题的不同子问题）时，
+    仅靠前 n 个字符会撞目录、后者覆盖前者。
+    """
     t = re.sub(r'[^\w\u4e00-\u9fff]+', '', text or '')
-    return t[:n] or 'query'
+    t = t[:n] or 'query'
+    h = hashlib.md5((text or '').encode('utf-8')).hexdigest()[:4]
+    return f'{t}_{h}'
 
 
 def _json_load(text: str):
-    """从模型输出里抠 JSON（容忍 ```json 包裹和前后噪音）。"""
+    """从模型输出里抠 JSON（容忍 ```json 包裹和前后噪音）。
+
+    注意：不能用贪婪正则 `\\{.*\\}` —— 模型若在 JSON 前后夹带含花括号的说明文字，
+    贪婪匹配会吞掉整段导致解析失败。这里用括号配对扫描，能正确取出最外层结构。
+    """
     if not text:
         return None
     t = text.strip()
@@ -41,27 +61,58 @@ def _json_load(text: str):
     try:
         return json.loads(t)
     except Exception:  # noqa: BLE001
-        m = re.search(r'\{.*\}', t, re.S)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:  # noqa: BLE001
-                return None
+        pass
+    # 括号配对扫描：找到第一个 { 或 [，配对到对应的收尾括号
+    for opener, closer in (('{', '}'), ('[', ']')):
+        start = t.find(opener)
+        if start < 0:
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(t)):
+            ch = t[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == '\\':
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    chunk = t[start:i + 1]
+                    try:
+                        return json.loads(chunk)
+                    except Exception:  # noqa: BLE001
+                        break
     return None
 
 
 class Run:
     def __init__(self, question: str, constraints: str = '', cfg: dict | None = None,
-                 cq_explicit: list[str] | None = None):
+                 cq_explicit: list[str] | None = None,
+                 history: list[dict] | None = None,
+                 resume_dir: str | None = None):
         self.cfg = cfg or cfgmod.load_config()
         self.question = (question or '').strip()
         self.constraints = (constraints or '').strip()
+        self.history = history or []
         self.t0 = time.time()
         self.stamp = datetime.now().strftime('%Y%m%d-%H%M')
 
-        # ---- 输出目录 ----
+        # ---- 输出目录（断点续跑时复用原目录）----
         root = self.cfg['paths'].get('runs_root') or './runs'
-        self.dir = os.path.join(os.path.abspath(root), f'{self.stamp}_{_slug(self.question)}')
+        if resume_dir:
+            self.dir = os.path.abspath(resume_dir)
+        else:
+            self.dir = os.path.join(os.path.abspath(root), f'{self.stamp}_{_slug(self.question)}')
         os.makedirs(os.path.join(self.dir, '06_fulltext'), exist_ok=True)
 
         # ---- 模型端点与路由 ----
@@ -82,51 +133,67 @@ class Run:
             email=self.cfg['pubmed'].get('email', ''),
         )
 
-        # ---- Clinical Query（仅在用户显式指定时启用）----
+        # ---- Clinical Query（仅用户显式指定时启用）----
         self.cq_all = self._load_cq()
         self.cq_explicit = list(cq_explicit or [])
         self.cq_used: list[str] = []
         self.search_failed = False
+        self._search_latency: list[float] = []
 
         # ---- 状态 ----
         self.papers: dict[str, dict] = {}
         self.evidence: list[dict] = []
+        self.excluded: list[dict] = []          # C6：带排除理由
         self.search_log: list[dict] = []
         self.plan: dict = {}
         self.critique: dict = {}
         self.answer = ''
         self.pmid_check: dict = {}
+        self.pooled: list[dict] = []            # B4：合并效应量
+        self.mech_grading: dict = {}           # B1：机械定级
+        self.preprint_papers: list[dict] = []   # A4
         self.prisma = {
             'identified': 0, 'deduplicated': 0, 'screened': 0,
             'excluded_screening': 0, 'fulltext_assessed': 0,
             'included': 0, 'excluded_fulltext': 0, 'queries': 0,
+            'preprints': 0, 'linked': 0, 'snowballed': 0,
         }
         self.trace = {
             'question': self.question, 'constraints': self.constraints,
             'timings': {}, 'models': {}, 'errors': [], 'counts': {},
+            'tokens': {}, 'cost_estimate': {},
             'provider': {'name': self.provider.name, 'base_url': self.provider.base},
             'scope_on': False,
-            'scope_note': '本工具不做刊源限制，检索全 PubMed',
+            'scope_note': '本工具检索全 PubMed（英文国际文献），不限刊源、不限学科；'
+                          '不检索中文数据库',
             'clinical_queries': {'used': list(self.cq_used)},
         }
         self._log_lines: list[str] = []
-
-        # 全文抓取配额：并发下必须用锁，否则会超量
         self._ft_lock = threading.Lock()
         self._ft_claimed = 0
+        self._checkpoint: dict = {}
 
-    # ---------- 配置解析 ----------
+        if resume_dir:
+            self._load_checkpoint()
+
+    # ---------- 工具 ----------
     def _load_cq(self) -> dict:
-        """载入 PubMed 官方 Clinical Query 过滤器表（仅供 --cq 显式调用）。"""
+        """载入 PubMed 官方 Clinical Query 过滤器表（仅供 --cq 显式调用）。
+
+        读不到文件时不能静默返回空——那会让 --cq 看起来"生效了但没效果"。
+        """
         path = os.path.join(cfgmod.ROOT, 'data', 'clinical_queries.json')
         try:
             with open(path, encoding='utf-8') as f:
                 data = json.load(f)
-        except Exception:  # noqa: BLE001
+        except FileNotFoundError:
+            self.log(f'!! 找不到临床查询过滤器表：{path}（--cq 将不可用）')
+            return {}
+        except Exception as e:  # noqa: BLE001
+            self.log(f'!! 临床查询过滤器表读取失败：{e}（--cq 将不可用）')
             return {}
         return {k: v for k, v in data.items() if not k.startswith('_')}
 
-    # ---------- 日志 ----------
     def log(self, msg: str):
         line = f'[{time.strftime("%H:%M:%S")}] {msg}'
         print(line, flush=True)
@@ -136,20 +203,86 @@ class Run:
         self.trace['errors'].append({'stage': stage, 'err': str(e)[:400]})
         self.log(f'!! {stage} 出错：{e}')
 
+    def _track_tokens(self, role: str, res: dict):
+        """D3：记录每角色 token 用量与估算费用。"""
+        n = res.get('tokens')
+        if n:
+            self.trace['tokens'][role] = self.trace['tokens'].get(role, 0) + int(n)
+        price = (self.cfg.get('runtime') or {}).get('price_per_million_tokens')
+        if price and self.trace['tokens']:
+            total = sum(self.trace['tokens'].values())
+            self.trace['cost_estimate'] = {
+                'total_tokens': total,
+                'estimated_cny': round(total / 1_000_000 * price, 4),
+                'price_per_million_tokens': price,
+            }
+
+    # ---------- 断点续跑（D4）----------
+    def _ckpt_path(self) -> str:
+        return os.path.join(self.dir, '_checkpoint.json')
+
+    def _save_checkpoint(self):
+        try:
+            self._checkpoint = {
+                'plan': self.plan, 'search_log': self.search_log,
+                'papers': list(self.papers.values()),
+                'excluded': self.excluded, 'prisma': self.prisma,
+                'evidence': [{k: v for k, v in d.items() if not k.startswith('_')}
+                             for d in self.evidence],
+                'critique': self.critique, 'answer': self.answer,
+                'pooled': self.pooled, 'mech_grading': self.mech_grading,
+                'trace': self.trace,
+            }
+            with open(self._ckpt_path(), 'w', encoding='utf-8') as f:
+                json.dump(self._checkpoint, f, ensure_ascii=False, indent=1)
+        except Exception as e:  # noqa: BLE001
+            self.err('checkpoint', e)
+
+    def _load_checkpoint(self):
+        p = self._ckpt_path()
+        if not os.path.exists(p):
+            self.log(f'! 未找到断点文件 {p}，从头开始')
+            return
+        try:
+            with open(p, encoding='utf-8') as f:
+                ck = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            self.err('checkpoint-load', e)
+            return
+        self.plan = ck.get('plan', {})
+        self.search_log = ck.get('search_log', [])
+        for p2 in ck.get('papers', []):
+            if p2.get('pmid'):
+                self.papers[p2['pmid']] = p2
+        self.excluded = ck.get('excluded', [])
+        self.prisma.update(ck.get('prisma', {}))
+        self.evidence = ck.get('evidence', [])
+        self.critique = ck.get('critique', {})
+        self.answer = ck.get('answer', '')
+        self.pooled = ck.get('pooled', [])
+        self.mech_grading = ck.get('mech_grading', {})
+        self.trace.update(ck.get('trace', {}))
+        self.log(f'↻ 已载入断点：候选 {len(self.papers)} 篇，证据 {len(self.evidence)} 篇')
+
     # ---------- 1. 规划 ----------
     def plan_queries(self) -> dict:
+        hist = ''
+        if self.history:
+            prev = '；'.join(h.get('question', '') for h in self.history[-3:])
+            hist = (f'\n\n【对话历史】用户此前连续提问：{prev}\n'
+                    f'本次问题若是追问，请在检索式中保留必要的前序概念，不要重复问清。')
         msgs = [{'role': 'system', 'content': prompts.PLANNER_SYSTEM},
                 {'role': 'user', 'content': prompts.PLANNER_USER.format(
-                    question=self.question,
+                    question=self.question + hist,
                     constraints=self.constraints or '（无）')}]
         res = self.router.chat('planner', msgs,
                                temperature=self.cfg['runtime']['temperature_plan'],
                                max_tokens=1600)
         self.trace['timings']['plan'] = res['elapsed']
         self.trace['models']['planner'] = res['model']
+        self._track_tokens('planner', res)
         data = _json_load(res['content']) or {}
         if not data.get('queries'):
-            # 兜底：把问题原样当检索式
             data = {'core_question_en': self.question,
                     'queries': [{'label': '直译', 'query': self.question}],
                     'pico': {}, 'notes': '模型未给出检索式，已回退为原问题'}
@@ -160,9 +293,100 @@ class Run:
             self.log(f'   · [{q.get("label")}] {q.get("query", "")[:110]}')
         return data
 
-    # ---------- 2. 扩写（第二轮） ----------
+    def revise_queries(self, failed: list[dict]) -> list[dict]:
+        """A1：检索式命中 0 时让 planner 换一版。"""
+        used = '\n'.join(f'- {q.get("query", "")}' for q in failed)
+        msgs = [{'role': 'system', 'content': prompts.PLANNER_REVISE_SYSTEM},
+                {'role': 'user', 'content': prompts.PLANNER_REVISE_USER.format(
+                    core_question=self.plan.get('core_question_en') or self.question,
+                    failed_queries=used,
+                    constraints=self.constraints or '（无）')}]
+        try:
+            res = self.router.chat('planner', msgs,
+                                   temperature=0.3, max_tokens=1000)
+        except Exception as e:  # noqa: BLE001
+            self.err('revise', e)
+            return []
+        self._track_tokens('planner', res)
+        data = _json_load(res['content']) or {}
+        qs = data.get('queries') or []
+        self.log(f'   修订检索式 {len(qs)} 条（{res["model"]}）：{data.get("reason", "")}')
+        for q in qs:
+            self.log(f'   · [修订] {q.get("query", "")[:110]}')
+        return qs
+
+    # ---------- 2. 检索 ----------
+    def search(self, queries: list[dict], tag: str = 'round1',
+               retmax: int = 20, min_year: str | None = None):
+        if tag == 'round1':
+            self.log('   检索范围：全 PubMed（不限刊源，不限学科；仅英文国际文献）')
+
+        for cq_id in self.cq_explicit:
+            if cq_id not in self.cq_all:
+                self.log(f'   ! 未知 clinical query：{cq_id}（已忽略）')
+                continue
+            self.cq_used.append(cq_id)
+            self.log(f'   临床查询过滤器：{cq_id}（{self.cq_all[cq_id]["label"]}）')
+
+        exclude_animals = bool((self.cfg['retrieval'] or {}).get('exclude_animals'))
+
+        for q in queries:
+            term = (q.get('query') or '').strip()
+            if not term:
+                continue
+            full = term
+            for cq_id in self.cq_used:
+                full = pm.apply_clinical_query(full, self.cq_all[cq_id]['query'])
+            if exclude_animals:
+                full = pm.apply_animal_exclusion(full, True)
+            self.log(f'② 检索 [{q.get("label")}] {term[:90]}')
+            t0 = time.time()
+            try:
+                r = self.pubmed.esearch(full, retmax=retmax, mindate=min_year)
+            except Exception as e:  # noqa: BLE001
+                self.err('esearch', e)
+                continue
+            self._search_latency.append(time.time() - t0)
+            if r.get('error'):
+                self.search_failed = True
+                self.err('esearch', f"NCBI 检索后端暂不可用：{r['error']}")
+                self.log(f'   ! 检索后端报错，本条跳过：{str(r["error"])[:140]}')
+                continue
+            got = r['ids']
+            fresh = [i for i in got if i not in self.papers]
+            self.prisma['identified'] += r['count']
+            self.prisma['queries'] += 1
+            self.search_log.append({
+                'round': tag, 'label': q.get('label'), 'query': term,
+                'final_query': full[:800],
+                'total_hits': r['count'], 'retrieved': len(got), 'new': len(fresh),
+                'translation': r.get('translation', '')[:300],
+            })
+            self.log(f'   命中 {r["count"]}，取回 {len(got)}，新增 {len(fresh)}')
+            if fresh:
+                self.fetch_metadata(fresh)
+        self._save_checkpoint()
+
+    def search_with_precheck(self, queries: list[dict], tag: str = 'round1',
+                             retmax: int = 20, min_year: str | None = None):
+        """A1：检索式命中为 0 时自动修订重试（最多 2 轮）。"""
+        self.search(queries, tag, retmax, min_year)
+        current = queries
+        for attempt in range(1, int(self.cfg['retrieval'].get('max_revisions', 2)) + 1):
+            hits = sum(s['total_hits'] for s in self.search_log if s['round'] == tag)
+            if hits > 0 or self.search_failed:
+                break
+            self.log(f'   ! 本轮命中 0，触发检索式修订（第 {attempt} 次）')
+            revised = self.revise_queries(current)
+            if not revised:
+                break
+            newtag = f'{tag}rev{attempt}'
+            self.search(revised, tag=newtag, retmax=retmax, min_year=min_year)
+            current = revised
+        return current
+
     def expand_queries(self) -> list[dict]:
-        """第一轮候选不足时，让 planner 扩写检索式提高召回。"""
+        """第二轮：让 planner 补充检索式（缩写/旧术语/同义表述），提高召回。"""
         rounds = int(self.cfg['retrieval'].get('rounds', 1) or 1)
         if rounds < 2:
             return []
@@ -172,7 +396,7 @@ class Run:
             self.log(f'   候选已充足（{len(self.papers)} ≥ {need}），跳过扩写')
             return []
         used = '\n'.join(f'- {q.get("query", "")}' for q in self.plan.get('queries', []))
-        gaps = ('（请补充缩写、旧术语、同义表述，以及该问题常用的其他 MeSH 专指词）')
+        gaps = '（请补充缩写、旧术语、同义表述，以及该问题常用的其他 MeSH 专指词）'
         msgs = [{'role': 'system', 'content': prompts.PLANNER_EXPAND_SYSTEM},
                 {'role': 'user', 'content': prompts.PLANNER_EXPAND_USER.format(
                     core_question=self.plan.get('core_question_en') or self.question,
@@ -187,6 +411,7 @@ class Run:
         except Exception as e:  # noqa: BLE001
             self.err('expand', e)
             return []
+        self._track_tokens('planner', res)
         data = _json_load(res['content']) or {}
         qs = data.get('queries') or []
         self.log(f'   扩写轮：新增 {len(qs)} 条检索式（{res["model"]}，{res["elapsed"]}s）')
@@ -194,55 +419,65 @@ class Run:
             self.log(f'   · [扩写] {q.get("query", "")[:110]}')
         return qs
 
-    # ---------- 3. 检索 ----------
-    def search(self, queries: list[dict], tag: str = 'round1',
-               retmax: int = 20, min_year: str | None = None):
-        # 本工具不做刊源限制：检索全 PubMed，任何期刊、任何出版社都进入候选。
-        if tag == 'round1':
-            self.log('   检索范围：全 PubMed（不限刊源，不限学科）')
-
-        # Clinical Query 仅在用户显式指定时启用
-        for cq_id in self.cq_explicit:
-            if cq_id not in self.cq_all:
-                self.log(f'   ! 未知 clinical query：{cq_id}（已忽略）')
-                continue
-            self.cq_used.append(cq_id)
-            self.log(f'   临床查询过滤器：{cq_id}（{self.cq_all[cq_id]["label"]}）')
-
-        for q in queries:
-            term = (q.get('query') or '').strip()
-            if not term:
-                continue
-            full = term
-            for cq_id in self.cq_used:
-                full = pm.apply_clinical_query(full, self.cq_all[cq_id]['query'])
-            self.log(f'② 检索 [{q.get("label")}] {term[:90]}')
-            try:
-                r = self.pubmed.esearch(full, retmax=retmax, mindate=min_year)
-            except Exception as e:  # noqa: BLE001
-                self.err('esearch', e)
-                continue
-            # NCBI 检索后端故障时返回 HTTP 200 + ERROR 字段，
-            # 必须与"真的没检索到"区分开，否则会把上游故障说成证据不足。
+    # ---------- 3. 链接扩展（A2）与引文滚雪球（A3） ----------
+    def expand_by_links(self, max_extra: int = 15):
+        """A2：被引文献 + 相似文献。"""
+        seeds = list(self.papers.keys())[:8]
+        if not seeds:
+            return
+        for linkname, label in (('pubmed_pubmed_citedin', '被引文献'),
+                                ('pubmed_pubmed_sim', '相似文献')):
+            r = self.pubmed.elink(seeds, linkname, retmax=max_extra)
             if r.get('error'):
-                self.search_failed = True
-                self.err('esearch', f"NCBI 检索后端暂不可用：{r['error']}")
-                self.log(f'   ! 检索后端报错，本条跳过：{str(r["error"])[:140]}')
+                self.log(f'   ! {label}扩展失败：{r["error"][:80]}')
                 continue
-            got = r['ids']
-            fresh = [i for i in got if i not in self.papers]
-            self.prisma['identified'] += r['count']
-            self.prisma['queries'] += 1
-            self.search_log.append({
-                'round': tag, 'label': q.get('label'), 'query': term,
-                'final_query': full[:600],
-                'total_hits': r['count'], 'retrieved': len(got), 'new': len(fresh),
-                'translation': r.get('translation', '')[:300],
-            })
-            self.log(f'   命中 {r["count"]}，取回 {len(got)}，新增 {len(fresh)}')
-            # 立刻抓题录，确保本轮内去重生效
-            if fresh:
-                self.fetch_metadata(fresh)
+            new = [i for i in r['ids'] if i not in self.papers][:max_extra]
+            if new:
+                self.fetch_metadata(new)
+                self.prisma['linked'] += len(new)
+                self.log(f'   + {label}扩展：新增 {len(new)} 篇')
+        self._save_checkpoint()
+
+    def expand_by_references(self, max_titles: int = 3):
+        """A3：从种子文献的参考文献标题回灌检索。"""
+        titles: list[str] = []
+        for p in list(self.papers.values())[:6]:
+            for t in (p.get('reference_titles') or []):
+                if len(t) > 25 and t not in titles:
+                    titles.append(t)
+        titles = titles[:max_titles]
+        if not titles:
+            return
+        for t in titles:
+            try:
+                r = self.pubmed.esearch(f'"{t}"[Title]', retmax=3)
+            except Exception as e:  # noqa: BLE001
+                self.err('snowball', e)
+                continue
+            if r.get('error'):
+                continue
+            new = [i for i in r['ids'] if i not in self.papers]
+            if new:
+                self.fetch_metadata(new)
+                self.prisma['snowballed'] += len(new)
+                self.log(f'   + 引文滚雪球："{t[:48]}…" → 新增 {len(new)} 篇')
+        self._save_checkpoint()
+
+    def search_preprints(self, term: str, retmax: int = 15):
+        """A4：bioRxiv / medRxiv 预印本。"""
+        if not preprintmod or not (self.cfg['retrieval'] or {}).get('include_preprints'):
+            return
+        r = preprintmod.search_preprints(term, retmax=retmax)
+        if r.get('error'):
+            self.log(f'   ! 预印本检索不可用：{r["error"][:100]}')
+            return
+        papers = r.get('papers') or []
+        if papers:
+            self.preprint_papers.extend(papers)
+            self.prisma['preprints'] += len(papers)
+            self.log(f'   + 预印本（bioRxiv/medRxiv）：{len(papers)} 篇'
+                     f'（已标注来源，证据等级会相应下调）')
+        self._save_checkpoint()
 
     # ---------- 4. 题录 ----------
     def fetch_metadata(self, pmids: list[str]) -> int:
@@ -274,16 +509,30 @@ class Run:
         for pid in list(self.papers.keys()):
             p = self.papers[pid]
             if research_only and not pm.is_research_article(p, exclude, research_min):
+                self.excluded.append({'pmid': pid, 'title': p.get('title', ''),
+                                      'reason': '非研究论文（文献类型不符合）'})
                 del self.papers[pid]
                 dropped += 1
                 continue
             if len(p.get('abstract') or '') < min_abs:
+                self.excluded.append({'pmid': pid, 'title': p.get('title', ''),
+                                      'reason': f'摘要过短（<{min_abs} 字）'})
+                del self.papers[pid]
+                dropped += 1
+                continue
+            # B2：撤稿文献不进精读池
+            chk = pm.check_retraction(p)
+            if chk['retracted']:
+                self.excluded.append({'pmid': pid, 'title': p.get('title', ''),
+                                      'reason': '已撤稿（Retracted Publication）'})
                 del self.papers[pid]
                 dropped += 1
         self.prisma['deduplicated'] = before
         self.prisma['screened'] = len(self.papers)
         self.prisma['excluded_screening'] = before - len(self.papers)
-        self.log(f'③ 过滤后保留 {len(self.papers)} 篇（剔除 {dropped} 篇：非研究论文 / 摘要过短）')
+        self.log(f'③ 过滤后保留 {len(self.papers)} 篇（剔除 {dropped} 篇：'
+                 f'非研究论文 / 摘要过短 / 已撤稿）')
+        self._save_checkpoint()
         return list(self.papers.keys())
 
     # ---------- 6. 重排 ----------
@@ -319,7 +568,6 @@ class Run:
 
     # ---------- 7. 精读 ----------
     def _claim_fulltext_slot(self) -> bool:
-        """原子地占用一个全文抓取配额。并发下避免超量抓取。"""
         limit = int(self.cfg['retrieval'].get('fulltext_limit', 0) or 0)
         with self._ft_lock:
             if self._ft_claimed < limit:
@@ -327,9 +575,22 @@ class Run:
                 return True
         return False
 
+    def _adaptive_workers(self) -> int:
+        """D5：按实测检索延迟调整并发度。"""
+        base = max(1, int(self.cfg['runtime']['workers']))
+        if not self._search_latency:
+            return base
+        lat = sorted(self._search_latency)
+        med = lat[len(lat) // 2]
+        if med > 4.0:
+            return max(1, base - 1)
+        if med < 1.0:
+            return min(6, base + 1)
+        return base
+
     def read_one(self, pmid: str) -> dict | None:
         p = self.papers[pmid]
-        ft = {'source': 'abstract', 'text': ''}
+        ft = {'source': 'abstract', 'text': '', 'figure_captions': []}
         if self._claim_fulltext_slot():
             try:
                 ft = self.pubmed.fulltext(p)
@@ -364,10 +625,11 @@ class Run:
         try:
             res = self.router.chat('reader', msgs,
                                    temperature=self.cfg['runtime']['temperature_reader'],
-                                   max_tokens=1600)
+                                   max_tokens=2200)
         except Exception as e:  # noqa: BLE001
             self.err(f'read {pmid}', e)
             return None
+        self._track_tokens('reader', res)
         data = _json_load(res['content'])
         if not data:
             self.err(f'read {pmid}', 'JSON 解析失败')
@@ -377,12 +639,20 @@ class Run:
         data['_journal'] = p.get('journal', '')
         data['_year'] = p.get('year', '')
         data['_title'] = p.get('title', '')
+        # B7：图表说明
+        caps = (ft.get('figure_captions') or [])[:8]
+        if caps:
+            data['_figure_captions'] = caps
+        # B2：撤稿/勘误标记
+        chk = pm.check_retraction(p)
+        if chk['note']:
+            data['_retraction'] = chk['note']
         return data
 
     def read_all(self, ids: list[str]):
-        self.log(f'⑤ 逐篇精读（{len(ids)} 篇，并发 {self.cfg["runtime"]["workers"]}）')
+        workers = self._adaptive_workers()
+        self.log(f'⑤ 逐篇精读（{len(ids)} 篇，并发 {workers}）')
         t0 = time.time()
-        workers = max(1, int(self.cfg['runtime']['workers']))
         done = 0
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(self.read_one, pid): pid for pid in ids}
@@ -399,45 +669,68 @@ class Run:
                     self.log(f'   [{done}/{len(ids)}] {pid} 相关度 {d.get("relevance", "?")}'
                              f'（{d["_text_source"]}）')
                 else:
+                    self.prisma['excluded_fulltext'] += 1
                     self.log(f'   [{done}/{len(ids)}] {pid} 抽取失败')
         self.trace['timings']['read'] = round(time.time() - t0, 1)
         self.evidence.sort(key=lambda d: (-(d.get('relevance') or 0), str(d.get('_year') or '')))
         self.prisma['fulltext_assessed'] = len(ids)
         self.prisma['included'] = len(self.evidence)
-        self.prisma['excluded_fulltext'] = len(ids) - len(self.evidence)
+        self.prisma['excluded_fulltext'] = max(0, len(ids) - len(self.evidence))
         self.log(f'   精读完成：成功 {len(self.evidence)} 篇，{self.trace["timings"]["read"]}s')
+        self._save_checkpoint()
 
-    # ---------- 8. 审查 ----------
+    # ---------- 8. 效应量合并（B4） ----------
+    def pool_effects(self):
+        if not metamod:
+            return []
+        try:
+            self.pooled = metamod.summarize_effects(self.evidence)
+        except Exception as e:  # noqa: BLE001
+            self.err('meta', e)
+            self.pooled = []
+        for p in self.pooled:
+            self.log(f'   合并效应量：{p.get("metric")} = {p.get("pooled")} '
+                     f'({p.get("ci_low")}–{p.get("ci_high")}), I²={p.get("i2")}%, '
+                     f'k={p.get("k")}，{p.get("heterogeneity")}异质性')
+        self._save_checkpoint()
+        return self.pooled
+
+    # ---------- 9. 审查 ----------
     def critique_all(self) -> dict:
         if not self.evidence:
             return {'evidence_strength': '无证据', 'certainty': '极低',
                     'certainty_reason': '本轮未获得可用的结构化证据',
                     'consistency': '无', 'conflicts': [],
                     'gaps': ['本轮检索未获得可用的结构化证据'],
-                    'warnings': ['检索过窄或全部抽取失败']}
+                    'warnings': ['检索过窄或全部抽取失败'],
+                    'population_applicability': '不适用'}
         slim = [{k: v for k, v in d.items() if not k.startswith('_')} for d in self.evidence]
         msgs = [{'role': 'system', 'content': prompts.CRITIC_SYSTEM},
                 {'role': 'user', 'content': prompts.CRITIC_USER.format(
                     question=self.plan.get('core_question_en') or self.question,
                     evidence=json.dumps(slim, ensure_ascii=False)[:14000],
-                    search_summary=self.search_summary())}]
+                    search_summary=self.search_summary(),
+                    mechanical_grading=json.dumps(self.mech_grading, ensure_ascii=False))}]
         self.log('⑥ 横向证据审查')
         try:
-            res = self.router.chat('critic', msgs, temperature=0.15, max_tokens=1800)
+            res = self.router.chat('critic', msgs, temperature=0.15, max_tokens=2000)
             self.trace['timings']['critique'] = res['elapsed']
             self.trace['models']['critic'] = res['model']
+            self._track_tokens('critic', res)
             data = _json_load(res['content']) or {}
             self.log(f'   完成（{res["model"]}，{res["elapsed"]}s）'
                      f'—— 一致性：{data.get("consistency", "?")}'
-                     f'｜GRADE：{data.get("certainty", "?")}')
+                     f'｜GRADE：{data.get("certainty", "?")}'
+                     f'（机械定级 {self.mech_grading.get("certainty", "?")}）')
             return data
         except Exception as e:  # noqa: BLE001
             self.err('critique', e)
-            return {'evidence_strength': '审查环节失败', 'certainty': '未知',
-                    'certainty_reason': '', 'consistency': '未知',
-                    'conflicts': [], 'gaps': [], 'warnings': [str(e)[:200]]}
+            return {'evidence_strength': '审查环节失败', 'certainty': '极低',
+                    'certainty_reason': '审查环节失败', 'consistency': '未知',
+                    'conflicts': [], 'gaps': [], 'warnings': [str(e)[:200]],
+                    'population_applicability': '未知'}
 
-    # ---------- 9. 成文 ----------
+    # ---------- 10. 概况与表格 ----------
     def search_summary(self) -> str:
         if not self.search_log:
             return '（无检索记录）'
@@ -456,10 +749,16 @@ class Run:
             f'- 年份范围：{ymin}–{ymax}',
             '- 设计分布：' + '；'.join(f'{k} {v} 篇' for k, v in designs.items()),
             '- 期刊来源：' + '；'.join(sorted({p.get("journal", "") for p in self.papers.values()})[:8]),
-            '- 检索范围：全 PubMed（不限刊源，不限学科）',
+            '- 检索范围：全 PubMed（不限刊源，不限学科；**仅英文国际文献，未检索中文数据库**）',
         ]
         if self.cq_used:
             lines.append('- 临床查询过滤器：' + '、'.join(self.cq_used))
+        if self.prisma.get('linked'):
+            lines.append(f'- 经被引/相似文献链接扩展补充 {self.prisma["linked"]} 篇')
+        if self.prisma.get('snowballed'):
+            lines.append(f'- 经引文滚雪球补充 {self.prisma["snowballed"]} 篇')
+        if self.prisma.get('preprints'):
+            lines.append(f'- 预印本（bioRxiv/medRxiv）{self.prisma["preprints"]} 篇')
         return '\n'.join(lines)
 
     def prisma_summary(self) -> str:
@@ -475,8 +774,7 @@ class Run:
     def prisma_table(self) -> str:
         p = self.prisma
         rows = [
-            '| 阶段 | 数量 |',
-            '|---|---|',
+            '| 阶段 | 数量 |', '|---|---|',
             f'| 数据库检出记录（{p["queries"]} 次检索，去重前） | {p["identified"]} |',
             f'| 去重后题录 | {p["deduplicated"]} |',
             f'| 题摘初筛排除 | −{p["excluded_screening"]} |',
@@ -484,17 +782,68 @@ class Run:
             f'| 全文/深读评估排除 | −{p["excluded_fulltext"]} |',
             f'| 最终纳入 | {p["included"]} |',
         ]
+        if p.get('linked'):
+            rows.append(f'| 其中来自被引/相似文献链接扩展 | +{p["linked"]} |')
+        if p.get('snowballed'):
+            rows.append(f'| 其中来自引文滚雪球 | +{p["snowballed"]} |')
+        if p.get('preprints'):
+            rows.append(f'| 其中预印本 | +{p["preprints"]} |')
         return '\n'.join(rows)
 
+    def exclusion_reasons(self) -> str:
+        rs = grading.excluded_reason_table(self.excluded)
+        return '\n'.join(f'- {r}' for r in rs) if rs else '- （无排除记录）'
+
     def evidence_table(self) -> str:
-        rows = ['| # | PMID | 年份 | 期刊 | 设计 | 样本量 | 相关度 | 核心发现 |',
-                '|---|------|------|------|------|--------|--------|----------|']
+        """证据总表。单元格里的竖线必须全部转义，否则会把 Markdown 表格打散。"""
+        def cell(v, limit=0) -> str:
+            s = str(v if v is not None else '')
+            s = s.replace('|', '/').replace('\n', ' ').strip()
+            if limit and len(s) > limit:
+                s = s[:limit]
+            return s
+
+        rows = ['| # | PMID | 年份 | 期刊 | 设计 | 样本量 | PICO | 相关度 | 核心发现 |',
+                '|---|------|------|------|------|--------|------|--------|----------|']
         for i, d in enumerate(self.evidence, 1):
-            kf = '；'.join((d.get('key_findings') or [])[:2])[:100].replace('|', '/')
-            rows.append(f'| {i} | {d.get("pmid", "")} | {d.get("_year", "")} | '
-                        f'{(d.get("_journal") or "")[:26]} | {(d.get("study_design") or "")[:16]} | '
-                        f'{str(d.get("sample_size") or "")[:14]} | {d.get("relevance", "")} | {kf} |')
+            kf = cell('；'.join((d.get('key_findings') or [])[:2]), 100)
+            flag = ' ⚠撤稿' if d.get('_retraction') else ''
+            rows.append(f'| {i} | {cell(d.get("pmid"))}{flag} | {cell(d.get("_year"))} | '
+                        f'{cell(d.get("_journal"), 26)} | {cell(d.get("study_design"), 16)} | '
+                        f'{cell(d.get("sample_size"), 14)} | '
+                        f'{cell(d.get("pico_match")) or "—"} | {cell(d.get("relevance"))} | {kf} |')
         return '\n'.join(rows)
+
+    def bias_table(self) -> str:
+        """B3：偏倚评估要素汇总。"""
+        fields = [('randomization', '随机化'), ('blinding', '盲法'),
+                  ('allocation_concealment', '分配隐藏'),
+                  ('followup_duration', '随访时长'),
+                  ('attrition', '失访'), ('sample_size_calc', '样本量估算')]
+        rows = ['| PMID | ' + ' | '.join(lbl for _, lbl in fields) + ' |',
+                '|---|' + '---|' * len(fields)]
+        for d in self.evidence:
+            ba = d.get('bias_assessment') or {}
+            cells = []
+            for key, _lbl in fields:
+                v = str(ba.get(key) or '未提及')
+                cells.append(v.replace('|', '/')[:22])
+            rows.append(f'| {d.get("pmid", "")} | ' + ' | '.join(cells) + ' |')
+        return '\n'.join(rows)
+
+    def pooled_summary(self) -> str:
+        if not self.pooled:
+            return '（本轮没有可合并的效应量）'
+        out = []
+        for p in self.pooled:
+            if p.get('k', 0) <= 0:
+                out.append(f'- {p.get("metric")}：{p.get("note", "无法合并")}')
+                continue
+            out.append(f'- {p.get("metric")} 合并值 {p.get("pooled")} '
+                       f'(95%CI {p.get("ci_low")}–{p.get("ci_high")})，'
+                       f'k={p.get("k")}，I²={p.get("i2")}%，'
+                       f'{p.get("model")} 模型，异质性{p.get("heterogeneity")}')
+        return '\n'.join(out)
 
     def bibliography(self) -> str:
         """参考文献由脚本按 PubMed 原始字段生成，不经过模型。"""
@@ -507,9 +856,12 @@ class Run:
             journal = p.get('journal') or p.get('journal_short') or ''
             year = p.get('year') or ''
             doi = f' doi:{p["doi"]}' if p.get('doi') else ''
-            out.append(f'{i}. {head}{title}. *{journal}*. {year}. PMID:{d["pmid"]}{doi}')
+            note = ' [已撤稿]' if d.get('_retraction') else ''
+            out.append(f'{i}. {head}{title}. *{journal}*. {year}. '
+                       f'PMID:{d["pmid"]}{doi}{note}')
         return '\n'.join(out)
 
+    # ---------- 11. 成文 ----------
     def write(self) -> str:
         msgs = [{'role': 'system', 'content': prompts.WRITER_SYSTEM},
                 {'role': 'user', 'content': prompts.WRITER_USER.format(
@@ -518,35 +870,37 @@ class Run:
                     search_summary=self.search_summary(),
                     prisma=self.prisma_summary(),
                     evidence_table=self.evidence_table(),
+                    retraction_notes='\n'.join(
+                        grading.retraction_notes(list(self.papers.values()))
+                    ) or '（无撤稿/勘误提示）',
+                    pooled_effects=self.pooled_summary(),
                     critique=json.dumps(self.critique, ensure_ascii=False)[:8000])}]
         self.log('⑦ 撰写答案')
         try:
             res = self.router.chat('writer', msgs,
                                    temperature=self.cfg['runtime']['temperature_writer'],
-                                   max_tokens=self.cfg['runtime']['max_tokens'] + 1500)
+                                   max_tokens=self.cfg['runtime']['max_tokens'] + 2000)
             self.trace['timings']['write'] = res['elapsed']
             self.trace['models']['writer'] = res['model']
+            self._track_tokens('writer', res)
             self.log(f'   完成（{res["model"]}，{res["elapsed"]}s）')
             return res['content']
         except Exception as e:  # noqa: BLE001
             self.err('write', e)
             return '## 生成失败\n\n模型调用出错，请查看 09_log.txt。\n'
 
-    # ---------- 10. PMID 越界校验 ----------
+    # ---------- 12. PMID 越界校验 ----------
     def validate_pmids(self) -> dict:
-        """正文里出现的每个 PMID 都必须来自候选池；否则判为越界引用。"""
-        cited = set(re.findall(r'\[PMID:(\d+)\]', self.answer or ''))
+        # 容许 "[PMID: 12345678]" 这类带空格的写法
+        cited = set(re.findall(r'\[PMID:\s*(\d+)\]', self.answer or ''))
         pool = set(self.papers.keys())
         orphan = sorted(cited - pool)
         check = {
-            'cited_count': len(cited),
-            'pool_size': len(pool),
-            'orphan_pmids': orphan,
-            'orphan_count': len(orphan),
+            'cited_count': len(cited), 'pool_size': len(pool),
+            'orphan_pmids': orphan, 'orphan_count': len(orphan),
             'cited_in_pool': len(cited & pool),
         }
         if self.search_failed:
-            # 上游故障导致没生成答案，不做 PMID 判读
             check['skipped'] = '检索后端故障，未生成答案'
             self.pmid_check = check
             return check
@@ -556,7 +910,7 @@ class Run:
             self.trace['errors'].append({'stage': 'pmid_check', 'err': msg})
             self.log(f'!! PMID 校验未通过：{msg}')
         elif cited:
-            self.log(f'   PMID 校验通过：正文引用 {len(cited)} 个，全部来自候选池')
+            self.log(f'   ✓ PMID 校验通过：正文引用 {len(cited)} 个，全部来自候选池')
         else:
             self.log('   ! 正文没有出现任何 [PMID:xxxx]，可能是证据不足或模型未遵守写作纪律')
             self.trace['errors'].append({'stage': 'pmid_check',
@@ -564,7 +918,7 @@ class Run:
         self.pmid_check = check
         return check
 
-    # ---------- 11. 落盘 ----------
+    # ---------- 13. 落盘 ----------
     def _w(self, name: str, content: str):
         with open(os.path.join(self.dir, name), 'w', encoding='utf-8') as f:
             f.write(content)
@@ -572,14 +926,18 @@ class Run:
     def save(self):
         self._w('01_question.md',
                 f'# 问题\n\n{self.question}\n\n## 补充限定\n\n{self.constraints or "（无）"}\n\n'
-                f'## 检索范围\n\n全 PubMed（不限刊源，不限学科）\n')
+                f'## 检索范围\n\n全 PubMed（不限刊源、不限学科；仅英文国际文献，未检索中文数据库）\n')
         self._w('02_plan.json', json.dumps(self.plan, ensure_ascii=False, indent=2))
         self._w('03_papers.json', json.dumps(list(self.papers.values()), ensure_ascii=False, indent=1))
-
         clean = [{k: v for k, v in d.items() if not k.startswith('_')} for d in self.evidence]
         self._w('04_evidence.json', json.dumps(clean, ensure_ascii=False, indent=1))
         self._w('05_evidence_table.md',
-                f'# 证据总表\n\n{self.search_summary()}\n\n{self.evidence_table()}\n')
+                f'# 证据总表\n\n{self.search_summary()}\n\n{self.evidence_table()}\n\n'
+                f'## 偏倚评估要素\n\n{self.bias_table()}\n\n'
+                f'## 合并效应量\n\n{self.pooled_summary()}\n\n'
+                f'## GRADE 机械定级\n\n'
+                f'{self.mech_grading.get("reason", "（未执行）")}\n')
+        self._w('05b_excluded.json', json.dumps(self.excluded, ensure_ascii=False, indent=1))
 
         bib = self.bibliography()
         answer = self.answer
@@ -590,6 +948,7 @@ class Run:
         self._w('11_prisma.md',
                 '# PRISMA 流程\n\n' + self.prisma_summary() + '\n\n'
                 + self.prisma_table() + '\n\n'
+                + '## 排除理由汇总\n\n' + self.exclusion_reasons() + '\n\n'
                 + '## 检索式明细\n\n'
                 + '\n'.join(f'### 第 {i} 次检索（{s["round"]} / {s.get("label", "")}）\n\n'
                             f'- 命中：{s["total_hits"]}\n- 取回：{s["retrieved"]}\n'
@@ -599,32 +958,78 @@ class Run:
         self.trace['counts'] = {'papers': len(self.papers), 'evidence': len(self.evidence)}
         self.trace['prisma'] = dict(self.prisma)
         self.trace['pmid_check'] = dict(self.pmid_check)
+        self.trace['mechanical_grading'] = dict(self.mech_grading)
         self.trace['elapsed_total'] = round(time.time() - self.t0, 1)
         self._w('10_trace.json', json.dumps(self.trace, ensure_ascii=False, indent=2))
         self._w('09_log.txt', '\n'.join(self._log_lines) + '\n')
         self.log(f'⑧ 已保存到 {self.dir}')
-        self.log(f'   总耗时 {self.trace["elapsed_total"]}s')
+        self.log(f'   总耗时 {self.trace["elapsed_total"]}s'
+                 + (f'｜本次 token 约 {self.trace["tokens"]}' if self.trace['tokens'] else ''))
+        self._update_index()
+        self._save_checkpoint()
+
+    def _update_index(self):
+        """C4：维护 runs 根目录下的汇总索引。"""
+        try:
+            root = os.path.abspath(self.cfg['paths'].get('runs_root') or './runs')
+            os.makedirs(root, exist_ok=True)
+            idx = os.path.join(root, '_index.md')
+            title = (self.plan.get('core_question_en') or self.question)[:80]
+            row = (f'| {self.stamp} | {title} | {len(self.evidence)} | '
+                   f'{self.pmid_check.get("cited_count", 0)} | '
+                   f'{self.prisma.get("identified", 0)} | '
+                   f'{self.trace.get("elapsed_total", 0)}s |')
+            if not os.path.exists(idx):
+                with open(idx, 'w', encoding='utf-8') as f:
+                    f.write('# 运行索引\n\n| 时间 | 问题 | 纳入 | 引用PMID | 命中 | 耗时 |\n')
+                    f.write('|---|---|---|---|---|---|\n')
+            with open(idx, 'a', encoding='utf-8') as f:
+                f.write(row + '\n')
+        except Exception as e:  # noqa: BLE001
+            self.err('index', e)
 
     # ---------- 编排 ----------
-    def execute(self, quick: bool = False):
+    def execute(self, quick: bool = False, resume: bool = False):
         ret = self.cfg['retrieval']
-        max_papers = int(ret['max_papers'])
-        min_year = str(ret.get('min_year') or '') or None
 
-        self.plan_queries()
-        self.search(self.plan.get('queries', []), tag='round1',
-                    retmax=int(ret['retmax_per_query']), min_year=min_year)
-
-        if not self.papers:
-            self.log('!! 没有检索到任何文献，尝试放宽：去掉年份限制')
-            self.search(self.plan.get('queries', []), tag='round1b',
-                        retmax=int(ret['retmax_per_query']), min_year=None)
+        if resume and self.plan:
+            self.log('↻ 断点续跑：跳过规划与检索阶段')
+        else:
+            self.plan_queries()
+            # A7：年份下限自适应（planner 给出 year_floor）
+            min_year = str(ret.get('min_year') or '') or None
+            try:
+                yf = int(self.plan.get('year_floor') or 0)
+                if yf:
+                    min_year = str(yf)
+                    self.log(f'   年份下限（自适应）：{min_year}')
+            except (TypeError, ValueError):
+                pass
+            self.search_with_precheck(self.plan.get('queries', []), tag='round1',
+                                      retmax=int(ret['retmax_per_query']),
+                                      min_year=min_year)
+            if not self.papers and not self.search_failed:
+                self.log('!! 没有检索到任何文献，尝试放宽：去掉年份限制')
+                self.search_with_precheck(self.plan.get('queries', []), tag='round1b',
+                                          retmax=int(ret['retmax_per_query']),
+                                          min_year=None)
 
         # 第二轮：扩写检索式提高召回
         extra = self.expand_queries()
         if extra:
-            self.search(extra, tag='round2',
-                        retmax=int(ret.get('retmax_per_query_round2', 12)), min_year=min_year)
+            min_year = str(ret.get('min_year') or '') or None
+            self.search_with_precheck(extra, tag='round2',
+                                      retmax=int(ret.get('retmax_per_query_round2', 12)),
+                                      min_year=min_year)
+
+        # A2 / A3 / A4 扩展
+        if ret.get('expand_by_links', True):
+            self.expand_by_links(max_extra=int(ret.get('max_link_expansion', 15)))
+        if ret.get('expand_by_references', True):
+            self.expand_by_references(max_titles=int(ret.get('max_snowball_titles', 3)))
+        if ret.get('include_preprints', False):
+            self.search_preprints(self.plan.get('core_question_en') or self.question,
+                                  retmax=int(ret.get('preprint_limit', 15)))
 
         ids = self.filter_papers()
         if not ids:
@@ -635,8 +1040,7 @@ class Run:
                     '**本轮未能完成检索：NCBI 检索后端暂时不可用**（返回 '
                     '`Search Backend failed / Search is temporarily unavailable`）。\n\n'
                     '这不是"检索后没有相关证据"，而是**上游服务故障**。'
-                    '请稍后重试，或用 `--pubmed-only` 单独确认检索式是否可用。\n'
-                )
+                    '请稍后重试，或用 `--pubmed-only` 单独确认检索式是否可用。\n')
             else:
                 self.log('!! 过滤后为空，跳过精读')
                 self.answer = '## 一句话结论\n\n本轮检索未获得可用文献，无法作答。\n'
@@ -646,6 +1050,11 @@ class Run:
 
         picked = self.rerank(ids)
         self.read_all(picked)
+        self.pool_effects()
+        # B1：机械定级（在审查之前算好，供 critic 复核）
+        self.mech_grading = grading.mechanical_grading(self.evidence, self.pooled)
+        self.log(f'   GRADE 机械定级：{self.mech_grading.get("certainty")}'
+                 f'（{self.mech_grading.get("reason", "")}）')
         self.critique = self.critique_all()
         self.answer = self.write()
         self.validate_pmids()

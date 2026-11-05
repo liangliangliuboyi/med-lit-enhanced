@@ -1,6 +1,5 @@
 {
   "_comment": "配置模板。复制为 config.json 后可自由修改；密钥请写进 .env 或系统环境变量，不要写在这里。config.local.json 可覆盖本文件的任意字段（已 gitignore）。检索范围固定为全 PubMed，不做刊源或学科限制。",
-
   "provider": {
     "name": "siliconflow",
     "base_url": "https://api.siliconflow.cn/v1",
@@ -17,13 +16,12 @@
       "api_key_env": "SILICONFLOW_API_KEY"
     }
   },
-
   "pubmed": {
     "api_key_env": "NCBI_API_KEY",
     "tool": "medlit-agent",
-    "email": ""
+    "email": "3352292450@qq.com",
+    "_comment": "tool 是项目级标识；email 按 NCBI 规定填「软件开发者」的邮箱（不是终端使用者的），使用者可在自己的 config.json 里改成自己的。不填也能用，只是 NCBI 无法联系到作者。"
   },
-
   "models": {
     "chain": {
       "planner": [
@@ -55,7 +53,6 @@
       ]
     }
   },
-
   "retrieval": {
     "rounds": 2,
     "expand_when_below": 16,
@@ -79,9 +76,16 @@
       "News",
       "Published Erratum",
       "Retraction of Publication"
-    ]
+    ],
+    "exclude_animals": true,
+    "expand_by_links": true,
+    "expand_by_references": true,
+    "max_link_expansion": 15,
+    "max_snowball_titles": 3,
+    "include_preprints": false,
+    "preprint_limit": 15,
+    "max_revisions": 2
   },
-
   "runtime": {
     "timeout": 180,
     "max_retries": 3,
@@ -89,9 +93,9 @@
     "temperature_plan": 0.15,
     "temperature_reader": 0.1,
     "temperature_writer": 0.3,
-    "workers": 3
+    "workers": 3,
+    "price_per_million_tokens": 0.0
   },
-
   "paths": {
     "runs_root": "./runs"
   }

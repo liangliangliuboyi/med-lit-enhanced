@@ -1,55 +1,92 @@
 # 更新日志
 
-## v2.1.0 —— 2026-11-05
+## v2.2.0 —— 2026-11-05
 
-**这一版的核心是"做减法"：删掉一切会替用户做决定的限制，并把技能改造成可以直接从地址安装的样子。**
+**把功能改进清单的第一批（A~H 组 40+ 项）全部实现。** 这一版是"能力大跃"，不是修修补补。
 
-### 移除（重要）
+### 检索覆盖
 
-- **完全删除刊源限制**。原先内建 26 本 CNS 期刊白名单 + 可切换的期刊画像，
-  现在**恒定检索全 PubMed**。使用者来自不同专业背景（临床、公卫、药学、流行病学……），
-  工具不应该替他们决定"该看哪些刊"。
-- **完全删除学科域预设**。原先内置糖尿病代谢 / 慢病基层 / 循证医学 / 公卫政策四个预设，
-  会把特定学科的 MeSH 词与研究设计偏好硬塞进检索式。**全部移除**，检索式只围绕问题本身。
-- **删除相关 CLI 参数**：`--journals`、`--journal-list`、`--journal-mode`、
-  `--preset`、`--no-preset`、`--list-presets`。
-- **删除相关文件**：`scripts/presets.py`、`data/presets.json`、`data/journal_profiles.json`。
-- **Clinical Query 过滤器改为默认关闭**。原先由 planner 自动挑选并 AND 进检索式，
-  现在只有用户显式 `--cq <id>` 时才生效。
-- **planner 提示词新增禁令**：不得限定学科、主题或期刊。
+- **A1 检索式质量闸门**：命中 0 时自动把原检索式回喂给 planner 修订并重试（默认 2 轮）。
+- **A2 被引/相似文献扩展**：ELink 拉 `citedin` 与 `sim`，补关键词检索的漏检。
+- **A3 引文滚雪球**：efetch 时解析 `ReferenceList` 标题，回灌 PubMed 检索。
+- **A4 预印本**：新增 `scripts/preprints.py`。**Europe PMC 为主源**（支持真正的关键词检索，
+  收录 bioRxiv/medRxiv/专利），bioRxiv 官方 API 作兜底。**不伪造 PMID**。
+- **A5 中文文献边界声明**：writer 提示词明令不得声称检索了中文文献；检索概况与产物里标注
+  "仅英文国际文献"。真要接中文库需要万方/CNKI 的可用授权。
+- **A6 排除动物实验**：用官方 MeSH 写法（`NOT "Animals"[MeSH] NOT "Humans"[MeSH]`），
+  避免自由词 `NOT` 被 PubMed 错解析。`--no-animal-exclusion` 可关。
+- **A7 年份下限自适应**：planner 输出 `year_floor`（"最新进展"→近 3-5 年，"经典"→早年）。
+- **A8 复用检索式**：`--reuse-plan <02_plan.json>`。
 
-### 新增
+### 证据质量
 
-- **标准 `skills/` 布局**：技能位于 `skills/medlit-agent/`，符合
-  [Agent Skills](https://skills.sh) 生态约定，`npx -y skills add owner/repo --skill medlit-agent`
-  可直接安装。
-- **安装脚本** `install/install.ps1`（Windows）与 `install/install.sh`（macOS/Linux），
-  自动识别目标 agent、复制技能目录、生成 `.env` 模板、打印后续步骤。
-- **SKILL.md 新增「零、安装」章节**：智能体读到仓库地址后，可以照着文件自己完成安装。
-- **自检新增两项**：临床查询过滤器表完整性、**检索范围无限制**（扫描源码确认没有
-  刊源/预设逻辑残留，config 里也不允许再有 `journals` 块）。
-- **`--list-cq`**：列出可用的 Clinical Query 过滤器。
-- **功能改进清单** `docs/功能改进清单.md`：40+ 条待裁决的改进项，供后续迭代使用。
+- **B1 GRADE 机械定级**（新增 `scripts/grading.py`）：研究设计→起始等级，
+  偏倚/不一致/不精确/间接四类降级，效应量与剂量反应升级。
+  **模型在 critic 阶段复核并说明与机械等级是否一致**。
+  发表偏倚因程序无法自动检测，只作备注不降级（证据少时降级是过度惩罚）。
+- **B2 撤稿与勘误**：efetch 解析 `CommentsCorrections`；撤稿文献在过滤阶段**剔除**，
+  勘误在证据表与正文标注 ⚠。
+- **B3 偏倚评估要素**：reader 抽取 6 个结构化字段，`05_evidence_table.md` 出偏倚要素表。
+- **B4 效应量合并**（新增 `scripts/meta.py`）：逆方差加权固定效应 + Q 检验 + I² +
+  DerSimonian-Laird 随机效应；**OR 与 RR/HR 不混池**（不可折叠），MD 与 SMD 不混池。
+- **B6 PICO 匹配度**：reader 输出「直接/部分/间接」；writer 要求间接证据单独成段；
+  机械定级对间接证据降级。
+- **B7 图表说明**：PMC BioC 解析时单独收集 figure captions。
 
-### 修复（沿用 v2.0.0）
+### 输出可用性
 
-- 密钥全部走 `api_key_env` → `.env`/环境变量，仓库零明文密钥。
-- **PMID 越界校验**：正文每个 `[PMID:]` 必须来自候选池，越界写进 `trace.errors` 并告警。
-- NCBI 返回 200 + `ERROR` 时不再误报成"命中 0 条"，严格区分上游故障与真的零命中。
-- `fulltext_limit` 并发竞态（加锁 + 原子计数）。
-- `retrieval.rounds` 由死配置改为真实的第二轮扩写。
-- `--research-only` 摘要门槛改读配置 `research_min_abstract_chars`。
+- **C1/C2/C3 导出**（新增 `scripts/export.py`）：BibTeX（纯 ASCII 引用键、复姓连写）、
+  RIS（EndNote/Zotero 可导入）、**Word**（纯标准库手写 OOXML，零第三方依赖，已用真实 Word 验证可打开）、
+  Zotero 笔记。`--export bib|ris|notes|docx`。
+- **C4 运行索引**：`runs/_index.md` 自动汇总。
+- **C5 适用边界**：writer 输出新增「## 适用边界」段；critic 增加 `population_applicability`。
+- **C6 排除理由**：新增 `05b_excluded.json` 与 PRISMA 里的排除理由汇总。
+
+### 工程与维护
+
+- **D1 单元测试**：新增 `tests/`，**107 个离线用例**（unittest，无需密钥）。
+- **D2 CI**：`.github/workflows/ci.yml`，Python 3.9–3.12，windows 单独跑语法检查。
+- **D3 token 成本**：按角色累计 token，填单价即出成本估算。
+- **D4 断点续跑**：各阶段落 `_checkpoint.json`，`--resume <目录>`。
+- **D5 并发自适应**：按实测检索延迟在 1–6 之间调并发度。
+- **D6 `--json` 含正文**：答案、PRISMA、GRADE、合并效应量、token 与成本全在里面。
+- **D7 中文报错**：密钥缺失、NCBI 上游故障、HTTP 错误全部中文并给补救方式。
+
+### 安装与体验
+
+- **E1 配置向导 + 主动提示**：`ask.py --setup` 交互向导；`ask.py --doctor` 环境体检。
+  **缺密钥时报错信息本身就是一份可执行清单**；SKILL.md 明确要求智能体先体检、
+  缺什么就主动问用户要什么。
+- **E2 连续提问**：`ask.py --chat`，历史带入 planner 上下文，支持追问。
+
+### 修掉的既有缺陷
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | `_json_load` 用贪婪正则 `\{.*\}`，模型在 JSON 前后夹带含花括号的文字时会解析失败 | 改为括号配对扫描（正确处理嵌套与字符串内的括号） |
+| 2 | PMID 正则不容许空格，`[PMID: 12345678]` 会被漏掉 | 改为 `\[PMID:\s*(\d+)\]` |
+| 3 | 证据表只转义 `key_findings` 的竖线，其他单元格的 `\|` 会打散 Markdown 表格 | 统一走 `cell()` 转义 |
+| 4 | 同一分钟跑两个相似问题会撞目录、后者覆盖前者 | 目录名末尾加 4 位哈希后缀 |
+| 5 | `_load_cq` 静默返回空 dict，`--cq` 会"看起来生效但没效果" | 读不到文件时明确报错 |
+| 6 | `expand_queries` 方法在重构中丢失，端到端直接 `AttributeError` | 补回 |
+| 7 | 证据数少时机械定级因"无法评估发表偏倚"而降级，把高质量 RCT 误判成"低确定性" | 改为只记备注不降级 |
+| 8 | BibTeX 引用键没取完整复姓（`van der Berg` → `van`），且允许非 ASCII | 取完整姓氏去空格连写 + 限定纯 ASCII |
+| 9 | `pubmed.email` 按 NCBI 规定应填**开发者**邮箱，模板里空着 | 模板填开发者邮箱并注明使用者可覆盖 |
 
 ### 保留
 
-- **GRADE 确定性分级**、**PRISMA 流程计数**（`11_prisma.md`）：输出增强，不构成限制。
-- **provider 抽象**：任意 OpenAI 兼容端点可用；`rerank` 可选。
-- **11 个留痕文件**：方法学可审计。
+GRADE 分级 ✅ ｜ PRISMA 计数 ✅ ｜ `--cq`（默认关）✅ ｜ provider 抽象 ✅ ｜
+语义重排（可选）✅ ｜ 11 个留痕文件 ✅ ｜ 第二轮扩写 ✅ ｜ 检索范围不限制 ✅
+
+## v2.1.0 —— 2026-11-05
+
+**做减法**：删净刊源限制与学科域预设，改造为 Agent Skills 标准 `skills/` 布局，
+支持 `npx -y skills add owner/repo --skill medlit-agent`，新增一键安装脚本。
 
 ## v2.0.0 —— 2026-11-05
 
-开源化重构：密钥环境变量化、NCBI 免责声明、PMID 越界校验、GRADE、PRISMA、
-provider 抽象、11 项自检。（v2.1.0 已按反馈撤销其中的学科预设与期刊画像。）
+开源化重构：密钥环境变量化、NCBI 免责声明、PMID 越界校验、provider 抽象、11 项自检。
+（其中 v2.1.0 已按反馈撤销学科预设与期刊画像。）
 
 ## v1.0 —— 2026-10-27
 

@@ -5,7 +5,11 @@
   python ask.py "GLP-1 受体激动剂对青少年肥胖的效果如何？"
   python ask.py "问题" --constraints "只关注中国人群，2020 年后"
   python ask.py --quick "问题"                 # 快速模式，约 3 分钟
+  python ask.py --setup                       # 首次配置向导（缺什么会主动提示）
+  python ask.py --doctor                      # 环境体检：缺什么、怎么补
+  python ask.py --chat                        # 连续提问模式
   python ask.py --cq therapy.narrow "问题"    # 套用 PubMed 官方临床查询过滤器（可选）
+  python ask.py --export bib "问题"           # 顺带导出 BibTeX / RIS / docx
   python ask.py --models                      # 看模型路由与实际可用情况
   python ask.py --pubmed-only "检索式"        # 只检索，不调模型
 """
@@ -27,7 +31,13 @@ import pipeline
 import pubmed as pm
 import sf
 
+try:
+    import export as exportmod
+except Exception:  # noqa: BLE001
+    exportmod = None
 
+
+# ---------------- 子命令实现 ----------------
 def cmd_models(cfg):
     prov = cfg.get('provider') or {}
     print(f'服务端点：{prov.get("name", "provider")}  {prov.get("base_url", "")}')
@@ -47,6 +57,148 @@ def cmd_models(cfg):
     print(f"\nrerank: {rr.get('model', '-')} "
           f"{'OK' if rr.get('enabled') and rr.get('model') in live else '--'}"
           f"（enabled={rr.get('enabled')}）")
+
+
+def cmd_doctor():
+    """环境体检：把「缺什么、怎么补」一次说清楚。"""
+    print('=' * 66)
+    print('环境体检')
+    print('=' * 66)
+    missing = []
+    for it in cfgmod.doctor():
+        mark = '✓' if it['ok'] else '·'
+        print(f'[{mark}] {it["item"]}')
+        detail = str(it['detail'])
+        if it['ok']:
+            print(f'      {detail}')
+        else:
+            print(detail)
+            missing.append(it['item'])
+    print('=' * 66)
+    if missing:
+        print(f'有 {len(missing)} 项需要补：' + '、'.join(missing))
+        print('运行 `python scripts/ask.py --setup` 可以由向导代填。')
+        return 1
+    print('环境齐备，可以正常使用。')
+    return 0
+
+
+def cmd_setup():
+    """首次配置向导：只问必要的问题，其余用默认值。"""
+    print('=' * 66)
+    print('medlit-agent 配置向导')
+    print('=' * 66)
+    print('只需要三样东西。随时可以跳过，选填项留空即可。\n')
+
+    endpoints = [
+        ('siliconflow', '硅基流动（推荐，国内直连，开箱即用）'),
+        ('deepseek', 'DeepSeek（便宜）'),
+        ('kimi', 'Kimi / 月之暗面'),
+        ('openai', 'OpenAI（国际用户）'),
+        ('ollama', '本地 Ollama（完全离线）'),
+    ]
+    print('① 选择模型服务：')
+    for i, (_key, label) in enumerate(endpoints, 1):
+        print(f'   {i}. {label}')
+    idx = _ask_int('序号（默认 1）', 1)
+    key, _label = endpoints[max(0, min(len(endpoints) - 1, idx - 1))]
+    base = {
+        'siliconflow': 'https://api.siliconflow.cn/v1',
+        'deepseek': 'https://api.deepseek.com/v1',
+        'kimi': 'https://api.moonshot.cn/v1',
+        'openai': 'https://api.openai.com/v1',
+        'ollama': 'http://127.0.0.1:11434/v1',
+    }[key]
+
+    print('\n② 模型服务密钥（必填）')
+    print(f'   端点：{base}')
+    api_key = _ask('   粘贴你的 API Key（输入不回显）', default='', secret=True)
+    if not api_key:
+        print('   ✗ 没有填密钥，无法继续。稍后可以随时运行 --setup 补上。')
+        return 1
+
+    print('\n③ NCBI API key（选填）')
+    print('   没有也能用，只是限速 3 请求/秒；申请：'
+          'https://www.ncbi.nlm.nih.gov/account/settings/')
+    ncbi_key = _ask('   NCBI API Key（可留空）', default='')
+
+    print('\n④ 你的邮箱（选填，强烈建议）')
+    print('   NCBI 规定这里填「软件开发者」的邮箱：万一这个软件被违规使用导致 IP 被封，'
+          'NCBI 需要能联系到作者。使用者也可以在 config.json 里改成自己的。')
+    email = _ask('   邮箱（可留空）', default='')
+
+    env_name = 'SILICONFLOW_API_KEY' if key == 'siliconflow' else 'OPENAI_COMPATIBLE_API_KEY'
+    values = {env_name: api_key}
+    if ncbi_key:
+        values['NCBI_API_KEY'] = ncbi_key
+    if email:
+        values['NCBI_EMAIL'] = email
+
+    path = cfgmod.save_env(values)
+    print(f'\n✓ 已写入 {path}')
+
+    # 非默认端点要落到 config.json
+    if key != 'siliconflow':
+        _write_provider_config(key, base, env_name)
+        print(f'✓ 已把端点写入 config.json（provider = {key}）')
+
+    print('\n正在自检……')
+    try:
+        cfg = cfgmod.load_config()
+        p = sf.Provider(cfg['provider']['name'], cfg['provider']['base_url'],
+                        cfg['provider']['api_key'])
+        live = p.available_models(refresh=True)
+        if not live:
+            print('  ! 模型端点连不上或密钥无效，请检查。')
+            return 1
+        print(f'  ✓ 模型端点可用（{len(live)} 个模型）')
+    except Exception as e:  # noqa: BLE001
+        print(f'  ! 自检失败：{e}')
+        return 1
+    print('\n配置完成，现在可以提问了：'
+          '\n  python scripts/ask.py "你的问题"')
+    return 0
+
+
+def _write_provider_config(key: str, base: str, env_name: str):
+    import copy
+    src = cfgmod.EXAMPLE_CONFIG
+    try:
+        with open(src, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        data = {}
+    prov = data.setdefault('provider', {})
+    prov['name'] = key
+    prov['base_url'] = base
+    prov['api_key_env'] = env_name
+    rr = prov.setdefault('rerank', {})
+    rr['enabled'] = False
+    rr['endpoint'] = ''
+    out = cfgmod.LOCAL_CONFIG
+    with open(out, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _ask(prompt: str, default: str = '', secret: bool = False) -> str:
+    import getpass
+    try:
+        if secret:
+            v = getpass.getpass(prompt + ': ')
+        else:
+            v = input(prompt + ': ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return (v or '').strip() or default
+
+
+def _ask_int(prompt: str, default: int) -> int:
+    v = _ask(prompt)
+    try:
+        return int(v)
+    except ValueError:
+        return default
 
 
 def cmd_pubmed_only(cfg, term, retmax):
@@ -77,8 +229,7 @@ def cmd_pubmed_only(cfg, term, retmax):
         print(f'    摘要: {(x["abstract"] or "")[:360]}…\n')
 
 
-def cmd_list_cq(cfg):
-    """列出可用的 Clinical Query 过滤器。"""
+def cmd_list_cq():
     path = os.path.join(cfgmod.ROOT, 'data', 'clinical_queries.json')
     try:
         with open(path, encoding='utf-8') as f:
@@ -94,6 +245,74 @@ def cmd_list_cq(cfg):
     print('\n这些过滤器默认不启用。用 --cq therapy.narrow 等显式指定才会生效。')
 
 
+def cmd_chat(cfg, args):
+    """E2：连续提问模式，上下文自动带。"""
+    history: list[dict] = []
+    print('连续提问模式。输入问题，Enter 提交；输入 quit / exit 退出。')
+    print('（每次提问都会跑一次完整检索，请稍等）\n')
+    while True:
+        try:
+            q = input('问题> ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not q:
+            continue
+        if q.lower() in ('quit', 'exit', ':q', '退出'):
+            break
+        run = pipeline.Run(q, args.constraints, cfg, cq_explicit=_cq_list(args),
+                           history=list(history))
+        out_dir = run.execute(quick=args.quick)
+        history.append({'question': q,
+                        'core_question_en': run.plan.get('core_question_en', '')})
+        print('\n' + '=' * 70)
+        print(run.answer[:2000])
+        print(f'\n（完整答案见 {out_dir}/07_answer.md）\n')
+    return 0
+
+
+def _cq_list(args):
+    if not args.cq:
+        return []
+    return [x.strip() for x in args.cq.replace('，', ',').split(',') if x.strip()]
+
+
+def _do_exports(run, out_dir, fmt: str):
+    """C1/C2/C3：导出参考文献与笔记。"""
+    if not exportmod:
+        print('  ! 导出模块不可用')
+        return
+    papers = [run.papers.get(d['pmid'], {}) for d in run.evidence]
+    papers = [p for p in papers if p]
+    try:
+        if fmt == 'bib':
+            path = os.path.join(out_dir, 'references.bib')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(exportmod.to_bibtex(papers))
+            print(f'  ✓ BibTeX：{path}')
+        elif fmt == 'ris':
+            path = os.path.join(out_dir, 'references.ris')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(exportmod.to_ris(papers))
+            print(f'  ✓ RIS：{path}')
+        elif fmt == 'notes':
+            path = os.path.join(out_dir, 'zotero_notes.md')
+            with open(path, 'w', encoding='utf-8') as f:
+                for d in run.evidence:
+                    p = run.papers.get(d['pmid'], {})
+                    f.write(exportmod.to_zotero_note(p, d) + '\n\n---\n\n')
+            print(f'  ✓ Zotero 笔记：{path}')
+        elif fmt == 'docx':
+            md = (f'# {run.plan.get("core_question_en") or run.question}\n\n'
+                  f'{run.answer}\n\n---\n\n## 关键文献\n\n{run.bibliography()}\n')
+            path = os.path.join(out_dir, 'answer.docx')
+            exportmod.to_docx(md, path)
+            print(f'  ✓ Word 文档：{path}')
+    except Exception as e:  # noqa: BLE001
+        print(f'  ! 导出失败：{e}')
+
+
+# ---------------- 主入口 ----------------
 def main():
     ap = argparse.ArgumentParser(
         description='循证医学文献检索 Agent',
@@ -101,7 +320,8 @@ def main():
         epilog='示例：\n'
                '  python ask.py "GLP-1 受体激动剂对青少年肥胖的效果如何？"\n'
                '  python ask.py "TIR 与糖尿病并发症风险" --cq prognosis.narrow\n'
-               '  python ask.py "问题" --constraints "2020 年后，中国人群" --quick\n')
+               '  python ask.py "问题" --constraints "2020 年后，中国人群" --quick\n'
+               '  python ask.py --setup        # 首次配置\n')
     ap.add_argument('question', nargs='?', help='你的问题（中文即可）')
     ap.add_argument('--constraints', default='', help='补充限定，如人群/年份/地区')
     ap.add_argument('--quick', action='store_true', help='快速模式：单轮、少读几篇')
@@ -110,6 +330,19 @@ def main():
     ap.add_argument('--research-only', action='store_true', help='只保留研究论文')
     ap.add_argument('--cq', metavar='ID[,ID]', help='PubMed 官方临床查询过滤器 id（默认不启用）')
     ap.add_argument('--rounds', type=int, help='检索轮数（2 表示必要时做一轮扩写）')
+    ap.add_argument('--no-animal-exclusion', action='store_true',
+                    help='不排除纯动物实验（默认排除）')
+    ap.add_argument('--no-links', action='store_true', help='不做被引/相似文献扩展')
+    ap.add_argument('--no-snowball', action='store_true', help='不做引文滚雪球扩展')
+    ap.add_argument('--preprints', action='store_true', help='同时检索 bioRxiv/medRxiv 预印本')
+    ap.add_argument('--export', choices=['bib', 'ris', 'notes', 'docx'],
+                    help='跑完后额外导出参考文献或笔记')
+    ap.add_argument('--reuse-plan', metavar='FILE',
+                    help='复用上次保存的检索式（02_plan.json），不重新规划')
+    ap.add_argument('--resume', metavar='DIR', help='从上次运行的目录断点续跑')
+    ap.add_argument('--chat', action='store_true', help='连续提问模式')
+    ap.add_argument('--setup', action='store_true', help='首次配置向导')
+    ap.add_argument('--doctor', action='store_true', help='环境体检：缺什么、怎么补')
     ap.add_argument('--models', action='store_true', help='打印模型路由链')
     ap.add_argument('--list-cq', action='store_true', help='列出可用的临床查询过滤器')
     ap.add_argument('--pubmed-only', metavar='TERM', help='只检索 PubMed，不调模型')
@@ -118,20 +351,26 @@ def main():
     ap.add_argument('--config', help='配置文件路径')
     args = ap.parse_args()
 
-    # --models / --pubmed-only / --list-cq 不需要模型密钥也能跑
+    if args.setup:
+        return cmd_setup()
+    if args.doctor:
+        return cmd_doctor()
+    if args.list_cq:
+        cmd_list_cq()
+        return 0
+
+    # --models / --pubmed-only 不需要模型密钥也能跑
     cfg = pipeline.load_config(args.config) if args.models else cfgmod.load_config(args.config)
 
     if args.models:
         cmd_models(cfg)
         return 0
-
-    if args.list_cq:
-        cmd_list_cq(cfg)
-        return 0
-
     if args.pubmed_only:
         cmd_pubmed_only(cfg, args.pubmed_only, args.retmax)
         return 0
+
+    if args.chat:
+        return cmd_chat(cfg, args)
 
     if not args.question:
         ap.print_help()
@@ -140,7 +379,8 @@ def main():
     # ---- 参数覆盖配置 ----
     if args.quick:
         cfg['retrieval'].update({'rounds': 1, 'retmax_per_query': 12,
-                                 'max_papers': 4, 'fulltext_limit': 2})
+                                 'max_papers': 4, 'fulltext_limit': 2,
+                                 'expand_by_links': False, 'expand_by_references': False})
     if args.max_papers:
         cfg['retrieval']['max_papers'] = args.max_papers
     if args.fulltext_limit is not None:
@@ -149,20 +389,44 @@ def main():
         cfg['retrieval']['research_only'] = True
     if args.rounds is not None:
         cfg['retrieval']['rounds'] = args.rounds
+    if args.no_animal_exclusion:
+        cfg['retrieval']['exclude_animals'] = False
+    if args.no_links:
+        cfg['retrieval']['expand_by_links'] = False
+    if args.no_snowball:
+        cfg['retrieval']['expand_by_references'] = False
+    if args.preprints:
+        cfg['retrieval']['include_preprints'] = True
 
-    cq_list = []
-    if args.cq:
-        cq_list = [x.strip() for x in args.cq.replace('，', ',').split(',') if x.strip()]
+    run = pipeline.Run(args.question, args.constraints, cfg,
+                       cq_explicit=_cq_list(args), resume_dir=args.resume)
 
-    run = pipeline.Run(args.question, args.constraints, cfg, cq_explicit=cq_list)
-    out_dir = run.execute(quick=args.quick)
+    # A8：复用检索式
+    if args.reuse_plan:
+        try:
+            with open(args.reuse_plan, encoding='utf-8') as f:
+                run.plan = json.load(f)
+            run.log(f'↻ 已复用检索式：{args.reuse_plan}')
+        except Exception as e:  # noqa: BLE001
+            print(f'✗ 读取检索式失败：{e}')
+            return 2
+
+    out_dir = run.execute(quick=args.quick, resume=bool(args.resume))
+
+    if args.export:
+        _do_exports(run, out_dir, args.export)
 
     if args.json:
         print(json.dumps({'dir': out_dir,
+                          'answer': run.answer,
                           'counts': run.trace.get('counts', {}),
                           'prisma': run.trace.get('prisma', {}),
                           'pmid_check': run.trace.get('pmid_check', {}),
+                          'grading': run.trace.get('mechanical_grading', {}),
+                          'pooled': run.pooled,
                           'models': run.trace.get('models', {}),
+                          'tokens': run.trace.get('tokens', {}),
+                          'cost': run.trace.get('cost_estimate', {}),
                           'scope': run.trace.get('scope_note', ''),
                           'elapsed': run.trace.get('elapsed_total')},
                          ensure_ascii=False, indent=2))
@@ -177,4 +441,10 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except cfgmod.MissingSecretError as e:
+        print('\n✗ 配置不完整\n')
+        print(str(e))
+        print('\n补齐后重试，或运行 `python scripts/ask.py --setup` 由向导代填。')
+        sys.exit(2)

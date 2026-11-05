@@ -8,9 +8,12 @@
 3. 检索式里的 NOT (A OR B) 会被 PubMed 错解析（实测命中掉 85%），
    所以"排除综述"一律放在程序侧按 pub_types 过滤。
 4. 检索式过长（>1800 字符）必须改 POST，否则 URL 超长被拒。
+5. **检索后端故障时 NCBI 会返回 HTTP 200 + esearchresult.ERROR 字段**，
+   而不是错误状态码。必须显式识别，否则会把"上游挂了"误报成"命中 0 条"。
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import urllib.error
@@ -20,11 +23,11 @@ import xml.etree.ElementTree as ET
 
 EUTILS = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils'
 BIOC = 'https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json'
-UA = 'med-lit-enhanced/1.0 (literature retrieval)'
+UA = 'medlit-agent/2.1 (evidence retrieval)'
 
 
 class PubMed:
-    def __init__(self, api_key: str = '', tool: str = 'med-lit-enhanced',
+    def __init__(self, api_key: str = '', tool: str = 'medlit-agent',
                  email: str = '', min_interval: float = 0.36):
         self.api_key = api_key
         self.tool = tool
@@ -90,24 +93,57 @@ class PubMed:
             params['datetype'] = 'pdat'
         _, txt = self._call('esearch', params)
         try:
-            import json
             data = json.loads(txt)
         except Exception:  # noqa: BLE001
             return {'count': 0, 'ids': [], 'translation': '',
                     'error': 'NCBI 返回的不是合法 JSON（可能是 5xx 错误页）'}
         res = data.get('esearchresult', {}) or {}
-        # NCBI 检索后端故障时会返回 HTTP 200 + ERROR 字段，而不是报错状态码。
-        # 必须显式识别，否则会把"上游挂了"误报成"命中 0 条"。
         err = res.get('ERROR') or res.get('error')
         if err:
-            return {'count': 0, 'ids': [], 'translation': '',
-                    'error': str(err)[:300]}
+            return {'count': 0, 'ids': [], 'translation': '', 'error': str(err)[:300]}
         return {
             'count': int(res.get('count', 0) or 0),
             'ids': res.get('idlist', []) or [],
             'translation': res.get('querytranslation', ''),
             'error': '',
         }
+
+    # ---------- elink：被引文献 / 相似文献 ----------
+    def elink(self, pmids: list[str], linkname: str = 'pubmed_pubmed_citedin',
+              retmax: int = 40) -> dict:
+        """ELink 扩展检索。
+
+        linkname 取值：
+          pubmed_pubmed_citedin  → 引用了这些文献的（被引文献）
+          pubmed_pubmed_sim      → 相似文献
+        返回 {'ids': [...], 'error': ''}，失败时 error 非空、ids 为空。
+        """
+        if not pmids:
+            return {'ids': [], 'error': ''}
+        out: list[str] = []
+        err = ''
+        for i in range(0, len(pmids), 50):
+            chunk = pmids[i:i + 50]
+            params = {'dbfrom': 'pubmed', 'db': 'pubmed', 'id': ','.join(chunk),
+                      'linkname': linkname, 'retmode': 'json', 'retmax': retmax}
+            try:
+                _, txt = self._call('elink', params)
+                data = json.loads(txt)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)[:200]
+                continue
+            links = data.get('linksets') or []
+            for ls in links:
+                for db in (ls.get('linksetdbs') or []):
+                    for link in (db.get('links') or []):
+                        out.extend(str(x) for x in link)
+        # 去重保序
+        seen, uniq = set(), []
+        for x in out:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return {'ids': uniq, 'error': err}
 
     # ---------- efetch ----------
     def efetch(self, pmids: list[str]) -> list[dict]:
@@ -183,6 +219,25 @@ class PubMed:
                     elif t == 'pmc':
                         pmcid = self._text(aid)
 
+            # ---- 更正/撤稿标记（B2：引用了撤稿论文是大忌）----
+            flags = []
+            for cc in article.findall('CommentsCorrectionsList/CommentsCorrections'):
+                ref = (cc.findtext('RefType') or '').strip().lower()
+                if ref:
+                    flags.append(ref.replace(' ', '-'))
+
+            # ---- 参考文献标题（用于引文滚雪球 A3）----
+            refs = []
+            for ref in article.findall('ReferenceList/Reference'):
+                t = self._text(ref.find('ArticleTitle'))
+                if t:
+                    t = re.sub(r'\s+', ' ', t).rstrip('.')
+                    refs.append(t)
+                else:
+                    art_title = self._text(ref.find('Article/ArticleTitle'))
+                    if art_title:
+                        refs.append(re.sub(r'\s+', ' ', art_title).rstrip('.'))
+
             papers.append({
                 'pmid': pmid,
                 'title': title,
@@ -196,6 +251,8 @@ class PubMed:
                 'mesh': [m for m in mesh if m],
                 'keywords': [k for k in kws if k],
                 'pub_types': [p for p in ptypes if p],
+                'correction_flags': flags,
+                'reference_titles': refs[:40],
             })
         return papers
 
@@ -204,36 +261,42 @@ class PubMed:
         """优先 PMC BioC；失败则返回空。"""
         pmcid = (paper.get('pmcid') or '').replace('PMC', '')
         if not pmcid:
-            return {'source': '', 'text': '', 'sections': []}
+            return {'source': '', 'text': '', 'sections': [], 'figure_captions': []}
         try:
             return self._bioc(pmcid)
         except Exception:  # noqa: BLE001
-            return {'source': '', 'text': '', 'sections': []}
+            return {'source': '', 'text': '', 'sections': [], 'figure_captions': []}
 
     def _bioc(self, pmcid: str) -> dict:
         url = f'{BIOC}/PMC{pmcid}/unicode'
         req = urllib.request.Request(url, headers={'User-Agent': UA})
         with urllib.request.urlopen(req, timeout=90) as r:
             raw = r.read().decode('utf-8', 'ignore')
-        import json
         data = json.loads(raw)
         if isinstance(data, list):
             data = data[0] if data else {}
         docs = data.get('documents') or []
         if not docs:
-            return {'source': '', 'text': '', 'sections': []}
+            return {'source': '', 'text': '', 'sections': [], 'figure_captions': []}
         doc = docs[0]
-        buf, secs = [], []
+        buf, secs, captions = [], [], []
         for psg in doc.get('passages', []):
-            sec = (psg.get('infons') or {}).get('section_type', '') or ''
+            infons = psg.get('infons') or {}
+            sec = infons.get('section_type', '') or ''
+            stype = (infons.get('type') or '')
             txt = (psg.get('text') or '').strip()
             if not txt:
+                continue
+            # 图表说明单独收集（B7：系统评价常用森林图/漏斗图）
+            if stype in ('caption', 'fig_caption', 'table_caption') or sec == 'FIG' or sec == 'TABLE':
+                captions.append(txt)
                 continue
             if sec and (not secs or secs[-1] != sec):
                 secs.append(sec)
                 buf.append(f'\n## {sec}')
             buf.append(txt)
-        return {'source': 'pmc_bioc', 'text': '\n'.join(buf), 'sections': secs}
+        return {'source': 'pmc_bioc', 'text': '\n'.join(buf), 'sections': secs,
+                'figure_captions': captions}
 
 
 # ---------- Clinical Query 过滤器 ----------
@@ -242,6 +305,17 @@ def apply_clinical_query(term: str, cq_query: str) -> str:
     if not cq_query:
         return term
     return f'({term}) AND ({cq_query})'
+
+
+# ---------- 动物/体外研究排除（A6：官方 MeSH 写法，比自由词 NOT 稳）----------
+ANIMAL_EXCLUSION = 'NOT ("Animals"[MeSH] NOT "Humans"[MeSH])'
+
+
+def apply_animal_exclusion(term: str, enabled: bool = True) -> str:
+    """排除纯动物实验。官方 MeSH 写法不会像自由词 NOT 那样被 PubMed 错解析。"""
+    if not enabled:
+        return term
+    return f'({term}) AND {ANIMAL_EXCLUSION}'
 
 
 # ---------- 研究论文判定（程序侧，不用检索式） ----------
@@ -259,6 +333,35 @@ def is_research_article(p: dict, exclude: list[str] | None = None,
     if len(p.get('abstract') or '') < min_abstract:
         return False
     return True
+
+
+# ---------- 撤稿/更正判定（B2） ----------
+RETRACTION_TYPES = {'retracted-publication', 'retraction-of'}
+ERRATUM_TYPES = {'erratum-in', 'published-erratum', 'erratum-for'}
+CORRECTION_TYPES = {'corrected-and-republished-from', 'expression-of-concern-in',
+                     'update-in', 'comment-in'}
+
+
+def check_retraction(paper: dict) -> dict:
+    """判断一篇文献是否被撤稿 / 有更正。
+
+    返回 {'retracted': bool, 'erratum': bool, 'concern': bool, 'flags': [...], 'note': ''}
+    """
+    flags = [str(f).lower() for f in (paper.get('correction_flags') or [])]
+    types = [str(t).lower() for t in (paper.get('pub_types') or [])]
+    allf = flags + types
+    retracted = any(f in RETRACTION_TYPES for f in allf)
+    erratum = any(f in ERRATUM_TYPES for f in allf)
+    concern = any(f in CORRECTION_TYPES for f in allf) or 'expression-of-concern' in allf
+    note = ''
+    if retracted:
+        note = '⚠ 该文献已被撤稿（Retracted Publication），不应作为有效证据引用'
+    elif erratum:
+        note = '⚠ 该文献有勘误（Erratum），引用前请核对原文'
+    elif concern:
+        note = '⚠ 该文献有更正/关注声明，引用前请核对原文'
+    return {'retracted': retracted, 'erratum': erratum, 'concern': concern,
+            'flags': flags, 'note': note}
 
 
 def fmt_authors(authors: list[str], limit: int = 3) -> str:

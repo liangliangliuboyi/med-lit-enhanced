@@ -48,28 +48,42 @@ cd medlit-agent
 
 ### 装完两件事
 
-**1. 填密钥。** 装好的目录里会有一个 `.env`（由 `.env.example` 生成）：
+**1. 体检（缺什么会主动提示你）。**
+
+```bash
+cd <装好的目录>
+python scripts/ask.py --doctor
+```
+
+它会逐项检查并给出**可执行的补救说明**（缺什么、写到哪、怎么拿）：
+
+```
+[✓] 模型服务密钥
+      已配置（SILICONFLOW_API_KEY）
+[·] NCBI API key（选填）
+      未配置，限速 3 请求/秒（功能正常，只是稍慢）
+```
+
+**2. 填密钥。** 装好的目录里会有一个 `.env`（由 `.env.example` 生成）：
 
 ```
 SILICONFLOW_API_KEY=你的模型服务密钥     # 必填
 NCBI_API_KEY=你的NCBI密钥               # 选填，有则限速 3/s → 10/s
-NCBI_EMAIL=你的邮箱                     # 建议填
+NCBI_EMAIL=你的邮箱                     # 建议填（NCBI 规定这里填开发者邮箱）
 ```
+
+或者让向导代填：`python scripts/ask.py --setup`（采集并写入 `.env`，自动自检）。
 
 模型服务默认用**硅基流动**（国内直连、开箱即用）。任何 OpenAI 兼容端点都能换——
 改 `config.json` 的 `provider.base_url` 与 `provider.api_key_env` 就行，
 可换 DeepSeek / Kimi / OpenAI / 本地 Ollama。
 
-**2. 自检。**
+**自检**：
 
 ```bash
-cd <装好的目录>
-python scripts/selftest.py
+python scripts/selftest.py          # 逐环节体检（上游故障显示 SKIP 而非 FAIL）
+python ../../tests/run_tests.py      # 离线单元测试，不需要密钥
 ```
-
-自检 12 项：配置、临床查询表、检索范围无限制、模型服务、对话接口、PubMed 检索、题录解析、
-PMC 全文、研究论文判定、PMID 越界校验、端到端迷你跑。
-**遇到 NCBI 上游故障时相关项显示 `SKIP` 而不是 `FAIL`**——那不是安装问题，等上游恢复重跑即可。
 
 ## 用起来
 
@@ -94,10 +108,27 @@ python scripts/ask.py "GLP-1 受体激动剂对青少年肥胖的效果如何？
 | 语言 | 英文提问英文答 | **中文提问中文答** |
 | 引用可靠性 | 靠模型自觉写引用 | **参考文献由脚本生成，模型无权写**；正文 PMID 逐条校验，越界即报警 |
 | 可复现性 | 通常只给一段对话 | **11 个文件留痕**：检索式、题录、证据、审查意见、PRISMA 流程、模型命中、耗时 |
-| 循证规范 | 无 | **GRADE 确定性分级 + PRISMA 流程计数**，可直接用于系统评价的方法学部分 |
+| 循证规范 | 无 | **GRADE 确定性分级（程序机械定级 + 模型复核）+ PRISMA 流程计数**，可直接用于系统评价的方法学部分 |
+| 证据把关 | 无 | **撤稿文献自动拦截并标注**；**偏倚评估要素**结构化抽取；**PICO 匹配度**区分直接/间接证据 |
+| 效应量 | 各说各的 | 同指标自动**合并效应量**（逆方差加权 + I² 异质性 + 随机效应敏感性） |
+| 漏检 | 只做关键词检索 | **检索式命中 0 自动修订重试** + **被引/相似文献链接扩展** + **引文滚雪球** + 年份下限自适应 |
 | 检索范围 | 常常默认限定某些刊 | **全 PubMed，不限刊源、不限学科**——不同专业背景都能用 |
 | 安装成本 | `pip install biopython httpx ...` | **零第三方依赖**，`git clone` 就能跑 |
 | 服务端点 | 绑定单一厂商 | **任意 OpenAI 兼容端点**，rerank 可选 |
+
+## 工具自己会做的检索增强
+
+不需要用户要求，每次运行自动执行：
+
+| 能力 | 行为 |
+|---|---|
+| **检索式质量闸门** | 命中 0 时自动修订检索式并重试（默认最多 2 轮） |
+| **年份自适应** | "最新进展"放宽到近 3-5 年，"经典/机制"放宽到早年，一般疗效诊断近 10 年 |
+| **被引/相似文献** | ELink 拉引用了种子文献的新文献与相似文献 |
+| **引文滚雪球** | 从种子文献的参考文献标题回灌检索 |
+| **排除纯动物实验** | 用官方 MeSH 写法，不会像自由词 `NOT` 那样被 PubMed 错解析 |
+| **撤稿拦截** | 撤稿文献在进入精读前剔除，证据表标注 ⚠ |
+| **第二轮扩写** | 候选不足时补充缩写/旧术语/同义表述再搜一轮 |
 
 ## 产物
 
@@ -106,19 +137,42 @@ python scripts/ask.py "GLP-1 受体激动剂对青少年肥胖的效果如何？
 ```
 runs/20261105-1830_GLP1受体激动剂对青少年肥胖/
   01_question.md        问题与限定
-  02_plan.json          检索计划（英文核心问题 + PICO + 检索式）
-  03_papers.json        全部候选题录（摘要/MeSH/关键词/PMCID）
-  04_evidence.json      逐篇抽取的结构化证据
-  05_evidence_table.md  ★ 证据总表 + 检索概况
+  02_plan.json          检索计划（核心问题 + PICO + 检索式 + 年份下限）
+  03_papers.json        全部候选题录
+  04_evidence.json      抽取的结构化证据（含偏倚要素、PICO 匹配度）
+  05_evidence_table.md  ★ 证据总表 + 偏倚要素表 + 合并效应量 + GRADE 机械定级
+  05b_excluded.json     被排除文献及排除理由
   06_fulltext/PMID*.txt 抓到的 PMC 开放全文
   07_answer.md          ★ 答案正文（每条论断挂 PMID）+ 关键文献
   08_bibliography.md    参考文献（脚本生成，非模型）
   09_log.txt            带时间戳的执行日志
-  10_trace.json         模型命中 / 各阶段耗时 / 错误表 / PMID 校验结果
-  11_prisma.md          PRISMA 流程计数 + 全部检索式明细
+  10_trace.json         模型命中 / 耗时 / 错误表 / PMID 校验 / token 与成本
+  11_prisma.md          PRISMA 流程计数 + 排除理由汇总 + 全部检索式明细
 ```
 
 **看答案只需 `07_answer.md` 和 `05_evidence_table.md`**；其余是过程留痕，供审稿与复现。
+`runs/_index.md` 汇总所有历史运行。
+
+## 常用命令
+
+```bash
+python scripts/ask.py "你的问题"                          # 基本用法
+python scripts/ask.py --doctor                            # 缺什么、怎么补
+python scripts/ask.py --setup                             # 配置向导
+python scripts/ask.py --quick "你的问题"                  # 快速模式（约 3 分钟）
+python scripts/ask.py --chat                              # 连续提问，上下文自动带
+python scripts/ask.py "问题" --export bib                 # 顺带导出 BibTeX
+python scripts/ask.py "问题" --export ris                 # 顺带导出 RIS（EndNote/Zotero 可导入）
+python scripts/ask.py "问题" --export docx                # 顺带导出 Word
+python scripts/ask.py "问题" --export notes               # 顺带导出 Zotero 笔记
+python scripts/ask.py --resume runs/20261105-1830_xxx     # 断点续跑
+python scripts/ask.py "问题" --reuse-plan runs/xxx/02_plan.json   # 复用检索式
+python scripts/ask.py "问题" --cq prognosis.narrow        # 按研究设计筛
+python scripts/ask.py "问题" --preprints                 # 同时检索 bioRxiv/medRxiv
+python scripts/ask.py --models                            # 看模型路由链
+python scripts/ask.py --pubmed-only '检索式'              # 只检索不调模型
+python scripts/ask.py --json "问题"                       # 机器可读输出（含答案与成本）
+```
 
 ## 设计要点
 

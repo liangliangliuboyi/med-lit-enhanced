@@ -19,6 +19,7 @@ except Exception:  # noqa: BLE001
 import json
 
 import config as cfgmod
+import grading
 import pipeline
 import pubmed as pm
 import sf
@@ -191,6 +192,85 @@ def main():
         return f'10 篇中判定为研究论文 {n} 篇'
 
     check('研究论文判定', t_research_filter)
+
+    def t_doctor():
+        """doctor 必须能把「缺什么、怎么补」说清楚。"""
+        items = cfgmod.doctor()
+        if not items:
+            raise RuntimeError('doctor 返回空')
+        names = [i['item'] for i in items]
+        for must in ('模型服务密钥', 'NCBI API key（选填）', 'Python 版本'):
+            if must not in names:
+                raise RuntimeError(f'doctor 缺少检查项：{must}')
+        miss = [i for i in items if not i['ok']]
+        for i in miss:
+            if not i['detail'].strip():
+                raise RuntimeError(f"缺项 {i['item']} 没给出补救说明")
+        return f'{len(items)} 项检查，{len(miss)} 项待补（提示文案齐备）'
+
+    check('环境体检 doctor', t_doctor)
+
+    def t_grading():
+        """B1：机械定级必须给出可复核的理由。"""
+        ev = [
+            {'study_design': 'RCT', 'sample_size': 'n=2000', 'pico_match': '直接',
+             'limitations': [], 'effect_sizes': ['RR 0.60 (95%CI 0.45-0.80)']},
+            {'study_design': 'RCT', 'sample_size': 'n=1500', 'pico_match': '直接',
+             'limitations': [], 'effect_sizes': ['RR 0.65 (95%CI 0.50-0.85)']},
+        ]
+        g = grading.mechanical_grading(ev, [])
+        if g['certainty'] not in ('高', '中', '低', '极低'):
+            raise RuntimeError(f'定级结果异常：{g}')
+        if not g.get('reason'):
+            raise RuntimeError('定级没有给出理由')
+        # 间接证据应降级
+        ev2 = [dict(e, pico_match='间接') for e in ev]
+        g2 = grading.mechanical_grading(ev2, [])
+        if g2['score'] >= g['score']:
+            raise RuntimeError('间接证据没有导致降级')
+        return (f'RCT+直接 → {g["certainty"]}；全间接 → {g2["certainty"]}'
+                f'；降级项 {len(g2["downgrades"])} 条')
+
+    check('GRADE 机械定级', t_grading)
+
+    def t_retraction():
+        """B2：撤稿与勘误必须能被识别。"""
+        r1 = pm.check_retraction({'correction_flags': ['retracted-publication']})
+        if not r1['retracted']:
+            raise RuntimeError('撤稿未识别')
+        r2 = pm.check_retraction({'correction_flags': ['erratum-in']})
+        if not r2['erratum']:
+            raise RuntimeError('勘误未识别')
+        r3 = pm.check_retraction({'correction_flags': []})
+        if r3['retracted'] or r3['erratum']:
+            raise RuntimeError('正常文献被误判')
+        return '撤稿 / 勘误 / 正常 三种情况均正确'
+
+    check('撤稿勘误识别', t_retraction)
+
+    def t_new_modules():
+        """新增模块必须能导入并暴露预期 API。"""
+        import importlib
+        need = {
+            'export': ['to_bibtex', 'to_ris', 'to_zotero_note', 'evidence_markdown', 'to_docx'],
+            'meta': ['parse_effect_size', 'pool_effect_sizes', 'summarize_effects'],
+            'preprints': ['search_preprints', 'preprint_to_paper_record'],
+        }
+        missing = []
+        for mod, fns in need.items():
+            try:
+                m = importlib.import_module(mod)
+            except Exception as e:
+                missing.append(f'{mod}(导入失败: {e})')
+                continue
+            for fn in fns:
+                if not hasattr(m, fn):
+                    missing.append(f'{mod}.{fn}')
+        if missing:
+            raise RuntimeError('缺少：' + '、'.join(missing))
+        return f'{len(need)} 个新模块 API 齐备'
+
+    check('新增模块 API', t_new_modules)
 
     def t_pmid_check():
         """PMID 越界校验必须能抓到假 PMID。"""

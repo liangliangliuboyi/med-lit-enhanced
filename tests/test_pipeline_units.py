@@ -1,0 +1,384 @@
+# -*- coding: utf-8 -*-
+"""`skills/medlit-agent/scripts/pipeline.py` 的纯离线单元测试。
+
+测试范围（全部是**纯函数 / 无副作用方法**）：
+
+| 被测对象            | 说明                                             |
+| ------------------- | ------------------------------------------------ |
+| `_json_load`        | 从模型输出里抠 JSON                              |
+| `_slug`             | 生成运行目录名                                   |
+| `Run._load_cq`      | 载入 Clinical Query 过滤器表                     |
+| `Run.evidence_table`| 证据总表（Markdown）                             |
+| `Run.prisma_table`  | PRISMA 流程表（Markdown）                        |
+| `Run.validate_pmids`| 正文 PMID 越界校验                               |
+
+**离线保证**
+本文件里的所有测试都不发网络请求、不读任何 API key。
+`TestOfflineGuard` 一组用例会把 `socket.socket` 与
+`urllib.request.urlopen` 替换成"一旦被调用就抛异常"的桩，
+从而证明被测代码路径确实没有偷偷联网。
+
+**构造 Run 实例的姿势**
+`Run.__init__` 会创建输出目录、构造 Provider / PubMed 客户端并读取配置，
+既需要密钥又会产生副作用，因此测试一律用 `Run.__new__(Run)` 绕开 `__init__`，
+再手工塞入被测方法真正需要的字段。
+"""
+from __future__ import annotations
+
+import os
+import socket
+import sys
+import unittest
+import urllib.request
+
+# 把被测代码目录加入 import 路径。路径由 __file__ 推导，不写死绝对路径，
+# 保证在 CI 上（不同的工作目录）同样可用。
+SCRIPTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'skills', 'medlit-agent', 'scripts')
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
+import pipeline  # noqa: E402  （必须在 sys.path 调整之后导入）
+
+
+def make_run(**fields):
+    """构造一个不跑 __init__ 的 Run 实例，并写入给定字段。
+
+    `Run.__init__` 需要密钥、会建目录、会连 PubMed，所以测试里一律绕开它。
+    """
+    run = pipeline.Run.__new__(pipeline.Run)
+    run.answer = ''
+    run.papers = {}
+    run.evidence = []
+    run.excluded = []
+    run.prisma = {
+        'identified': 0, 'deduplicated': 0, 'screened': 0,
+        'excluded_screening': 0, 'fulltext_assessed': 0,
+        'included': 0, 'excluded_fulltext': 0, 'queries': 0,
+        'preprints': 0, 'linked': 0, 'snowballed': 0,
+    }
+    run.trace = {'errors': []}
+    run.search_failed = False
+    # log 会往 self._log_lines 里追加并 print，测试里不需要输出，直接静音。
+    run.log = lambda msg: None
+    for key, value in fields.items():
+        setattr(run, key, value)
+    return run
+
+
+class TestJsonLoad(unittest.TestCase):
+    """`_json_load(text)`：从模型输出里抠 JSON。"""
+
+    def test_plain_json_is_parsed(self):
+        """纯 JSON 字符串应被直接解析成 dict。"""
+        self.assertEqual(pipeline._json_load('{"a": 1, "b": "x"}'), {'a': 1, 'b': 'x'})
+
+    def test_json_array_is_parsed(self):
+        """JSON 数组同样应被解析（返回 list 而不是 dict）。"""
+        self.assertEqual(pipeline._json_load('[1, 2, 3]'), [1, 2, 3])
+
+    def test_fenced_json_block_is_parsed(self):
+        """被 ```json ... ``` 包起来时应能解析。"""
+        raw = '```json\n{"queries": [{"label": "直译"}]}\n```'
+        self.assertEqual(pipeline._json_load(raw), {'queries': [{'label': '直译'}]})
+
+    def test_fenced_json_without_language_tag_is_parsed(self):
+        """只有 ``` 而没有 json 语言标记时也应能解析。"""
+        raw = '```\n{"ok": true}\n```'
+        self.assertEqual(pipeline._json_load(raw), {'ok': True})
+
+    def test_noisy_text_around_json_is_parsed_via_regex_fallback(self):
+        """前后有噪音文字、中间夹着 JSON 时，靠正则兜底也能解析。"""
+        raw = '好的，这是结果：\n{"core_question_en": "aspirin", "queries": []}\n以上。'
+        self.assertEqual(
+            pipeline._json_load(raw),
+            {'core_question_en': 'aspirin', 'queries': []})
+
+    def test_empty_string_returns_none(self):
+        """空字符串返回 None。"""
+        self.assertIsNone(pipeline._json_load(''))
+
+    def test_none_returns_none(self):
+        """None 返回 None。"""
+        self.assertIsNone(pipeline._json_load(None))
+
+    def test_invalid_json_returns_none(self):
+        """非法 JSON 返回 None，而不是抛异常。"""
+        self.assertIsNone(pipeline._json_load('这不是 JSON'))
+
+    def test_broken_json_object_returns_none(self):
+        """形似 JSON 但语法损坏的文本也应返回 None。"""
+        self.assertIsNone(pipeline._json_load('{"a": }'))
+
+
+class TestSlug(unittest.TestCase):
+    """`_slug(text, n)`：生成运行目录名片段（末尾带短哈希防撞名）。"""
+
+    def _base(self, text, n=16):
+        """取掉哈希后缀后的主体部分。"""
+        out = pipeline._slug(text, n)
+        return out.rsplit('_', 1)[0] if '_' in out else out
+
+    def test_chinese_characters_are_preserved(self):
+        """中文应被保留。"""
+        self.assertTrue(pipeline._slug('二甲双胍治疗糖尿病').startswith('二甲双胍治疗糖尿病'))
+
+    def test_special_characters_are_stripped(self):
+        """空格与标点等特殊字符应被去掉。"""
+        self.assertEqual(self._base('hello world!@#$%^&*()'), 'helloworld')
+
+    def test_empty_string_falls_back_to_query(self):
+        """空字符串应回退成 'query'（并仍带哈希后缀）。"""
+        self.assertTrue(pipeline._slug('').startswith('query'))
+
+    def test_none_falls_back_to_query(self):
+        """None 应回退成 'query'。"""
+        self.assertTrue(pipeline._slug(None).startswith('query'))
+
+    def test_only_special_characters_falls_back_to_query(self):
+        """全是特殊字符时清空后同样回退成 'query'。"""
+        self.assertTrue(pipeline._slug('!!!???').startswith('query'))
+
+    def test_long_text_is_truncated_to_n(self):
+        """超过 n 个字符应被截断。"""
+        self.assertEqual(len(self._base('a' * 30, 10)), 10)
+
+    def test_truncation_keeps_leading_characters(self):
+        """截断应保留开头部分。"""
+        self.assertEqual(self._base('abcdefghijklmnop', 5), 'abcde')
+
+    def test_default_length_is_16(self):
+        """默认主体长度为 16。"""
+        self.assertEqual(len(self._base('x' * 40)), 16)
+
+    def test_same_minute_different_questions_do_not_collide(self):
+        """同一分钟内两个相似问题的目录名不能相同（否则后者覆盖前者）。"""
+        a = pipeline._slug('GLP-1 受体激动剂对青少年肥胖的效果如何？')
+        b = pipeline._slug('GLP-1 受体激动剂对青少年肥胖的长期安全性如何？')
+        self.assertNotEqual(a, b, '相似问题的目录名撞车了')
+
+    def test_same_question_is_stable(self):
+        """同一个问题每次生成的目录名必须一致（便于断点续跑）。"""
+        self.assertEqual(pipeline._slug('测试问题'), pipeline._slug('测试问题'))
+
+
+class TestLoadCq(unittest.TestCase):
+    """`Run._load_cq()`：载入 Clinical Query 过滤器表。"""
+
+    def setUp(self):
+        self.cq = make_run()._load_cq()
+
+    def test_returns_dict(self):
+        """应返回一个 dict。"""
+        self.assertIsInstance(self.cq, dict)
+
+    def test_contains_therapy_narrow(self):
+        """应包含 'therapy.narrow' 等标准过滤器条目。"""
+        self.assertIn('therapy.narrow', self.cq)
+
+    def test_underscore_prefixed_keys_are_removed(self):
+        """以 _ 开头的元信息键（如 _comment）应被过滤掉。"""
+        for key in self.cq:
+            self.assertFalse(key.startswith('_'),
+                             f'不应保留以下划线开头的键：{key}')
+
+    def test_entries_have_label_and_query(self):
+        """每个条目都应包含 label 与 query 两个字段。"""
+        for key, value in self.cq.items():
+            self.assertIsInstance(value, dict, f'{key} 应为 dict')
+            self.assertIn('label', value, f'{key} 缺少 label')
+            self.assertIn('query', value, f'{key} 缺少 query')
+
+
+class TestEvidenceTable(unittest.TestCase):
+    """`Run.evidence_table()`：证据总表。"""
+
+    def test_empty_evidence_returns_header_only(self):
+        """evidence 为空时只返回表头，且不抛异常。"""
+        table = make_run(evidence=[]).evidence_table()
+        self.assertIsInstance(table, str)
+        self.assertIn('PMID', table)
+        self.assertIn('核心发现', table)
+
+    def test_empty_evidence_has_exactly_two_header_lines(self):
+        """evidence 为空时应只有表头行与分隔行两行。"""
+        table = make_run(evidence=[]).evidence_table()
+        self.assertEqual(len(table.strip().splitlines()), 2)
+
+    def test_evidence_rows_are_rendered(self):
+        """有证据时应逐条渲染出 PMID 等字段。"""
+        evidence = [{
+            'pmid': '12345678', '_year': '2020', '_journal': 'Lancet',
+            'study_design': 'RCT', 'sample_size': 1200,
+            'pico_match': 'P', 'relevance': 9,
+            'key_findings': ['降低风险', '无明显差异'],
+        }]
+        table = make_run(evidence=evidence).evidence_table()
+        self.assertIn('12345678', table)
+        self.assertIn('Lancet', table)
+        self.assertIn('RCT', table)
+        self.assertIn('降低风险', table)
+
+    def test_pipe_in_key_findings_is_escaped(self):
+        """核心发现里的竖线应被替换掉，否则会破坏 Markdown 表格。"""
+        evidence = [{'pmid': '1', 'key_findings': ['A|B']}]
+        table = make_run(evidence=evidence).evidence_table()
+        body = table.splitlines()[2]
+        self.assertNotIn('A|B', body)
+        self.assertIn('A/B', body)
+
+
+class TestPrismaTable(unittest.TestCase):
+    """`Run.prisma_table()`：PRISMA 流程表。"""
+
+    def test_output_contains_final_inclusion_row(self):
+        """输出中应包含「最终纳入」字样。"""
+        table = make_run().prisma_table()
+        self.assertIn('最终纳入', table)
+
+    def test_output_is_markdown_table(self):
+        """输出应是 Markdown 表格（含表头与分隔行）。"""
+        table = make_run().prisma_table()
+        lines = table.strip().splitlines()
+        self.assertTrue(lines[0].startswith('|'))
+        self.assertEqual(set(lines[1].replace('|', '').strip()), {'-'})
+
+    def test_counts_are_rendered(self):
+        """PRISMA 计数应被渲染进表格。"""
+        prisma = {
+            'identified': 120, 'deduplicated': 100, 'screened': 80,
+            'excluded_screening': 20, 'fulltext_assessed': 40,
+            'included': 12, 'excluded_fulltext': 28, 'queries': 3,
+            'preprints': 0, 'linked': 0, 'snowballed': 0,
+        }
+        table = make_run(prisma=prisma).prisma_table()
+        self.assertIn('120', table)
+        self.assertIn('| 12 |', table)
+
+
+class TestValidatePmids(unittest.TestCase):
+    """`Run.validate_pmids()`：正文 PMID 越界校验。
+
+    被测方法的实际行为（依当前 pipeline.py 实现）：
+    - 从正文里用正则 `\\[PMID:(\\d+)\\]` 抽取引用；
+    - `pool` 取自 `self.papers` 的键；
+    - `orphan` = 引用集合减去候选池，排序后写入 `orphan_pmids`；
+    - 返回字典字段：`cited_count` / `pool_size` / `orphan_pmids` /
+      `orphan_count` / `cited_in_pool`；
+    - `self.search_failed` 为真时**提前返回**，并在结果里加 `skipped`，
+      此时不做任何报警（不写 `trace['errors']`、不调用 `log`）。
+    """
+
+    def test_all_cited_pmids_in_pool_reports_no_orphan(self):
+        """正文 PMID 全部在候选池时，orphan_count 应为 0。"""
+        run = make_run(
+            answer='结论一 [PMID:11111111]；结论二 [PMID:22222222]。',
+            papers={'11111111': {}, '22222222': {}, '33333333': {}})
+        check = run.validate_pmids()
+        self.assertEqual(check['orphan_count'], 0)
+        self.assertEqual(check['orphan_pmids'], [])
+        self.assertEqual(check['cited_count'], 2)
+        self.assertEqual(check['cited_in_pool'], 2)
+        self.assertEqual(check['pool_size'], 3)
+
+    def test_orphan_pmid_is_detected(self):
+        """正文出现候选池之外的 PMID 时，应被记为越界引用。"""
+        run = make_run(
+            answer='有效引用 [PMID:11111111]，越界引用 [PMID:99999999]。',
+            papers={'11111111': {}})
+        check = run.validate_pmids()
+        self.assertEqual(check['orphan_count'], 1)
+        self.assertEqual(check['orphan_pmids'], ['99999999'])
+        self.assertEqual(check['cited_count'], 2)
+        self.assertEqual(check['cited_in_pool'], 1)
+
+    def test_multiple_orphans_are_sorted(self):
+        """多个越界 PMID 应被完整列出并按字典序排序。"""
+        run = make_run(
+            answer='[PMID:99999999] [PMID:12345678] [PMID:55555555]',
+            papers={})
+        check = run.validate_pmids()
+        self.assertEqual(check['orphan_count'], 3)
+        self.assertEqual(check['orphan_pmids'], ['12345678', '55555555', '99999999'])
+
+    def test_orphan_is_recorded_as_trace_error(self):
+        """发现越界引用时，应在 trace['errors'] 里留痕。"""
+        run = make_run(answer='[PMID:99999999]', papers={})
+        run.validate_pmids()
+        stages = [e.get('stage') for e in run.trace['errors']]
+        self.assertIn('pmid_check', stages)
+
+    def test_no_orphan_does_not_record_trace_error(self):
+        """没有越界引用时，不应产生 pmid_check 错误。"""
+        run = make_run(answer='[PMID:11111111]', papers={'11111111': {}})
+        run.validate_pmids()
+        stages = [e.get('stage') for e in run.trace['errors']]
+        self.assertNotIn('pmid_check', stages)
+
+    def test_search_failed_skips_the_check(self):
+        """search_failed 为真时不做 PMID 判读，结果里应带 skipped 字段。"""
+        run = make_run(
+            answer='[PMID:99999999]', papers={}, search_failed=True)
+        check = run.validate_pmids()
+        self.assertIn('skipped', check)
+        self.assertEqual(check['skipped'], '检索后端故障，未生成答案')
+
+    def test_search_failed_does_not_raise_alarm(self):
+        """search_failed 为真时不应报警（trace 里不记 pmid_check 错误）。"""
+        run = make_run(
+            answer='[PMID:99999999]', papers={}, search_failed=True)
+        run.validate_pmids()
+        stages = [e.get('stage') for e in run.trace['errors']]
+        self.assertNotIn('pmid_check', stages)
+
+    def test_result_is_stored_on_pmid_check_attribute(self):
+        """校验结果应同时写入 self.pmid_check。"""
+        run = make_run(answer='[PMID:11111111]', papers={'11111111': {}})
+        check = run.validate_pmids()
+        self.assertEqual(run.pmid_check, check)
+
+    def test_bare_pmid_without_brackets_is_not_counted(self):
+        """只有 [PMID:xxx] 形式才被识别；裸 PMID 文本不计入引用数。"""
+        run = make_run(answer='见 PMID:11111111 的研究。', papers={'11111111': {}})
+        check = run.validate_pmids()
+        self.assertEqual(check['cited_count'], 0)
+        self.assertEqual(check['orphan_count'], 0)
+
+
+class TestOfflineGuard(unittest.TestCase):
+    """离线保证：被测代码路径绝不触网。
+
+    把 `socket.socket` 与 `urllib.request.urlopen` 换成"一被调用就抛异常"的桩，
+    只要有任何一次真实的网络访问，测试就会失败。
+    """
+
+    def setUp(self):
+        def _boom(*args, **kwargs):
+            raise AssertionError('单元测试不允许发起网络请求')
+
+        self._orig_socket = socket.socket
+        self._orig_urlopen = urllib.request.urlopen
+        socket.socket = _boom
+        urllib.request.urlopen = _boom
+
+    def tearDown(self):
+        socket.socket = self._orig_socket
+        urllib.request.urlopen = self._orig_urlopen
+
+    def test_exercised_paths_make_no_network_call(self):
+        """把所有被测函数跑一遍，不应触发任何网络调用。"""
+        pipeline._json_load('{"a": 1}')
+        pipeline._slug('二甲双胍 糖尿病')
+        make_run().prisma_table()
+        make_run().evidence_table()
+        make_run(answer='[PMID:1]', papers={'1': {}}).validate_pmids()
+
+    def test_importing_pipeline_does_not_touch_network(self):
+        """被测模块本身不应在导入期发起网络请求（重新导入一次验证）。"""
+        import importlib
+        importlib.reload(pipeline)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

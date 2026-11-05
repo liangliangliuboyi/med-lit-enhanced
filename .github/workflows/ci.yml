@@ -1,0 +1,68 @@
+# CI 工作流：语法检查 + 离线单元测试
+#
+# 设计约束（重要）：
+# 1. 单元测试必须完全离线 —— 不发网络请求、不需要 API key。
+#    skills/medlit-agent/scripts/selftest.py 依赖 PubMed / 模型服务，
+#    绝不能在本工作流里执行，因此测试目录与 selftest 完全隔离。
+# 2. 矩阵只在 ubuntu-latest 上跑真正的测试，避免矩阵爆炸；
+#    另设一个 windows-latest 作业只做语法编译检查 ——
+#    Windows 的路径分隔符与换行处理容易出问题，值得单独守一道。
+#
+# 注意：YAML 1.1 会把裸 `on` 解析成布尔 True，所以这里写成 "on"。
+
+name: CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一个分支只保留最新一次运行，旧运行自动取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 单元测试 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 语法编译检查
+        run: python -m compileall -q skills/medlit-agent/scripts
+
+      - name: 运行离线单元测试
+        run: python -m unittest discover -s tests -v
+
+  syntax-windows:
+    name: 语法检查 (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 语法编译检查
+        run: python -m compileall -q skills/medlit-agent/scripts
+
+      - name: 语法编译检查（测试目录）
+        run: python -m compileall -q tests

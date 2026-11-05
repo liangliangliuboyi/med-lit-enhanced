@@ -79,7 +79,33 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 # ---------------- 密钥解析 ----------------
 class MissingSecretError(RuntimeError):
-    """缺少必需的密钥。"""
+    """缺少必需的密钥。消息要能直接当行动清单给用户看。"""
+
+
+# 缺什么 → 怎么补。这是用户看到的第一句话，必须可执行。
+FIX_HINTS = {
+    'provider': (
+        '缺少模型服务密钥。任选一种方式补上：\n'
+        '   1) 在技能目录下的 .env 里写 SILICONFLOW_API_KEY=<你的密钥>\n'
+        '      （.env.example 是模板，复制一份改名即可）\n'
+        '   2) 或设置系统环境变量 SILICONFLOW_API_KEY\n'
+        '   3) 或运行 `python scripts/ask.py --setup` 由向导代填\n'
+        '   密钥获取：硅基流动 https://cloud.siliconflow.cn/ → 账户 → API Key\n'
+        '   （也支持 OpenAI / DeepSeek / Kimi / 本地 Ollama 等任意 OpenAI 兼容端点，'
+        '改 config.json 的 provider 段即可）'),
+    'pubmed': (
+        '缺少 NCBI API key（可选项，但建议补）：\n'
+        '   在 .env 里写 NCBI_API_KEY=<你的密钥>，申请地址\n'
+        '   https://www.ncbi.nlm.nih.gov/account/settings/ → API Key Management\n'
+        '   有了它 NCBI 限速从 3 请求/秒 提升到 10 请求/秒。\n'
+        '   不填也能用，只是慢一些。'),
+    'email': (
+        '建议填写 NCBI 开发者邮箱（可选项）：\n'
+        '   在 .env 里写 NCBI_EMAIL=<你的邮箱>。\n'
+        '   NCBI 规定 email 填「软件开发者」的邮箱，不是终端使用者的邮箱——'
+        '   万一这个软件被违规使用并导致 IP 被封，NCBI 需要能联系到作者。\n'
+        '   填了之后使用者也可以在 config.json 的 pubmed.email 里改成自己的。'),
+}
 
 
 def resolve_secret(block: dict, dotenv: dict, label: str,
@@ -98,10 +124,8 @@ def resolve_secret(block: dict, dotenv: dict, label: str,
         return val
     if required:
         raise MissingSecretError(
-            f'缺少 {label} 的密钥。\n'
-            f'  请设置环境变量 {env_name or "(未声明 api_key_env)"}，'
-            f'或复制 .env.example 为 .env 后填写。\n'
-            f'  详见 README「配置」一节。')
+            f'{FIX_HINTS.get(label.split("(")[0].strip(), "缺少必要的配置项：")}\n'
+            f'  （配置项：{label}，期望的环境变量名：{env_name or "未声明 api_key_env"}）')
     return ''
 
 
@@ -168,3 +192,74 @@ def describe_sources(cfg: dict) -> str:
     if prov.get('api_key_env'):
         bits.append(f"env:{prov['api_key_env']}")
     return ' + '.join(bits) if bits else '(全部使用默认值)'
+
+
+# ---------------- 环境体检与配置向导 ----------------
+def doctor() -> list[dict]:
+    """检查当前环境缺什么、怎么补。返回 [{'item', 'ok', 'detail'}]。
+
+    这是「主动提醒用户少了什么」的入口：技能每次运行前可以先调用它。
+    """
+    items: list[dict] = []
+    dotenv = load_dotenv()
+    cfg = load_config(require_secrets=False)
+
+    prov = cfg.get('provider') or {}
+    prov_env = prov.get('api_key_env') or 'SILICONFLOW_API_KEY'
+    has_key = bool((os.environ.get(prov_env) or dotenv.get(prov_env) or '').strip())
+    items.append({
+        'item': '模型服务密钥',
+        'ok': has_key,
+        'detail': ('已配置（' + prov_env + '）' if has_key else FIX_HINTS['provider']),
+    })
+
+    has_pm = bool((os.environ.get('NCBI_API_KEY') or dotenv.get('NCBI_API_KEY') or '').strip())
+    items.append({
+        'item': 'NCBI API key（选填）',
+        'ok': has_pm,
+        'detail': ('已配置，限速 10 请求/秒' if has_pm
+                   else '未配置，限速 3 请求/秒（功能正常，只是稍慢）'),
+    })
+
+    has_mail = bool((cfg.get('pubmed') or {}).get('email'))
+    items.append({
+        'item': 'NCBI 开发者邮箱（建议）',
+        'ok': has_mail,
+        'detail': ('已配置' if has_mail else FIX_HINTS['email']),
+    })
+
+    items.append({'item': '配置文件', 'ok': True, 'detail': describe_sources(cfg)})
+
+    import sys
+    v = sys.version_info
+    items.append({'item': 'Python 版本', 'ok': v >= (3, 9),
+                  'detail': str(v.major) + '.' + str(v.minor) + '.' + str(v.micro) + '（需要 ≥ 3.9）'})
+    items.append({'item': '第三方依赖', 'ok': True,
+                  'detail': '无（纯标准库，可直接运行）'})
+    return items
+
+
+def save_env(values: dict, path=ENV_FILE) -> str:
+    """把键值写进 .env（已存在的键会被覆盖，其余保留）。"""
+    p = Path(path)
+    existing: dict[str, str] = {}
+    order: list[str] = []
+    if p.exists():
+        for line in p.read_text(encoding='utf-8').splitlines():
+            s = line.strip()
+            if not s or s.startswith('#') or '=' not in s:
+                continue
+            k, _, v = s.partition('=')
+            k = k.strip()
+            if k:
+                existing[k] = v.strip()
+                order.append(k)
+    for k, v in values.items():
+        if k not in existing:
+            order.append(k)
+        existing[k] = v
+    lines = ['# 由 --setup 向导生成，可手工编辑']
+    for k in order:
+        lines.append(k + '=' + existing.get(k, ''))
+    p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return str(p)
