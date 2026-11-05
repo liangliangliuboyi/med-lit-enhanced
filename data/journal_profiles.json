@@ -1,0 +1,88 @@
+{
+  "_comment": "期刊画像。mode=ta 用 NLM ISO 缩写匹配（推荐，命中率高）；mode=full 用期刊全称。内置三档：clinical（临床，医学院默认）/ basic_science（基础科学，原 26 本）/ public_health（公共卫生与卫生政策）。",
+
+  "clinical": {
+    "label": "临床医学核心期刊（Lancet/NEJM/JAMA/BMJ 梯队 + 内分泌代谢专科）",
+    "ta": [
+      "N Engl J Med", "Lancet", "JAMA", "BMJ", "Ann Intern Med",
+      "Lancet Diabetes Endocrinol", "Diabetes Care", "Diabetologia",
+      "Nat Rev Endocrinol", "Nat Med", "Sci Transl Med", "Med",
+      "Lancet Infect Dis", "JAMA Intern Med", "JAMA Cardiol", "JAMA Oncol",
+      "JAMA Psychiatry", "BMJ Qual Improv", "BMJ Qual Saf", "BMJ Glob Health",
+      "Lancet Oncol", "Lancet Psychiatry", "Lancet Respir Med",
+      "Lancet Rheumatol", "Lancet Neurol", "Lancet Child Adolesc Health",
+      "Lancet Digit Health", "Lancet Glob Health", "Lancet Public Health",
+      "J Am Coll Cardiol", "Eur Heart J", "Nat Rev Cardiol", "Circulation",
+      "Gastroenterology", "Hepatology", "Nat Rev Gastroenterol Hepatol",
+      "Am J Respir Crit Care Med", "Thorax", "Ann Rheum Dis", "J Clin Oncol",
+      "Obesity (Silver Spring)", "Int J Obes", "Diabetes Obes Metab",
+      "BMC Med", "EBioMedicine", "NPJ Digit Med", "JAMA Netw Open",
+      "QJM", "Eur J Heart Fail", "Heart", "JACC Cardiovasc Interv"
+    ],
+    "full": [
+      "The New England journal of medicine", "The Lancet", "JAMA",
+      "BMJ", "Annals of internal medicine", "The Lancet. Diabetes & endocrinology",
+      "Diabetes care", "Diabetologia", "Nature reviews. Endocrinology",
+      "Nature medicine", "Science translational medicine", "Medicine",
+      "The Lancet. Infectious diseases", "JAMA internal medicine",
+      "JAMA cardiology", "JAMA oncology", "JAMA psychiatry",
+      "BMJ quality improvement", "BMJ global health", "The Lancet. Oncology",
+      "The Lancet. Psychiatry", "The Lancet. Respiratory medicine",
+      "European heart journal", "Circulation", "Gastroenterology", "Hepatology",
+      "American journal of respiratory and critical care medicine",
+      "Annals of the rheumatic diseases", "Journal of clinical oncology",
+      "Obesity", "International journal of obesity", "Diabetes, obesity and metabolism",
+      "BMC medicine", "EBioMedicine", "npj Digital Medicine", "JAMA network open",
+      "QJM : quarterly journal of the Royal College of Medicine of London",
+      "Heart", "European journal of heart failure"
+    ]
+  },
+
+  "basic_science": {
+    "label": "基础科学高影响力刊（Nature/Cell 系列，原 26 本白名单）",
+    "ta": [
+      "Nature", "Cell", "Science",
+      "Nat Aging", "Nat Biomed Eng", "Nat Cancer", "Nat Cell Biol",
+      "Nat Genet", "Nat Immunol", "Nat Mater", "Nat Med", "Nat Metab",
+      "Nat Methods", "Nat Microbiol", "Nat Nanotechnol", "Nat Biotechnol",
+      "Cancer Cell", "Cell Host Microbe", "Cell Metab", "Dev Cell",
+      "Immunity", "Matter", "Med", "Mol Cell",
+      "Sci Immunol", "Sci Transl Med"
+    ],
+    "full": [
+      "Nature", "Cell", "Science",
+      "Nature aging", "Nature biomedical engineering", "Nature cancer",
+      "Nature cell biology", "Nature genetics", "Nature immunology",
+      "Nature materials", "Nature medicine", "Nature metabolism",
+      "Nature methods", "Nature microbiology", "Nature nanotechnology",
+      "Nature biotechnology", "Cancer cell", "Cell host & microbe",
+      "Cell metabolism", "Developmental cell", "Immunity", "Matter",
+      "Med", "Molecular cell", "Science immunology", "Science translational medicine"
+    ]
+  },
+
+  "public_health": {
+    "label": "公共卫生与卫生政策期刊",
+    "ta": [
+      "Am J Epidemiol", "Int J Epidemiol", "Epidemiology", "Ann Epidemiol",
+      "Eur J Epidemiol", "Am J Public Health", "Soc Sci Med", "Health Serv Res",
+      "Milbank Q", "Health Policy", "Health Econ", "Value Health",
+      "BMC Health Serv Res", "BMJ Open", "BMJ Open Qual", "PLoS Med",
+      "PLoS One", "PLoS Public Health", "BMC Public Health", "Int J Equity Health",
+      "BMC Health Serv Res", "JAMA Netw Open", "Wellcome Open Res",
+      "Health Policy Plan", "Health Syst Rev", "Implement Sci",
+      "Front Public Health", "BMC Health Serv Res"
+    ],
+    "full": [
+      "American journal of epidemiology", "International journal of epidemiology",
+      "Epidemiology", "Annals of epidemiology", "European journal of epidemiology",
+      "American journal of public health", "Social science & medicine",
+      "Health services research", "The Milbank Quarterly", "Health policy",
+      "Health economics", "Value in health", "BMC health services research",
+      "BMJ open", "PLoS medicine", "PLOS ONE", "PLOS public health",
+      "BMC public health", "International journal for equity in health",
+      "Implementation science", "Health policy and planning",
+      "Health systems review"
+    ]
+  }
+}

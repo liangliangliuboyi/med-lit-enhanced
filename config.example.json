@@ -1,0 +1,104 @@
+{
+  "_comment": "配置模板。复制为 config.json 后可自由修改；密钥请写进 .env 或系统环境变量，不要写在这里。config.local.json 可覆盖本文件的任意字段（已 gitignore）。",
+
+  "provider": {
+    "name": "siliconflow",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "rerank": {
+      "enabled": true,
+      "model": "Qwen/Qwen3-Reranker-8B",
+      "endpoint": "https://api.siliconflow.cn/v1/rerank",
+      "api_key_env": "SILICONFLOW_API_KEY"
+    },
+    "embed": {
+      "enabled": false,
+      "model": "Qwen/Qwen3-Embedding-8B",
+      "api_key_env": "SILICONFLOW_API_KEY"
+    }
+  },
+
+  "pubmed": {
+    "api_key_env": "NCBI_API_KEY",
+    "tool": "medlit-agent",
+    "email": ""
+  },
+
+  "models": {
+    "chain": {
+      "planner": [
+        "deepseek-ai/DeepSeek-V3.2",
+        "deepseek-ai/DeepSeek-V3.1-Terminus",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3-32B"
+      ],
+      "reader": [
+        "deepseek-ai/DeepSeek-V3.2",
+        "deepseek-ai/DeepSeek-V3.1-Terminus",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen2.5-72B-Instruct"
+      ],
+      "critic": [
+        "deepseek-ai/DeepSeek-R1",
+        "deepseek-ai/DeepSeek-V3.2",
+        "Qwen/Qwen3.5-27B"
+      ],
+      "writer": [
+        "deepseek-ai/DeepSeek-V3.2",
+        "deepseek-ai/DeepSeek-V3.1-Terminus",
+        "Qwen/Qwen3.5-35B-A3B"
+      ],
+      "fast": [
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3-14B",
+        "Qwen/Qwen2.5-7B-Instruct"
+      ]
+    }
+  },
+
+  "retrieval": {
+    "rounds": 2,
+    "expand_when_below": 16,
+    "retmax_per_query": 20,
+    "retmax_per_query_round2": 12,
+    "max_papers": 8,
+    "fulltext_limit": 4,
+    "min_year": 2015,
+    "require_abstract": true,
+    "min_abstract_chars": 200,
+    "research_min_abstract_chars": 300,
+    "research_only": false,
+    "exclude_pub_types": [
+      "Review",
+      "Systematic Review",
+      "Meta-Analysis",
+      "Case Reports",
+      "Editorial",
+      "Comment",
+      "Letter",
+      "News",
+      "Published Erratum",
+      "Retraction of Publication"
+    ],
+    "journals": {
+      "enabled": false,
+      "mode": "ta",
+      "profile": "clinical",
+      "list": []
+    }
+  },
+
+  "runtime": {
+    "timeout": 180,
+    "max_retries": 3,
+    "max_tokens": 4000,
+    "temperature_plan": 0.15,
+    "temperature_reader": 0.1,
+    "temperature_writer": 0.3,
+    "workers": 3
+  },
+
+  "paths": {
+    "runs_root": "./runs"
+  }
+}

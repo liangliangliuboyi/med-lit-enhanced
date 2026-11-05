@@ -1,0 +1,48 @@
+{
+  "_comment": "PubMed 官方 Clinical Queries 检索过滤器 + 常用文献类型过滤器。按 NCBI Clinical Queries 规格整理（https://www.ncbi.nlm.nih.gov/pubmed/advanced/clinical-queries/）。这些是检索式片段，会被 AND 进你的检索式。",
+
+  "therapy.narrow": {
+    "label": "治疗 · 窄（高质量 RCT）",
+    "query": "((clinical[Title/Abstract] AND trial[Title/Abstract]) OR clinical trials as topic[MeSH Terms:noexp] OR clinical trial[Publication Type] OR random*[Title/Abstract] OR random allocation[MeSH Terms:noexp] OR therapeutic use[MeSH Subheading:noexp])"
+  },
+  "therapy.broad": {
+    "label": "治疗 · 宽（含临床试验类研究）",
+    "query": "((clinical[Title/Abstract] AND trial[Title/Abstract]) OR clinical trials as topic[MeSH Terms] OR clinical trial[Publication Type] OR random*[Title/Abstract] OR random allocation[MeSH Terms] OR therapeutic use[MeSH Subheading])"
+  },
+  "diagnosis.narrow": {
+    "label": "诊断 · 窄",
+    "query": "((diagnosis[Title/Abstract] AND (diagnostic[Title/Abstract] OR differential[Title/Abstract])) OR (diagnostic imaging[MeSH Terms] OR diagnostic techniques and procedures[MeSH Terms]) OR (diagnostic[MeSH Terms] OR \"diagnosis\"[MeSH Terms])) NOT (animal[MeSH Terms] NOT humans[MeSH Terms])"
+  },
+  "diagnosis.broad": {
+    "label": "诊断 · 宽",
+    "query": "((diagnosis[Title/Abstract] AND (diagnostic[Title/Abstract] OR differential[Title/Abstract])) OR (diagnostic imaging[MeSH Terms] OR diagnostic techniques and procedures[MeSH Terms]) OR (diagnostic[MeSH Terms] OR \"diagnosis\"[MeSH Terms]))"
+  },
+  "prognosis.narrow": {
+    "label": "预后 · 窄",
+    "query": "((prognos*[Title/Abstract] OR predict*[Title/Abstract] OR outcome*[Title/Abstract]) AND (population[Title/Abstract] OR \"population\"[MeSH Terms] OR \"follow-up\"[MeSH Terms] OR \"follow up\"[Title/Abstract] OR \"course\"[Title/Abstract] OR \"duration\"[Title/Abstract])) NOT (animal[MeSH Terms] NOT humans[MeSH Terms])"
+  },
+  "prognosis.broad": {
+    "label": "预后 · 宽",
+    "query": "((prognos*[Title/Abstract] OR predict*[Title/Abstract] OR outcome*[Title/Abstract]) OR (population[MeSH Terms] OR \"follow-up\"[MeSH Terms] OR \"follow up\"[Title/Abstract] OR \"course\"[Title/Abstract] OR \"duration\"[Title/Abstract]))"
+  },
+  "etiology": {
+    "label": "病因 / 危险因素",
+    "query": "((etiol*[Title/Abstract] OR causal*[Title/Abstract] OR \"risk factor\"[Title/Abstract] OR \"risk factors\"[Title/Abstract] OR incidence[Title/Abstract]) AND (population[Title/Abstract] OR \"population\"[MeSH Terms] OR persons[Title/Abstract] OR humans[Title/Abstract])) NOT (animal[MeSH Terms] NOT humans[MeSH Terms])"
+  },
+  "rct": {
+    "label": "仅随机对照试验",
+    "query": "(randomized controlled trial[Publication Type] OR (randomized[Title/Abstract] AND controlled[Title/Abstract] AND trial[Title/Abstract]))"
+  },
+  "review": {
+    "label": "仅系统综述 / Meta 分析",
+    "query": "(review[Publication Type] OR systematic review[Publication Type] OR meta-analysis[Publication Type] OR \"meta analysis\"[Title/Abstract] OR \"systematic review\"[Title/Abstract])"
+  },
+  "observational": {
+    "label": "观察性研究（队列 / 病例对照）",
+    "query": "(cohort[Title/Abstract] OR \"cohort study\"[Title/Abstract] OR case-control[Title/Abstract] OR \"case control\"[Title/Abstract] OR longitudinal[Title/Abstract] OR cross-sectional[Title/Abstract] OR registry[Title/Abstract]) NOT (randomized[Title/Abstract] OR random allocation[MeSH Terms])"
+  },
+  "guideline": {
+    "label": "指南 / 共识 / 实践规范",
+    "query": "(guideline[Publication Type] OR practice guideline[Publication Type] OR consensus development conference[Publication Type] OR guideline[Title/Abstract] OR \"clinical practice guideline\"[Title/Abstract] OR consensus[Title/Abstract])"
+  }
+}

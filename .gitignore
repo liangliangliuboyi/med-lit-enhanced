@@ -1,0 +1,33 @@
+# ===== 密钥与本地配置：绝不入库 =====
+.env
+.env.*
+!.env.example
+config.json
+config.local.json
+*.key
+*.pem
+
+# ===== 运行产物：可重建，不入库 =====
+runs/
+med-lit-runs/
+!examples/**
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# ===== 编辑器与系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ===== 抓取的开放全文（版权属出版商，不入库）=====
+06_fulltext/
+*.txt.gz
