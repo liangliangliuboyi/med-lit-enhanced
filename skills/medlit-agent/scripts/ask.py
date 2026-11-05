@@ -445,6 +445,8 @@ def main():
                     help='不排除纯动物实验（默认排除）')
     ap.add_argument('--no-links', action='store_true', help='不做被引/相似文献扩展')
     ap.add_argument('--no-snowball', action='store_true', help='不做引文滚雪球扩展')
+    ap.add_argument('--no-cache', action='store_true',
+                    help='不用检索缓存（要可复现、或怀疑缓存过期时用）')
     ap.add_argument('--preprints', action='store_true', help='同时检索 bioRxiv/medRxiv 预印本')
     ap.add_argument('--export', choices=['bib', 'ris', 'notes', 'docx'],
                     help='跑完后额外导出参考文献或笔记')
@@ -517,6 +519,8 @@ def main():
                                  'expand_by_links': False, 'expand_by_references': False,
                                  'cross_check_relevance': False,
                                  'verify_claims': False})
+    if args.no_cache:
+        cfg['retrieval']['no_cache'] = True
     if args.max_papers:
         cfg['retrieval']['max_papers'] = args.max_papers
     if args.fulltext_limit is not None:

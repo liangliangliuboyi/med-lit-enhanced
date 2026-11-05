@@ -382,7 +382,9 @@ class Run:
     def _esearch(self, term: str, retmax: int = 20,
                  mindate: str | None = None) -> dict:
         """N8：带缓存的检索。同一检索式重复跑不再打 NCBI 的 API。"""
-        if not cachemod:
+        if not cachemod or (self.cfg['retrieval'] or {}).get('no_cache'):
+            # --no-cache：完全不走缓存。同一课题反复跑时，缓存的 72 小时 TTL
+            # 会让两次跑拿到不同结果——要复现就把它关掉。
             return self.pubmed.esearch(term, retmax=retmax, mindate=mindate)
         if self.cache is None:
             self.cache = cachemod.EsearchCache(self._cache_dir())
@@ -917,7 +919,10 @@ class Run:
                     question=self.plan.get('core_question_en') or self.question,
                     evidence=json.dumps(slim, ensure_ascii=False)[:14000],
                     search_summary=self.search_summary(),
-                    mechanical_grading=json.dumps(self.mech_grading, ensure_ascii=False))}]
+                    mechanical_grading=json.dumps(self.mech_grading, ensure_ascii=False),
+                    # 审稿模型也要看到效应量合并结果——否则它无从判断
+                    # 「合并后是否仍有异质性」「结论是否与合并效应一致」
+                    pooled_effects=self.pooled_summary() or '（无）')}]
         self.log('⑥ 横向证据审查')
         try:
             res = self.router.chat('critic', msgs, temperature=0.15, max_tokens=2000)
