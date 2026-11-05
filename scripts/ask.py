@@ -57,7 +57,17 @@ def cmd_pubmed_only(cfg, term, retmax):
     p = pm.PubMed(cfg['pubmed'].get('api_key', ''),
                   tool=cfg['pubmed'].get('tool', 'medlit-agent'),
                   email=cfg['pubmed'].get('email', ''))
-    r = p.esearch(term, retmax=retmax)
+    try:
+        r = p.esearch(term, retmax=retmax)
+    except Exception as e:  # noqa: BLE001
+        print(f'✗ PubMed 检索失败：{e}\n'
+              f'  若提示 500 / "Search Backend failed" / "Cannot connect to SOLR"，\n'
+              f'  说明是 NCBI 检索后端临时故障，与检索式无关，稍后重试即可。')
+        return
+    if r.get('error'):
+        print(f'✗ PubMed 检索后端暂不可用：{r["error"]}\n'
+              f'  这是 NCBI 上游故障（常见于访问高峰），不是检索式的问题，稍后重试即可。')
+        return
     papers = p.efetch(r['ids']) if r['ids'] else []
     print(f'命中 {r["count"]} 条，取回 {len(papers)} 条\n')
     if r.get('translation'):

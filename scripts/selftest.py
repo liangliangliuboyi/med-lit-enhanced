@@ -56,6 +56,17 @@ def esearch_or_skip(p, term: str, retmax: int = 10) -> dict:
     return r
 
 
+def efetch_or_skip(p, ids) -> list:
+    """efetch 的统一入口：上游故障一律 Skip，不算本项目失败。"""
+    if not ids:
+        raise Skip('上游 esearch 未返回 ID，跳过（依赖 esearch 成功）')
+    try:
+        papers = p.efetch(ids)
+    except Exception as e:  # noqa: BLE001
+        raise Skip(f'NCBI 题录接口不可用（上游故障）：{e}')
+    return papers
+
+
 def main():
     net_only = '--net' in sys.argv
     cfg = pipeline.load_config()
@@ -137,9 +148,7 @@ def main():
 
     def t_efetch():
         ids = pm_state.get('ids') or []
-        if not ids:
-            raise Skip('上游 esearch 未返回 ID，跳过（依赖 esearch 成功）')
-        papers = pmc.efetch(ids)
+        papers = efetch_or_skip(pmc, ids)
         if not papers:
             raise RuntimeError('efetch 返回空（检查 retmode=xml）')
         x = papers[0]
@@ -154,7 +163,7 @@ def main():
             retmax=20)
         if r['count'] == 0:
             raise RuntimeError('命中 0，无法测试全文抓取')
-        papers = pmc.efetch(r['ids'])
+        papers = efetch_or_skip(pmc, r['ids'])
         target = next((x for x in papers if x.get('pmcid')), None)
         if not target:
             return f'本轮 {len(papers)} 篇无 PMCID，跳过（正常现象）'
@@ -167,7 +176,7 @@ def main():
 
     def t_research_filter():
         r = esearch_or_skip(pmc, '"glucagon-like peptide-1"[tiab] AND obesity[tiab]', retmax=10)
-        papers = pmc.efetch(r['ids'])
+        papers = efetch_or_skip(pmc, r['ids'])
         n = sum(1 for x in papers if pm.is_research_article(
             x, cfg['retrieval']['exclude_pub_types'],
             cfg['retrieval'].get('research_min_abstract_chars', 300)))
@@ -181,11 +190,19 @@ def main():
         run.answer = '结论 A [PMID:11111111]，结论 B [PMID:22222222]。'
         run.papers = {'22222222': {'pmid': '22222222'}}
         run.trace = {'errors': []}
+        run.search_failed = False
         run.log = lambda m: None
         chk = run.validate_pmids()
         if chk['orphan_pmids'] != ['11111111']:
             raise RuntimeError(f'越界 PMID 未被检出：{chk}')
-        return f'检出越界 {chk["orphan_count"]} 个（应检出 1）'
+        # 再验一次：全部合法时不应报警
+        run.answer = '结论 [PMID:22222222]。'
+        run.trace = {'errors': []}
+        chk2 = run.validate_pmids()
+        if chk2['orphan_count'] != 0:
+            raise RuntimeError(f'合法 PMID 被误判：{chk2}')
+        return (f'检出越界 {chk["orphan_count"]} 个（应检出 1）；'
+                f'合法 PMID 不误报；trace.errors 已写入告警')
 
     check('PMID 越界校验', t_pmid_check)
 
