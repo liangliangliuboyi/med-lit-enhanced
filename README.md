@@ -179,8 +179,21 @@ python scripts/ask.py --resume runs/20261105-1830_xxx     # 断点续跑
 python scripts/ask.py "问题" --reuse-plan runs/xxx/02_plan.json   # 复用检索式
 python scripts/ask.py "问题" --cq prognosis.narrow        # 按研究设计筛
 python scripts/ask.py "问题" --preprints                 # 同时检索 bioRxiv/medRxiv
+python scripts/ask.py "问题" --no-cache                  # 不用检索缓存（要可复现时）
+python scripts/ask.py "问题" --no-animal-exclusion       # 不排除纯动物实验
 python scripts/ask.py --models                            # 看模型路由链
 python scripts/ask.py --pubmed-only '检索式'              # 只检索不调模型
+```
+
+### 几个容易被忽略的行为
+
+| 行为 | 说明 |
+|---|---|
+| `--quick` 到底快在哪 | 关掉第二轮扩写、两种链接扩展、**相关度交叉验证、论断语义比对**。**保留**检索式质量闸门——检索式写歪才是最大的坑 |
+| `--compare` 的成本 | 会跑 N 份「检索 + 精读 + 分级」，但**跳过综述成文与语义比对**（对比用不上）。耗时与成本约为单次完整查询的 N 倍 |
+| `--chat` 会沿用上一次的检索式 | 追问同一课题时保留上次的召回，再叠加新问题的概念；不会每次都从零重检 |
+| `--no-cache` 什么时候用 | 检索结果缓存 72 小时。同一课题两次跑可能拿到不同结果，**要复现就加这个** |
+| 证据表里的「来源」列 | 标明这条证据读的是**全文**还是**摘要**。只读了摘要时，"该研究未报告某结局"可能只是摘要没写 |
 python scripts/ask.py --json "问题"                       # 机器可读输出（含答案与成本）
 ```
 

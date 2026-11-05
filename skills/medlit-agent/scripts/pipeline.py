@@ -116,11 +116,16 @@ class Run:
     def __init__(self, question: str, constraints: str = '', cfg: dict | None = None,
                  cq_explicit: list[str] | None = None,
                  history: list[dict] | None = None,
-                 resume_dir: str | None = None):
+                 resume_dir: str | None = None,
+                 reuse_queries: list[dict] | None = None):
         self.cfg = cfg or cfgmod.load_config()
         self.question = (question or '').strip()
         self.constraints = (constraints or '').strip()
         self.history = history or []
+        # 沿用上一轮用过的检索式（连续提问模式）。
+        # 追问同一课题时重新做检索，白花钱还会捞到不同的文献；
+        # 沿用旧检索式 = 保留上次的召回，再叠加新问题的概念。
+        self.reuse_queries = reuse_queries or []
         self.t0 = time.time()
         self.stamp = datetime.now().strftime('%Y%m%d-%H%M')
 
@@ -343,6 +348,22 @@ class Run:
             data = {'core_question_en': self.question,
                     'queries': [{'label': '直译', 'query': self.question}],
                     'pico': {}, 'notes': '模型未给出检索式，已回退为原问题'}
+        # R12：把上一轮的检索式并进来（去重）。
+        # 放在这里而不是让 planner 自己回忆，是因为 planner 看不到上一轮
+        # 具体用过什么检索式——只有程序知道。
+        if self.reuse_queries:
+            have = {(q.get('query') or '').strip() for q in data.get('queries', [])}
+            added = 0
+            for q in self.reuse_queries:
+                qq = (q.get('query') or '').strip()
+                if qq and qq not in have:
+                    data.setdefault('queries', []).append(
+                        {'label': q.get('label') or '沿用', 'query': qq})
+                    have.add(qq)
+                    added += 1
+            if added:
+                self.log(f'   · 沿用上一轮的 {added} 条检索式'
+                         f'（连续提问模式：保留上次的召回，再叠加新问题的概念）')
         self.plan = data
         self.log(f'① 规划完成：{len(data.get("queries", []))} 条检索式'
                  f'（{res["model"]}，{res["elapsed"]}s）')
@@ -464,7 +485,7 @@ class Run:
                     self.log(f'   ! 命中偏少，PubMed 对检索式的解读：{trans[:260]}')
                     self.log('     （若解读与你的原意不符，多半是 MeSH 自动映射或拆词出了问题）')
             if fresh:
-                self.fetch_metadata(fresh)
+                self.fetch_metadata(fresh, found_by=f'{tag}:{q.get("label") or ""}')
         self._save_checkpoint()
 
     def search_with_precheck(self, queries: list[dict], tag: str = 'round1',
@@ -473,7 +494,11 @@ class Run:
         self.search(queries, tag, retmax, min_year)
         current = queries
         for attempt in range(1, int(self.cfg['retrieval'].get('max_revisions', 2)) + 1):
-            hits = sum(s['total_hits'] for s in self.search_log if s['round'] == tag)
+            # 命中统计要**把修订轮也算进来**：修订轮的标签是 '{tag}rev{n}'，
+            # 只算 tag 的话，第一次修订已经命中了几百条仍会再触发一次修订
+            # ——白花一次 planner 调用 + 一轮 NCBI 检索。命中为 0 恰恰是最该省钱的场景。
+            hits = sum(s['total_hits'] for s in self.search_log
+                       if s['round'] == tag or s['round'].startswith(tag + 'rev'))
             if hits > 0 or self.search_failed:
                 break
             self.log(f'   ! 本轮命中 0，触发检索式修订（第 {attempt} 次）')
@@ -550,7 +575,9 @@ class Run:
             return
         for t in titles:
             try:
-                r = self.pubmed.esearch(f'"{t}"[Title]', retmax=3)
+                # 走缓存：同一课题重跑时，滚雪球的标题检索完全一样，
+                # 不该再打一次 NCBI
+                r = self._esearch(f'"{t}"[Title]', retmax=3)
             except Exception as e:  # noqa: BLE001
                 self.err('snowball', e)
                 continue
@@ -593,7 +620,7 @@ class Run:
         self._save_checkpoint()
 
     # ---------- 4. 题录 ----------
-    def fetch_metadata(self, pmids: list[str]) -> int:
+    def fetch_metadata(self, pmids: list[str], found_by: str = '') -> int:
         try:
             papers = self.pubmed.efetch(pmids)
         except Exception as e:  # noqa: BLE001
@@ -605,6 +632,10 @@ class Run:
                 continue
             if self.cfg['retrieval'].get('require_abstract') and not p.get('abstract'):
                 continue
+            # R14：记下这篇是被哪一轮检索捞上来的。调检索式时这是唯一的抓手——
+            # 没有它就不知道"改了检索式之后少了哪些文献"。
+            if found_by:
+                p['found_by'] = found_by
             self.papers[p['pmid']] = p
             keep += 1
         self.log(f'   抓取题录 {keep} 篇（累计候选 {len(self.papers)}）')
@@ -697,18 +728,20 @@ class Run:
                 return True
         return False
 
+    def _read_workers(self) -> int:
+        """精读阶段的并发度。
+
+        刻意**不参考检索延迟**：精读是纯模型调用，跟 NCBI 快慢毫无关系。
+        原来的自适应逻辑在"检索慢"时把并发降下来，反而拖慢了精读本身
+        ——检索慢通常意味着网络问题，不是模型服务的问题。
+        上限 6：模型服务商有限流，且长文本并发容易超时（2026-11-05 实测教训）。
+        """
+        base = max(1, int(self.cfg['runtime'].get('workers', 3)))
+        return min(6, base)
+
     def _adaptive_workers(self) -> int:
-        """D5：按实测检索延迟调整并发度。"""
-        base = max(1, int(self.cfg['runtime']['workers']))
-        if not self._search_latency:
-            return base
-        lat = sorted(self._search_latency)
-        med = lat[len(lat) // 2]
-        if med > 4.0:
-            return max(1, base - 1)
-        if med < 1.0:
-            return min(6, base + 1)
-        return base
+        """兼容旧名。旧的"按检索延迟调整"逻辑已废弃，见 `_read_workers`。"""
+        return self._read_workers()
 
     def read_one(self, key: str, paper: dict | None = None,
                  is_preprint: bool = False) -> dict | None:
@@ -789,7 +822,7 @@ class Run:
 
     def read_all(self, ids: list[str]):
         """精读。ids 是 PubMed PMID 列表；预印本也会一并被精读。"""
-        workers = self._adaptive_workers()
+        workers = self._read_workers()
         self.log(f'⑤ 逐篇精读（PubMed {len(ids)} 篇'
                  + (f' + 预印本 {len(self.preprints)} 篇' if self.preprints else '')
                  + f'，并发 {workers}）')
@@ -1035,18 +1068,26 @@ class Run:
                 s = s[:limit]
             return s
 
-        rows = ['| # | 引用标识 | 年份 | 期刊 | 设计 | 样本量 | PICO | 相关度 | 核心发现 |',
-                '|---|--------|------|------|------|--------|------|--------|----------|']
+        rows = ['| # | 引用标识 | 年份 | 期刊 | 设计 | 样本量 | PICO | 相关度 | 来源 | 核心发现 |',
+                '|---|--------|------|------|------|--------|------|--------|------|----------|']
         for i, d in enumerate(self.evidence, 1):
             kf = cell('；'.join((d.get('key_findings') or [])[:2]), 100)
             flag = ' ⚠撤稿' if d.get('_retraction') else ''
             if d.get('_is_preprint'):
                 flag += ' 〔预印本〕'
+            # R13：标明这条证据实际读的是全文还是摘要。
+            # 两者证据强度不同——只读了摘要的条目，"未提及某个结局"可能只是
+            # 摘要没写，不能当成"该研究没做"。
+            src = {'fulltext': '全文', 'abstract': '摘要'}.get(
+                d.get('_text_source') or '', '')
+            if not src and d.get('_is_preprint'):
+                src = '预印本'
             rows.append(f'| {i} | {cell(d.get("_citation_key") or d.get("pmid"))}{flag} | '
                         f'{cell(d.get("_year"))} | '
                         f'{cell(d.get("_journal"), 26)} | {cell(d.get("study_design"), 16)} | '
                         f'{cell(d.get("sample_size"), 14)} | '
-                        f'{cell(d.get("pico_match")) or "—"} | {cell(d.get("relevance"))} | {kf} |')
+                        f'{cell(d.get("pico_match")) or "—"} | {cell(d.get("relevance"))} | '
+                        f'{src or "—"} | {kf} |')
         return '\n'.join(rows)
 
     def bias_table(self) -> str:
@@ -1426,9 +1467,32 @@ class Run:
             self.err('index', e)
 
     # ---------- 编排 ----------
-    def execute(self, quick: bool = False, resume: bool = False):
+    def _timed(self, key: str, fn, *args, **kwargs):
+        """跑一个阶段并把耗时记进 trace。
+
+        用 try/finally 计时，这样函数内部无论从哪个 return 出去，耗时都记得上。
+        """
+        t0 = time.time()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            self.trace['timings'][key] = round(
+                self.trace['timings'].get(key, 0) + (time.time() - t0), 1)
+
+    def execute(self, quick: bool = False, resume: bool = False,
+                stages: str = 'full'):
+        """跑检索流水线。
+
+        `stages` 控制跑到哪一步就停：
+        - `'evidence'`：只做检索 + 精读（要原始证据时用）
+        - `'grade'`：再加上效应量合并与 GRADE 定级（**横向对比用这个**——
+          对比只需要证据与确定性，不需要写综述正文，
+          跑完整的会白花一半的钱和一半的时间）
+        - `'full'`：完整流程（含审查、成文、语义比对）
+        """
         ret = self.cfg['retrieval']
         self.trace['quick_mode'] = bool(quick)
+        self.trace['stages'] = stages
         if quick:
             # 快速模式：关掉两项后置校验（B8 交叉验证每篇跑两遍模型、
             # B5 语义比对最多 12 条论断各跑一遍）。它们是纯成本项，
@@ -1450,33 +1514,35 @@ class Run:
                     self.log(f'   年份下限（自适应）：{min_year}')
             except (TypeError, ValueError):
                 pass
-            self.search_with_precheck(self.plan.get('queries', []), tag='round1',
-                                      retmax=int(ret['retmax_per_query']),
-                                      min_year=min_year)
+            self._timed('search', self.search_with_precheck,
+                        self.plan.get('queries', []), 'round1',
+                        int(ret['retmax_per_query']), min_year)
             if not self.papers and not self.search_failed:
                 self.log('!! 没有检索到任何文献，尝试放宽：去掉年份限制')
-                self.search_with_precheck(self.plan.get('queries', []), tag='round1b',
-                                          retmax=int(ret['retmax_per_query']),
-                                          min_year=None)
+                self._timed('search', self.search_with_precheck,
+                            self.plan.get('queries', []), 'round1b',
+                            int(ret['retmax_per_query']), None)
 
         # 第二轮：扩写检索式提高召回
-        extra = self.expand_queries()
+        extra = self._timed('expand_queries', self.expand_queries)
         if extra:
             min_year = str(ret.get('min_year') or '') or None
-            self.search_with_precheck(extra, tag='round2',
-                                      retmax=int(ret.get('retmax_per_query_round2', 12)),
-                                      min_year=min_year)
+            self._timed('search', self.search_with_precheck, extra, 'round2',
+                        int(ret.get('retmax_per_query_round2', 12)), min_year)
 
         # A2 / A3 / A4 扩展
         if ret.get('expand_by_links', True):
-            self.expand_by_links(max_extra=int(ret.get('max_link_expansion', 15)))
+            self._timed('expand_links', self.expand_by_links,
+                        max_extra=int(ret.get('max_link_expansion', 15)))
         if ret.get('expand_by_references', True):
-            self.expand_by_references(max_titles=int(ret.get('max_snowball_titles', 3)))
+            self._timed('expand_snowball', self.expand_by_references,
+                        max_titles=int(ret.get('max_snowball_titles', 3)))
         if ret.get('include_preprints', False):
-            self.search_preprints(self.plan.get('core_question_en') or self.question,
-                                  retmax=int(ret.get('preprint_limit', 15)))
+            self._timed('preprints', self.search_preprints,
+                        self.plan.get('core_question_en') or self.question,
+                        retmax=int(ret.get('preprint_limit', 15)))
 
-        ids = self.filter_papers()
+        ids = self._timed('filter', self.filter_papers)
         if not ids:
             if self.search_failed:
                 self.log('!! 全部检索均因 NCBI 后端故障失败，不是"没有相关文献"')
@@ -1493,13 +1559,27 @@ class Run:
             self.save()
             return self.dir
 
-        picked = self.rerank(ids)
-        self.read_all(picked)
+        picked = self._timed('rerank', self.rerank, ids)
+        self._timed('read', self.read_all, picked)
+
+        # 只要原始证据、不写综述正文时，到此为止
+        if stages == 'evidence':
+            self.answer = '（本次运行止步于证据抽取，未生成综述正文）\n'
+            self.save()
+            return self.dir
+
         self.pool_effects()
         # B1：机械定级（在审查之前算好，供 critic 复核）
         self.mech_grading = grading.mechanical_grading(self.evidence, self.pooled)
         self.log(f'   GRADE 机械定级：{self.mech_grading.get("certainty")}'
                  f'（{self.mech_grading.get("reason", "")}）')
+
+        # 横向对比只要证据与确定性：写成文、跑语义比对都是白花钱
+        if stages == 'grade':
+            self.answer = '（本次运行止步于证据分级，未生成综述正文）\n'
+            self.save()
+            return self.dir
+
         self.critique = self.critique_all()
         self.answer = self.write()
         self._verify_claims()

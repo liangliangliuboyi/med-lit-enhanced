@@ -255,12 +255,22 @@ def main():
     check('撤稿勘误识别', t_retraction)
 
     def t_new_modules():
-        """新增模块必须能导入并暴露预期 API。"""
+        """新增模块必须能导入并暴露预期 API。
+
+        要覆盖**所有**新增模块：漏掉一个就等于那个模块从没被冒烟过。
+        """
         import importlib
         need = {
             'export': ['to_bibtex', 'to_ris', 'to_zotero_note', 'evidence_markdown', 'to_docx'],
             'meta': ['parse_effect_size', 'pool_effect_sizes', 'summarize_effects'],
             'preprints': ['search_preprints', 'preprint_to_paper_record'],
+            'verify': ['parse_claims', 'verify_claims', 'cross_check_relevance',
+                       'cross_check_gain'],
+            'compare': ['build_comparison', 'compare_summary', 'recommend_wording',
+                        'comparison_dir_name'],
+            'cache': ['cache_key', 'EsearchCache', 'cached_esearch', 'CacheStats'],
+            'pricing': ['lookup_price', 'estimate_cost', 'format_cost_line'],
+            'grading': ['mechanical_grading', 'retraction_notes'],
         }
         missing = []
         for mod, fns in need.items():
@@ -274,7 +284,7 @@ def main():
                     missing.append(f'{mod}.{fn}')
         if missing:
             raise RuntimeError('缺少：' + '、'.join(missing))
-        return f'{len(need)} 个新模块 API 齐备'
+        return f'{len(need)} 个模块 API 齐备'
 
     check('新增模块 API', t_new_modules)
 

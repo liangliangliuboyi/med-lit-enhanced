@@ -294,10 +294,15 @@ def cmd_list_cq():
 
 
 def cmd_chat(cfg, args):
-    """E2：连续提问模式，上下文自动带。"""
+    """E2：连续提问模式，上下文自动带。
+
+    追问时会**沿用上一轮的检索式**：重新检索既白花钱，
+    又可能捞到和上次不一样的文献，连着看很别扭。
+    """
     history: list[dict] = []
+    prev_queries: list[dict] = []
     print('连续提问模式。输入问题，Enter 提交；输入 quit / exit 退出。')
-    print('（每次提问都会跑一次完整检索，请稍等）\n')
+    print('（每次提问都会跑一次检索，但会沿用上一轮的检索式，请稍等）\n')
     while True:
         try:
             q = input('问题> ').strip()
@@ -309,10 +314,14 @@ def cmd_chat(cfg, args):
         if q.lower() in ('quit', 'exit', ':q', '退出'):
             break
         run = pipeline.Run(q, args.constraints, cfg, cq_explicit=_cq_list(args),
-                           history=list(history))
+                           history=list(history),
+                           reuse_queries=list(prev_queries))
         out_dir = run.execute(quick=args.quick)
         history.append({'question': q,
                         'core_question_en': run.plan.get('core_question_en', '')})
+        # 记下本轮实际用的检索式（含沿用的），下一轮继续沿用。
+        # 上限 6 条：再多检索式会明显拖慢，而更早的那些通常已经被覆盖了。
+        prev_queries = (run.plan.get('queries') or [])[-6:]
         print('\n' + '=' * 70)
         print(run.answer[:2000])
         print(f'\n（完整答案见 {out_dir}/07_answer.md）\n')
@@ -332,7 +341,9 @@ def cmd_compare(cfg, args):
         print(f'\n===== 检索「{label}」 =====')
         q = f'{args.question} {label}' if args.question else label
         run = pipeline.Run(q, args.constraints, cfg, cq_explicit=_cq_list(args))
-        out_dir = run.execute(quick=args.quick)
+        # stages='grade'：只跑到证据分级。横向对比真正需要的只有
+        # evidence / pooled / mech_grading 三样，成文、审稿、语义比对全是白花钱。
+        out_dir = run.execute(quick=args.quick, stages='grade')
         arms.append({
             'label': label,
             'evidence': run.evidence,
@@ -369,13 +380,14 @@ def cmd_compare(cfg, args):
     with open(os.path.join(out_dir, 'comparison.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    # 对比模式跑的是 N 份完整流程（含各自的交叉验证与语义比对），
-    # 成本与耗时都是单次的数倍——必须告诉使用者，否则容易意外超支
+    # 对比模式跑的是 N 份「检索 + 精读 + 分级」流程，
+    # 成本与耗时约为单次查询的 N 倍——必须告诉使用者，否则容易意外超支
     n = len(arms)
     print('\n' + '=' * 70)
     print(f'对比结果：{out_dir}')
-    print(f'提示：本次共跑了 {n} 份完整检索流程，'
-          f'模型调用与耗时约为单次查询的 {n} 倍。')
+    print(f'提示：本次共跑了 {n} 份检索与证据分级流程'
+          f'（已跳过综述成文与语义比对，那部分对横向对比没有用），'
+          f'模型调用约为单次完整查询的 {n} 倍。')
     print('=' * 70)
     print(table)
     print('\n结论措辞：\n' + wording)

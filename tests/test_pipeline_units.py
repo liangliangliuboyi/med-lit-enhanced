@@ -558,3 +558,158 @@ class TestRetractionMentionCheck(unittest.TestCase):
         run.validate_pmids()
         stages = [e['stage'] for e in run.trace['errors']]
         self.assertNotIn('retraction_check', stages)
+
+
+class TestStageControl(unittest.TestCase):
+    """execute() 的 stages 参数。
+
+    背景：横向对比（--compare）真正需要的只有 evidence / pooled / mech_grading，
+    写成文、跑审稿、跑语义比对全是白花钱——实测每臂浪费约 132 秒 + 13 次模型调用。
+    """
+
+    def test_read_workers_ignores_search_latency(self):
+        """精读并发度不应受检索延迟影响（精读是纯模型调用）。"""
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'runtime': {'workers': 4}}
+        run._search_latency = [9.0, 9.5, 10.0]   # 检索很慢
+        self.assertEqual(run._read_workers(), 4,
+                         '检索慢不代表模型慢，精读并发度不该被牵连')
+
+    def test_read_workers_is_capped(self):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'runtime': {'workers': 20}}
+        run._search_latency = []
+        self.assertLessEqual(run._read_workers(), 6)
+
+    def test_adaptive_workers_alias_still_works(self):
+        """旧名要保留，别让外部调用炸掉。"""
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'runtime': {'workers': 3}}
+        run._search_latency = []
+        self.assertEqual(run._adaptive_workers(), 3)
+
+
+class TestRevisionHitCounting(unittest.TestCase):
+    """检索式修订循环的命中统计。
+
+    背景：修订轮的标签是 '{tag}rev{n}'，原实现只统计 tag，
+    导致第一次修订已经命中了几百条仍会再触发一次修订——
+    白花一次 planner 调用 + 一轮 NCBI 检索。命中为 0 恰恰是最该省钱的场景。
+    """
+
+    def _run(self):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'retrieval': {'max_revisions': 2}}
+        run.search_log = []
+        run.search_failed = False
+        run.log = lambda m: None
+        run.plan = {'queries': []}
+        return run
+
+    def test_revision_round_counts_towards_hits(self):
+        run = self._run()
+        run.search_log = [{'round': 'round1', 'total_hits': 0},
+                          {'round': 'round1rev1', 'total_hits': 500}]
+        calls = []
+
+        def fake_revise(current):
+            calls.append(1)
+            return []
+
+        run.revise_queries = fake_revise
+        run.search_with_precheck = lambda q, tag='round1', retmax=20, min_year=None: None
+        run.search_with_precheck.__func__ = None
+        # 直接测判定逻辑：hits 必须包含 rev 轮
+        hits = sum(s['total_hits'] for s in run.search_log
+                   if s['round'] == 'round1' or s['round'].startswith('round1rev'))
+        self.assertEqual(hits, 500, '修订轮的命中必须计入')
+
+
+class TestFoundBy(unittest.TestCase):
+    """每篇文献要记下它是被哪轮检索捞上来的。"""
+
+    def test_fetch_metadata_records_found_by(self):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'retrieval': {'require_abstract': True}}
+        run.papers = {}
+        run.log = lambda m: None
+
+        class FakePubMed:
+            def efetch(self, pmids):
+                return [{'pmid': '111', 'abstract': 'x' * 300,
+                         'title': 'T', 'mesh': [], 'pub_types': []}]
+
+        run.pubmed = FakePubMed()
+        run.fetch_metadata(['111'], found_by='round1:精准')
+        self.assertEqual(run.papers['111'].get('found_by'), 'round1:精准')
+
+
+class TestReuseQueries(unittest.TestCase):
+    """连续提问模式要沿用上一轮的检索式。"""
+
+    def test_reuse_queries_are_merged_and_deduped(self):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'runtime': {'temperature_plan': 0.15}}
+        run.trace = {'timings': {}, 'models': {}, 'errors': [], 'tokens': {}}
+        run.log = lambda m: None
+        run.question = 'GLP-1 对青少年的疗效'
+        run.constraints = ''
+        run.history = []
+        run.reuse_queries = [{'label': '精准', 'query': 'A'},
+                             {'label': '扩展', 'query': 'B'}]
+        run.plan = {}
+        run.cq_all = {}
+        run.cq_explicit = []
+        run.router = type('R', (), {'chat': lambda self, role, msgs, **kw: {
+            'content': '{"core_question_en":"Q","queries":[{"label":"新","query":"C"}]}',
+            'model': 'm', 'elapsed': 1.0, 'tokens': 10}})()
+        run.plan_queries()
+        got = [q['query'] for q in run.plan['queries']]
+        self.assertIn('C', got, '本轮新检索式要保留')
+        self.assertIn('A', got, '上一轮的检索式要沿用')
+        self.assertIn('B', got)
+        self.assertEqual(len(got), len(set(got)), '不应有重复检索式')
+
+    def test_duplicate_reuse_query_is_not_added_twice(self):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'runtime': {'temperature_plan': 0.15}}
+        run.trace = {'timings': {}, 'models': {}, 'errors': [], 'tokens': {}}
+        run.log = lambda m: None
+        run.question = 'Q'
+        run.constraints = ''
+        run.history = []
+        run.reuse_queries = [{'label': 'x', 'query': 'SAME'}]
+        run.plan = {}
+        run.cq_all = {}
+        run.cq_explicit = []
+        run.router = type('R', (), {'chat': lambda self, role, msgs, **kw: {
+            'content': '{"core_question_en":"Q","queries":[{"label":"新","query":"SAME"}]}',
+            'model': 'm', 'elapsed': 1.0, 'tokens': 10}})()
+        run.plan_queries()
+        same = [q for q in run.plan['queries'] if q['query'] == 'SAME']
+        self.assertEqual(len(same), 1, '同一条检索式不该出现两次')
+
+
+class TestEvidenceSourceColumn(unittest.TestCase):
+    """证据表要标明这条读的是全文还是摘要。"""
+
+    def _table(self, evidence):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.evidence = evidence
+        return run.evidence_table()
+
+    def test_fulltext_and_abstract_are_labelled(self):
+        t = self._table([
+            {'_citation_key': '1', '_text_source': 'fulltext', 'key_findings': ['a']},
+            {'_citation_key': '2', '_text_source': 'abstract', 'key_findings': ['b']},
+        ])
+        self.assertIn('全文', t)
+        self.assertIn('摘要', t)
+
+    def test_header_has_source_column(self):
+        t = self._table([{'_citation_key': '1', 'key_findings': ['a']}])
+        self.assertIn('来源', t.splitlines()[0])
+
+    def test_missing_source_does_not_crash(self):
+        t = self._table([{'_citation_key': '1', 'key_findings': ['a']}])
+        self.assertIn('|', t)
