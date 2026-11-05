@@ -141,7 +141,10 @@ class Run:
             timeout=int(self.cfg['runtime'].get('timeout', 180)),
             retries=int(self.cfg['runtime'].get('max_retries', 3)),
         )
-        self.router = sf.ModelRouter(self.provider, self.cfg['models']['chain'])
+        self.router = sf.ModelRouter(self.provider, self.cfg['models']['chain'],
+                                    call_budget=int(
+                                        (self.cfg.get('runtime') or {}).get(
+                                            'model_call_budget', 240)))
 
         # ---- PubMed ----
         self.pubmed = pm.PubMed(
@@ -751,7 +754,13 @@ class Run:
         try:
             res = self.router.chat('reader', msgs,
                                    temperature=self.cfg['runtime']['temperature_reader'],
-                                   max_tokens=2200)
+                                   max_tokens=2200,
+                                   # 精读喂的是全文（最长 26000 字），模型处理长文本
+                                   # 差异极大：实测 DeepSeek-V3.2 约 13 秒，
+                                   # 而 Qwen3.5-35B-A3B 会超过 180 秒直接超时。
+                                   # 超时越短，才能越快降级到真正能用的模型。
+                                   timeout=int((self.cfg['runtime'] or {}).get(
+                                       'reader_timeout', 90)))
         except Exception as e:  # noqa: BLE001
             self.err(f'read {key}', e)
             return None
@@ -830,7 +839,12 @@ class Run:
         def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
             if model:
                 # 指定模型时直接走 provider，绕开路由器的角色链
-                res = self.provider.chat(model, messages, temperature, max_tokens)
+                # 短超时：交叉验证/语义比对都是短 prompt，
+                # 超时越短越快降级到下一个模型，避免整轮卡住
+                res = self.provider.chat(model, messages, temperature,
+                                         max_tokens,
+                                         timeout=int((self.cfg['runtime'] or {}).get(
+                                             'reader_timeout', 90)))
                 self._track_tokens('reader', res)
                 return res
             return self.router.chat(role, messages, temperature, max_tokens)
@@ -1289,7 +1303,12 @@ class Run:
 
         def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
             if model:
-                res = self.provider.chat(model, messages, temperature, max_tokens)
+                # 短超时：交叉验证/语义比对都是短 prompt，
+                # 超时越短越快降级到下一个模型，避免整轮卡住
+                res = self.provider.chat(model, messages, temperature,
+                                         max_tokens,
+                                         timeout=int((self.cfg['runtime'] or {}).get(
+                                             'reader_timeout', 90)))
                 self._track_tokens('reader', res)
                 return res
             return self.router.chat(role, messages, temperature, max_tokens)

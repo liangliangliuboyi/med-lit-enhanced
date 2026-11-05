@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -47,6 +48,11 @@ def _post(url: str, payload: dict, headers: dict, timeout: int = 180,
                 time.sleep(2 ** attempt * 2)
                 continue
             raise last
+        except (socket.timeout, TimeoutError) as e:
+            # 超时**不重试**：同样的请求再发几次大概率还是超时，
+            # 而每次重试都要等满一个 timeout，会把耗时成倍放大。
+            # 直接抛给上层，由降级链换模型（那才是有效的应对）。
+            raise RuntimeError(f'请求超时（{timeout}s 未响应）: {e}') from e
         except Exception as e:  # noqa: BLE001
             last = e
             time.sleep(2 ** attempt)
@@ -149,11 +155,18 @@ class Provider:
 class ModelRouter:
     """按角色路由：先探活，命中第一个可用模型；失败则顺延到下一个。"""
 
-    def __init__(self, provider: Provider, chain: dict[str, list[str]]):
+    def __init__(self, provider: Provider, chain: dict[str, list[str]],
+                 call_budget: int = 240):
         self.p = provider
         self.chain = chain or {}
         self._resolved: dict[str, str] = {}
         self._fail: dict[str, set[str]] = {r: set() for r in self.chain}
+        # 一次 chat 调用的**总时长预算**（秒）。
+        # 没有它的话，最坏耗时 = 降级链长度 × timeout × retries
+        # （reader 链有 4 个模型，180s×3 重试 → 36 分钟一次调用），
+        # 任何一个模型挂起都会把整轮检索拖死。
+        self.call_budget = int(call_budget or 240)
+        self.last_errors: dict[str, list[str]] = {}
 
     def chain_of(self, role: str) -> list[str]:
         return [m for m in self.chain.get(role, []) if m not in self._fail.get(role, set())]
@@ -175,16 +188,32 @@ class ModelRouter:
 
     def chat(self, role: str, messages: list[dict], temperature: float = 0.2,
              max_tokens: int = 4000, timeout: int | None = None) -> dict:
-        """调用该角色；失败自动降级到链上的下一个模型。"""
+        """调用该角色；失败自动降级到链上的下一个模型。
+
+        降级链受**总时长预算**约束：预算耗尽就停，不再往下试。
+        否则「超时 × 重试 × 降级链」会相乘——实测一次精读调用能拖到半小时，
+        整轮检索看起来像卡死了。
+        """
         errors = []
+        deadline = time.time() + self.call_budget
         for model in self.chain_of(role):
+            remaining = deadline - time.time()
+            if remaining <= 5:
+                errors.append('总时长预算已耗尽')
+                break
+            # 单次调用的超时不能超过剩余预算
+            t = timeout or self.p.timeout
+            if t > remaining:
+                t = int(remaining)
             try:
-                res = self.p.chat(model, messages, temperature, max_tokens, timeout)
+                res = self.p.chat(model, messages, temperature, max_tokens, t)
                 if res.get('content'):
                     self._resolved[role] = model
+                    self.last_errors[role] = errors
                     return res
                 errors.append(f'{model}: 空返回')
             except Exception as e:  # noqa: BLE001
                 errors.append(f'{model}: {e}')
                 self._fail.setdefault(role, set()).add(model)
+        self.last_errors[role] = errors
         raise RuntimeError(f'角色 {role} 全部模型失败 → ' + ' | '.join(errors[-3:]))

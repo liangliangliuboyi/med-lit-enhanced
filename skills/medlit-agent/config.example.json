@@ -100,6 +100,8 @@
   "runtime": {
     "timeout": 180,
     "max_retries": 3,
+    "model_call_budget": 240,
+    "reader_timeout": 90,
     "max_tokens": 4000,
     "temperature_plan": 0.15,
     "temperature_reader": 0.1,
