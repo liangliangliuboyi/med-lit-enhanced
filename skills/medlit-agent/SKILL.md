@@ -155,6 +155,7 @@ python scripts/ask.py "问题原文" --constraints "人群/年份/地区等限�
 | **引文滚雪球** | 从种子文献的参考文献标题回灌检索 |
 | **排除纯动物实验** | 用官方 MeSH 写法（`NOT "Animals"[MeSH] NOT "Humans"[MeSH]`），比自由词 NOT 稳 |
 | **撤稿拦截** | 撤稿文献在进入精读前被剔除，并在证据表标注 ⚠ |
+| **预印本** | `--preprints` 开启后检索 Europe PMC 的预印本（bioRxiv/medRxiv）。预印本没有 PMID，用 `[DOI:10.1101/xxx]` 引用，证据等级按未同行评议下调 |
 | **第二轮扩写** | 候选不足时让模型补充缩写/旧术语/同义表述再搜一轮 |
 
 ## 五、输出在哪
@@ -210,7 +211,7 @@ python scripts/ask.py "问题原文" --constraints "人群/年份/地区等限�
 
 **抓不到全文**：正常。PubMed 只有开放获取（PMC）才有全文，多数临床刊只有摘要。答案里会注明"仅摘要"。
 
-**回答里出现没见过的文献**：不应该发生。参考文献由脚本按 PMID 回查生成；正文若引用了不在候选池里的 PMID，`10_trace.json` 的 `errors` 与 `pmid_check` 会报警。
+**回答里出现没见过的文献**：不应该发生。参考文献由脚本按原始字段生成；正文若引用了不在候选池里的 `[PMID:xxx]`（PubMed 文献）或 `[DOI:xxx]`（预印本），`10_trace.json` 的 `errors` 与 `pmid_check` 会报警。
 
 **报 "Search Backend failed / Search is temporarily unavailable"**：**NCBI 检索后端临时故障**，不是"没有相关文献"。等一会儿重试，工具已把这两种情况严格区分。
 

@@ -141,7 +141,8 @@ class Run:
         self._search_latency: list[float] = []
 
         # ---- 状态 ----
-        self.papers: dict[str, dict] = {}
+        self.papers: dict[str, dict] = {}      # PMID → PubMed 题录
+        self.preprints: dict[str, dict] = {}   # 预印本 id（doi:xxx）→ 题录
         self.evidence: list[dict] = []
         self.excluded: list[dict] = []          # C6：带排除理由
         self.search_log: list[dict] = []
@@ -151,7 +152,6 @@ class Run:
         self.pmid_check: dict = {}
         self.pooled: list[dict] = []            # B4：合并效应量
         self.mech_grading: dict = {}           # B1：机械定级
-        self.preprint_papers: list[dict] = []   # A4
         self.prisma = {
             'identified': 0, 'deduplicated': 0, 'screened': 0,
             'excluded_screening': 0, 'fulltext_assessed': 0,
@@ -226,6 +226,7 @@ class Run:
             self._checkpoint = {
                 'plan': self.plan, 'search_log': self.search_log,
                 'papers': list(self.papers.values()),
+                'preprints': list(self.preprints.values()),
                 'excluded': self.excluded, 'prisma': self.prisma,
                 'evidence': [{k: v for k, v in d.items() if not k.startswith('_')}
                              for d in self.evidence],
@@ -254,6 +255,9 @@ class Run:
         for p2 in ck.get('papers', []):
             if p2.get('pmid'):
                 self.papers[p2['pmid']] = p2
+        for rec in ck.get('preprints', []):
+            if rec.get('id'):
+                self.preprints[rec['id']] = rec
         self.excluded = ck.get('excluded', [])
         self.prisma.update(ck.get('prisma', {}))
         self.evidence = ck.get('evidence', [])
@@ -464,19 +468,32 @@ class Run:
         self._save_checkpoint()
 
     def search_preprints(self, term: str, retmax: int = 15):
-        """A4：bioRxiv / medRxiv 预印本。"""
+        """A4：预印本（Europe PMC 为主源，bioRxiv/medRxiv 官方 API 兜底）。
+
+        预印本**没有 PMID**，因此单独存一份字典，用 DOI 标识；
+        它们同样会进入精读池，并用 [DOI:xxx] 的形式被正文引用。
+        """
         if not preprintmod or not (self.cfg['retrieval'] or {}).get('include_preprints'):
             return
         r = preprintmod.search_preprints(term, retmax=retmax)
-        if r.get('error'):
+        papers = r.get('papers') or []
+        if r.get('error') and not papers:
             self.log(f'   ! 预印本检索不可用：{r["error"][:100]}')
             return
-        papers = r.get('papers') or []
-        if papers:
-            self.preprint_papers.extend(papers)
-            self.prisma['preprints'] += len(papers)
-            self.log(f'   + 预印本（bioRxiv/medRxiv）：{len(papers)} 篇'
-                     f'（已标注来源，证据等级会相应下调）')
+        if not papers:
+            self.log('   · 预印本检索无结果')
+            return
+        added = 0
+        for rec in papers:
+            ident = rec.get('id') or ''
+            if not ident or ident in self.preprints:
+                continue
+            self.preprints[ident] = rec
+            added += 1
+        self.prisma['preprints'] += added
+        self.log(f'   + 预印本（{"/".join(r.get("sources") or ["Europe PMC"])}）：'
+                 f'新增 {added} 篇（无 PMID，将以 [DOI:xxx] 形式引用；'
+                 f'证据等级按未同行评议下调）')
         self._save_checkpoint()
 
     # ---------- 4. 题录 ----------
@@ -588,8 +605,14 @@ class Run:
             return min(6, base + 1)
         return base
 
-    def read_one(self, pmid: str) -> dict | None:
-        p = self.papers[pmid]
+    def read_one(self, key: str, paper: dict | None = None,
+                 is_preprint: bool = False) -> dict | None:
+        """抽取单篇证据。
+
+        key 是"引用标识"：PubMed 文献是 PMID，预印本是 `doi:10.1101/xxx`。
+        正文里分别用 [PMID:xxx] 与 [DOI:xxx] 引用。
+        """
+        p = paper if paper is not None else self.papers[key]
         ft = {'source': 'abstract', 'text': '', 'figure_captions': []}
         if self._claim_fulltext_slot():
             try:
@@ -599,7 +622,7 @@ class Run:
         if ft.get('text'):
             body = ft['text'][:26000]
             src = 'fulltext'
-            fn = os.path.join(self.dir, '06_fulltext', f'PMID{pmid}.txt')
+            fn = os.path.join(self.dir, '06_fulltext', f'PMID{key}.txt')
             try:
                 with open(fn, 'w', encoding='utf-8') as f:
                     f.write(ft['text'])
@@ -614,7 +637,8 @@ class Run:
         msgs = [{'role': 'system', 'content': prompts.READER_SYSTEM},
                 {'role': 'user', 'content': prompts.READER_USER.format(
                     question=self.plan.get('core_question_en') or self.question,
-                    pmid=pmid,
+                    citation_key=key,
+                    is_preprint='是（预印本，未经过同行评议）' if is_preprint else '否',
                     journal=p.get('journal', ''),
                     year=p.get('year', ''),
                     title=p.get('title', ''),
@@ -627,18 +651,21 @@ class Run:
                                    temperature=self.cfg['runtime']['temperature_reader'],
                                    max_tokens=2200)
         except Exception as e:  # noqa: BLE001
-            self.err(f'read {pmid}', e)
+            self.err(f'read {key}', e)
             return None
         self._track_tokens('reader', res)
         data = _json_load(res['content'])
         if not data:
-            self.err(f'read {pmid}', 'JSON 解析失败')
+            self.err(f'read {key}', 'JSON 解析失败')
             return None
-        data['pmid'] = pmid
+        data['pmid'] = p.get('pmid', '') or ''
+        data['_citation_key'] = key
+        data['_is_preprint'] = is_preprint
         data['_text_source'] = src
         data['_journal'] = p.get('journal', '')
         data['_year'] = p.get('year', '')
         data['_title'] = p.get('title', '')
+        data['_doi'] = p.get('doi', '') or ''
         # B7：图表说明
         caps = (ft.get('figure_captions') or [])[:8]
         if caps:
@@ -650,32 +677,39 @@ class Run:
         return data
 
     def read_all(self, ids: list[str]):
+        """精读。ids 是 PubMed PMID 列表；预印本也会一并被精读。"""
         workers = self._adaptive_workers()
-        self.log(f'⑤ 逐篇精读（{len(ids)} 篇，并发 {workers}）')
+        self.log(f'⑤ 逐篇精读（PubMed {len(ids)} 篇'
+                 + (f' + 预印本 {len(self.preprints)} 篇' if self.preprints else '')
+                 + f'，并发 {workers}）')
         t0 = time.time()
         done = 0
+        jobs = [(k, self.papers[k], False) for k in ids]
+        jobs += [(k, self.preprints[k], True) for k in self.preprints]
+        total = len(jobs)
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(self.read_one, pid): pid for pid in ids}
+            futs = {ex.submit(self.read_one, k, p, is_pp): k for k, p, is_pp in jobs}
             for fut in as_completed(futs):
-                pid = futs[fut]
+                key = futs[fut]
                 try:
                     d = fut.result()
                 except Exception as e:  # noqa: BLE001
-                    self.err(f'read {pid}', e)
+                    self.err(f'read {key}', e)
                     d = None
                 done += 1
                 if d:
                     self.evidence.append(d)
-                    self.log(f'   [{done}/{len(ids)}] {pid} 相关度 {d.get("relevance", "?")}'
-                             f'（{d["_text_source"]}）')
+                    pp = '（预印本）' if d.get('_is_preprint') else ''
+                    self.log(f'   [{done}/{total}] {key} 相关度 {d.get("relevance", "?")}'
+                             f'（{d["_text_source"]}）{pp}')
                 else:
                     self.prisma['excluded_fulltext'] += 1
-                    self.log(f'   [{done}/{len(ids)}] {pid} 抽取失败')
+                    self.log(f'   [{done}/{total}] {key} 抽取失败')
         self.trace['timings']['read'] = round(time.time() - t0, 1)
         self.evidence.sort(key=lambda d: (-(d.get('relevance') or 0), str(d.get('_year') or '')))
-        self.prisma['fulltext_assessed'] = len(ids)
+        self.prisma['fulltext_assessed'] = total
         self.prisma['included'] = len(self.evidence)
-        self.prisma['excluded_fulltext'] = max(0, len(ids) - len(self.evidence))
+        self.prisma['excluded_fulltext'] = max(0, total - len(self.evidence))
         self.log(f'   精读完成：成功 {len(self.evidence)} 篇，{self.trace["timings"]["read"]}s')
         self._save_checkpoint()
 
@@ -803,12 +837,15 @@ class Run:
                 s = s[:limit]
             return s
 
-        rows = ['| # | PMID | 年份 | 期刊 | 设计 | 样本量 | PICO | 相关度 | 核心发现 |',
-                '|---|------|------|------|------|--------|------|--------|----------|']
+        rows = ['| # | 引用标识 | 年份 | 期刊 | 设计 | 样本量 | PICO | 相关度 | 核心发现 |',
+                '|---|--------|------|------|------|--------|------|--------|----------|']
         for i, d in enumerate(self.evidence, 1):
             kf = cell('；'.join((d.get('key_findings') or [])[:2]), 100)
             flag = ' ⚠撤稿' if d.get('_retraction') else ''
-            rows.append(f'| {i} | {cell(d.get("pmid"))}{flag} | {cell(d.get("_year"))} | '
+            if d.get('_is_preprint'):
+                flag += ' 〔预印本〕'
+            rows.append(f'| {i} | {cell(d.get("_citation_key") or d.get("pmid"))}{flag} | '
+                        f'{cell(d.get("_year"))} | '
                         f'{cell(d.get("_journal"), 26)} | {cell(d.get("study_design"), 16)} | '
                         f'{cell(d.get("sample_size"), 14)} | '
                         f'{cell(d.get("pico_match")) or "—"} | {cell(d.get("relevance"))} | {kf} |')
@@ -846,9 +883,21 @@ class Run:
         return '\n'.join(out)
 
     def bibliography(self) -> str:
-        """参考文献由脚本按 PubMed 原始字段生成，不经过模型。"""
+        """参考文献由脚本按原始字段生成，不经过模型。"""
         out = []
         for i, d in enumerate(self.evidence, 1):
+            key = d.get('_citation_key') or d.get('pmid') or ''
+            if d.get('_is_preprint'):
+                rec = self.preprints.get(key, {})
+                au = pm.fmt_authors(rec.get('authors') or [], 3)
+                head = f'{au}. ' if au else ''
+                title = (rec.get('title') or '').rstrip('.')
+                journal = rec.get('journal') or '预印本'
+                year = rec.get('year') or ''
+                doi = f' doi:{rec["doi"]}' if rec.get('doi') else ''
+                out.append(f'{i}. {head}{title}. *{journal}*. {year}. '
+                           f'{key}{doi} [预印本，未同行评议]')
+                continue
             p = self.papers.get(d['pmid'], {})
             au = pm.fmt_authors(p.get('authors') or [], 3)
             head = f'{au}. ' if au else ''
@@ -891,19 +940,66 @@ class Run:
 
     # ---------- 12. PMID 越界校验 ----------
     def validate_pmids(self) -> dict:
-        # 容许 "[PMID: 12345678]" 这类带空格的写法
-        cited = set(re.findall(r'\[PMID:\s*(\d+)\]', self.answer or ''))
-        pool = set(self.papers.keys())
-        orphan = sorted(cited - pool)
+        """正文里的每一个引用标识都必须来自候选池。
+
+        支持两种引用形式：
+          `[PMID:12345678]`   → 必须在本轮 PubMed 候选池里
+          `[DOI:10.1101/xxx]` → 必须在本轮预印本候选池里
+        越界引用会被记进 trace['errors']——这是唯一能自动发现"模型编文献"的机制。
+        """
+        answer = self.answer or ''
+        cited_pmids = set(re.findall(r'\[PMID:\s*(\d+)\]', answer))
+        cited_dois = set(re.findall(r'\[DOI:\s*([^\]\s]+)\]', answer))
+
+        pmid_pool = set(self.papers.keys())
+        doi_pool = set()
+        for k, rec in self.preprints.items():
+            d = (rec.get('doi') or '').strip().lower()
+            if d:
+                doi_pool.add(d)
+            if k.lower().startswith('doi:'):
+                doi_pool.add(k[4:].lower())
+
+        orphan_pmids = sorted(cited_pmids - pmid_pool)
+        orphan_dois = sorted(d for d in cited_dois if d.lower() not in doi_pool)
         check = {
-            'cited_count': len(cited), 'pool_size': len(pool),
-            'orphan_pmids': orphan, 'orphan_count': len(orphan),
-            'cited_in_pool': len(cited & pool),
+            'cited_count': len(cited_pmids) + len(cited_dois),
+            'cited_pmid_count': len(cited_pmids),
+            'cited_doi_count': len(cited_dois),
+            'pool_size': len(pmid_pool),
+            'doi_pool_size': len(doi_pool),
+            'orphan_pmids': orphan_pmids,
+            'orphan_dois': orphan_dois,
+            'orphan_count': len(orphan_pmids) + len(orphan_dois),
+            'cited_in_pool': len(cited_pmids & pmid_pool),
         }
         if self.search_failed:
             check['skipped'] = '检索后端故障，未生成答案'
             self.pmid_check = check
             return check
+        if orphan_pmids or orphan_dois:
+            parts = []
+            if orphan_pmids:
+                parts.append(f'{len(orphan_pmids)} 个不在候选池的 PMID：'
+                             + ', '.join(orphan_pmids[:10])
+                             + ('...' if len(orphan_pmids) > 10 else ''))
+            if orphan_dois:
+                parts.append(f'{len(orphan_dois)} 个不在候选池的 DOI：'
+                             + ', '.join(orphan_dois[:10])
+                             + ('...' if len(orphan_dois) > 10 else ''))
+            msg = '正文引用了' + '；'.join(parts)
+            self.trace['errors'].append({'stage': 'citation_check', 'err': msg})
+            self.log(f'!! 引用校验未通过：{msg}')
+        elif cited_pmids or cited_dois:
+            self.log(f'   ✓ 引用校验通过：正文引用 {len(cited_pmids)} 个 PMID'
+                     + (f' + {len(cited_dois)} 个 DOI' if cited_dois else '')
+                     + '，全部来自候选池')
+        else:
+            self.log('   ! 正文没有出现任何引用标记，可能是证据不足或模型未遵守写作纪律')
+            self.trace['errors'].append({'stage': 'citation_check',
+                                         'err': '正文中未出现任何 [PMID:xxx] / [DOI:xxx] 引用标记'})
+        self.pmid_check = check
+        return check
         if orphan:
             msg = (f'正文引用了 {len(orphan)} 个不在候选池中的 PMID：'
                    f'{", ".join(orphan[:10])}{"…" if len(orphan) > 10 else ""}')

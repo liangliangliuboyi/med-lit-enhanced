@@ -50,6 +50,7 @@ def make_run(**fields):
     run = pipeline.Run.__new__(pipeline.Run)
     run.answer = ''
     run.papers = {}
+    run.preprints = {}
     run.evidence = []
     run.excluded = []
     run.prisma = {
@@ -198,7 +199,7 @@ class TestEvidenceTable(unittest.TestCase):
         """evidence 为空时只返回表头，且不抛异常。"""
         table = make_run(evidence=[]).evidence_table()
         self.assertIsInstance(table, str)
-        self.assertIn('PMID', table)
+        self.assertIn('引用标识', table)
         self.assertIn('核心发现', table)
 
     def test_empty_evidence_has_exactly_two_header_lines(self):
@@ -307,14 +308,14 @@ class TestValidatePmids(unittest.TestCase):
         run = make_run(answer='[PMID:99999999]', papers={})
         run.validate_pmids()
         stages = [e.get('stage') for e in run.trace['errors']]
-        self.assertIn('pmid_check', stages)
+        self.assertIn('citation_check', stages)
 
     def test_no_orphan_does_not_record_trace_error(self):
         """没有越界引用时，不应产生 pmid_check 错误。"""
         run = make_run(answer='[PMID:11111111]', papers={'11111111': {}})
         run.validate_pmids()
         stages = [e.get('stage') for e in run.trace['errors']]
-        self.assertNotIn('pmid_check', stages)
+        self.assertNotIn('citation_check', stages)
 
     def test_search_failed_skips_the_check(self):
         """search_failed 为真时不做 PMID 判读，结果里应带 skipped 字段。"""
@@ -330,7 +331,7 @@ class TestValidatePmids(unittest.TestCase):
             answer='[PMID:99999999]', papers={}, search_failed=True)
         run.validate_pmids()
         stages = [e.get('stage') for e in run.trace['errors']]
-        self.assertNotIn('pmid_check', stages)
+        self.assertNotIn('citation_check', stages)
 
     def test_result_is_stored_on_pmid_check_attribute(self):
         """校验结果应同时写入 self.pmid_check。"""
@@ -382,3 +383,50 @@ class TestOfflineGuard(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestPreprintCitations(unittest.TestCase):
+    """预印本没有 PMID，用 [DOI:xxx] 引用；越界也要能查出来。"""
+
+    def _run(self, **fields):
+        run = make_run(**fields)
+        return run
+
+    def test_doi_citation_in_pool_is_ok(self):
+        run = self._run(
+            answer='结论 A [DOI:10.1101/2024.01.01.123456]。',
+            preprints={'doi:10.1101/2024.01.01.123456': {
+                'id': 'doi:10.1101/2024.01.01.123456',
+                'doi': '10.1101/2024.01.01.123456'}},
+        )
+        chk = run.validate_pmids()
+        self.assertEqual(chk['orphan_count'], 0)
+        self.assertEqual(chk['cited_doi_count'], 1)
+
+    def test_orphan_doi_is_detected(self):
+        run = self._run(
+            answer='结论 A [DOI:10.1101/99999999.999999]。',
+            preprints={'doi:10.1101/2024.01.01.123456': {
+                'id': 'doi:10.1101/2024.01.01.123456',
+                'doi': '10.1101/2024.01.01.123456'}},
+        )
+        chk = run.validate_pmids()
+        self.assertEqual(chk['orphan_count'], 1)
+        self.assertTrue(chk['orphan_dois'])
+
+    def test_preprint_and_pmid_pools_are_separate(self):
+        """PMID 引用只在 PubMed 池里查，DOI 引用只在预印本池里查，两者互不兜底。"""
+        run = self._run(
+            answer='混引 [PMID:11111111] 与 [DOI:10.1101/88888888.888888]。',
+            # PubMed 池里放的是另一个 PMID，说明 11111111 确实不在池内
+            papers={'22222222': {'pmid': '22222222'}},
+            preprints={'doi:10.1101/2024.01.01.123456': {
+                'id': 'doi:10.1101/2024.01.01.123456',
+                'doi': '10.1101/2024.01.01.123456'}},
+        )
+        chk = run.validate_pmids()
+        self.assertEqual(chk['orphan_count'], 2)
+        self.assertEqual(chk['orphan_pmids'], ['11111111'])
+        self.assertEqual(len(chk['orphan_dois']), 1)
+        self.assertEqual(chk['cited_pmid_count'], 1)
+        self.assertEqual(chk['cited_doi_count'], 1)

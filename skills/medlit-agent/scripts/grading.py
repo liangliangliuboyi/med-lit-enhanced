@@ -161,6 +161,14 @@ def _publication_bias_note(evidence: list[dict]) -> str:
     return f'{n} 篇证据，发表偏倚需人工用漏斗图/小样本效应量另行评估（程序未据此降级）'
 
 
+def _preprint_penalty(evidence: list[dict]) -> list[str]:
+    """预印本未经过同行评议，应作为降级因素。"""
+    n = sum(1 for e in evidence if e.get('_is_preprint'))
+    if not n:
+        return []
+    return [f'{n}/{len(evidence)} 篇为预印本（未经过同行评议）']
+
+
 def _upgrade_factors(evidence: list[dict], pooled: list[dict]) -> list[str]:
     up = []
     for p in pooled or []:
@@ -239,6 +247,11 @@ def mechanical_grading(evidence: list[dict], pooled: list[dict] | None = None,
 
     # 5) 发表偏倚（只记备注，不降级——见 _publication_bias 的说明）
     pb_note = _publication_bias_note(evidence)
+
+    # 6) 预印本未同行评议
+    pp = _preprint_penalty(evidence)
+    if pp:
+        downgrades.append('间接性：' + '；'.join(pp))
 
     upgrades = _upgrade_factors(evidence, pooled)
 

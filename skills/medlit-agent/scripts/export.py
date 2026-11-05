@@ -103,11 +103,13 @@ def _bib_key(paper: dict) -> str:
     authors = _lst(paper.get('authors'))
     surname = 'Anon'
     if authors and authors[0].strip():
-        # authors 已是 "Last Initials" 格式，姓氏 = 除末尾缩写外的全部部分。
-        # 复姓要连写（van der Berg → vanderBerg），这是 BibTeX 的通行做法。
+        # authors 是 "姓 + 首字母缩写" 格式。首字母缩写在两个来源里写法不同：
+        # PubMed 给 "Wilding JPH"（缩写连写），预印本给 "Harvey D Y"（缩写空格分隔）。
+        # 所以要连续剥掉末尾所有缩写 token，只剩姓氏。
         parts = re.split(r'\s+', authors[0].strip())
-        if len(parts) > 1 and re.fullmatch(r'[A-Z]{1,3}', parts[-1]):
-            parts = parts[:-1]          # 去掉末尾的姓名缩写
+        while len(parts) > 1 and re.fullmatch(r'[A-Z]{1,3}', parts[-1]):
+            parts = parts[:-1]
+        # 复姓要连写（van der Berg → vanderBerg），这是 BibTeX 的通行做法
         surname = ''.join(parts)
         # BibTeX 的引用键必须是纯 ASCII：部分文献管理工具遇到非 ASCII 键会报错
         surname = re.sub(r'[^A-Za-z0-9]', '', surname)
@@ -131,7 +133,10 @@ def to_bibtex(papers: list[dict]) -> str:
         if not isinstance(paper, dict):
             continue
         types = {t.lower() for t in _lst(paper.get('pub_types'))}
-        entry_type = 'article' if 'journal article' in types else 'misc'
+        is_preprint = bool(paper.get('preprint')) or 'preprint' in types
+        # 预印本一律 @misc（它不是正式发表的期刊论文）
+        entry_type = ('misc' if is_preprint
+                      else ('article' if 'journal article' in types else 'misc'))
 
         fields = []
         authors = _lst(paper.get('authors'))
@@ -147,11 +152,19 @@ def to_bibtex(papers: list[dict]) -> str:
         if year:
             fields.append(('year', year))
         doi = _s(paper.get('doi'))
-        if doi:
+        if is_preprint:
+            # BibTeX 描述预印本的标准字段是 eprint + archivePrefix
+            if doi:
+                fields.append(('eprint', doi))
+            fields.append(('archivePrefix', 'bioRxiv'))
+        elif doi:
             fields.append(('doi', doi))
         pmid = _s(paper.get('pmid'))
         if pmid:
             fields.append(('note', f'PMID: {pmid}'))
+        if is_preprint:
+            # 预印本必须标明未同行评议，否则读者会误以为是正式论文
+            fields.append(('note', 'Preprint（未经过同行评议）'))
 
         body = '\n'.join(
             f'  {name} = {{{_bib_escape(value)}}}' for name, value in fields)
@@ -174,6 +187,8 @@ def to_ris(papers: list[dict]) -> str:
     for paper in papers or []:
         if not isinstance(paper, dict):
             continue
+        types = {t.lower() for t in _lst(paper.get('pub_types'))}
+        is_preprint = bool(paper.get('preprint')) or 'preprint' in types
         lines = ['TY  - JOUR']
         for author in _lst(paper.get('authors')):
             lines.append(f'AU  - {author}')
@@ -184,6 +199,9 @@ def to_ris(papers: list[dict]) -> str:
         abstract = re.sub(r'\s+', ' ', _s(paper.get('abstract'))).strip()
         lines.append(f'AB  - {abstract}')
         lines.append(f'ID  - {_s(paper.get("pmid"))}')
+        if is_preprint:
+            # RIS 没有标准的预印本类型，用 N1 备注标明未同行评议
+            lines.append('N1  - Preprint (未经过同行评议)')
         lines.append('ER  -')
         records.append('\n'.join(lines))
     return '\n\n'.join(records)

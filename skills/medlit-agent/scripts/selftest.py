@@ -277,6 +277,7 @@ def main():
         run = pipeline.Run.__new__(pipeline.Run)
         run.answer = '结论 A [PMID:11111111]，结论 B [PMID:22222222]。'
         run.papers = {'22222222': {'pmid': '22222222'}}
+        run.preprints = {}
         run.trace = {'errors': []}
         run.search_failed = False
         run.log = lambda m: None
@@ -289,8 +290,17 @@ def main():
         chk2 = run.validate_pmids()
         if chk2['orphan_count'] != 0:
             raise RuntimeError(f'合法 PMID 被误判：{chk2}')
-        return (f'检出越界 {chk["orphan_count"]} 个（应检出 1）；'
-                f'合法 PMID 不误报；trace.errors 已写入告警')
+        # 预印本用 DOI 引用，DOI 越界也要能抓到
+        run.answer = '结论 [DOI:10.1101/99999999.999999]。'
+        run.trace = {'errors': []}
+        run.preprints = {'doi:10.1101/2024.01.01.123456': {
+            'id': 'doi:10.1101/2024.01.01.123456',
+            'doi': '10.1101/2024.01.01.123456'}}
+        chk3 = run.validate_pmids()
+        if chk3['orphan_dois'] != ['10.1101/99999999.999999']:
+            raise RuntimeError(f'越界 DOI 未被检出：{chk3}')
+        return (f'检出越界 PMID {chk["orphan_count"]} 个；合法引用不误报；'
+                f'预印本 DOI 越界也能检出')
 
     check('PMID 越界校验', t_pmid_check)
 

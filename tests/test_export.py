@@ -81,6 +81,28 @@ class TestBibtex(unittest.TestCase):
         p['authors'] = ['van der Berg JJ']
         self.assertIn('@article{vanderBerg2024_12345678,', export.to_bibtex([p]))
 
+    def test_key_handles_spaced_initials(self):
+        """首字母缩写空格分隔时要全部剥掉。
+
+        PubMed 给的是 "Wilding JPH"（缩写连写），预印本给的是 "Harvey D Y"
+        （缩写空格分隔）。两种写法都要还原出同一个姓氏 Harvey，
+        否则同一批文献会在参考文献里出现两个不同的键。
+        """
+        p = dict(PAPER)
+        p['authors'] = ['Harvey D Y']
+        self.assertIn('@article{Harvey2024_12345678,', export.to_bibtex([p]))
+
+    def test_key_joined_and_spaced_initials_agree(self):
+        """缩写连写与缩写空格分隔必须产出同一个键。
+
+        只比键，不比整段——author 字段是原样搬运的，两种写法本来就该不同。
+        """
+        def key_of(authors):
+            bib = export.to_bibtex([dict(PAPER, authors=authors)])
+            return bib.split('{', 1)[1].split(',', 1)[0]
+
+        self.assertEqual(key_of(['Harvey DY']), key_of(['Harvey D Y']))
+
     def test_article_type_from_pub_types(self):
         self.assertIn('@article{', export.to_bibtex([PAPER]))
 

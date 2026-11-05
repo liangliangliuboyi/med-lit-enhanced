@@ -198,5 +198,248 @@ class TestSearchGuards(unittest.TestCase):
             self.fail(f'search_preprints 抛出了异常：{e}')
 
 
+# ---------------------------------------------------------------------------
+# 以下用例全部离线：用假的 _get_json 替换真实网络请求
+# ---------------------------------------------------------------------------
+class _FakeHttp:
+    """替换 preprints._get_json，记录请求过的 URL 并返回预置响应。"""
+
+    def __init__(self, responder):
+        self.responder = responder
+        self.urls: list[str] = []
+
+    def __call__(self, url: str, timeout: int = 45, retries: int = 2):
+        self.urls.append(url)
+        return self.responder(url)
+
+
+class TestEuropePmcSourceFilter(unittest.TestCase):
+    """Europe PMC 的 source 必须写进检索式，不能当 URL 参数传。
+
+    当成 URL 参数传会被静默忽略，返回 PubMed 正式论文（带真 PMID），
+    而不是预印本——这会让正式论文混进预印本证据池。
+    """
+
+    def test_source_is_part_of_query_not_url_param(self):
+        seen = {}
+
+        def responder(url):
+            seen['url'] = url
+            return {'hitCount': 1, 'resultList': {'result': [{
+                'id': 'PPR1', 'source': 'PPR', 'title': 'A preprint',
+                'doi': '10.1101/x', 'pubYear': '2026',
+            }]}}
+
+        fake = _FakeHttp(responder)
+        orig = preprints._get_json
+        preprints._get_json = fake
+        try:
+            r = preprints.search_europepmc('glp-1', retmax=5, source='PPR')
+        finally:
+            preprints._get_json = orig
+
+        self.assertEqual(r['count'], 1)
+        # source 必须在 query 里
+        self.assertIn('SRC%3APPR', seen['url'])
+        self.assertNotIn('source=', seen['url'])
+        # 记录必须被标成预印本，且没有 PMID
+        self.assertEqual(r['papers'][0]['source'], 'PPR')
+        self.assertTrue(r['papers'][0]['preprint'])
+        self.assertEqual(r['papers'][0]['pmid'], '')
+
+    def test_non_preprint_record_is_not_marked_preprint(self):
+        """上游返回 MED 记录时，preprint 标志必须为 False。"""
+        raw = {'id': '1', 'source': 'MED', 'pmid': '123', 'title': 'A paper',
+               'pubYear': '2026'}
+        rec = preprints._europepmc_to_record(raw)
+        self.assertFalse(rec['preprint'])
+        self.assertEqual(rec['pmid'], '123')
+
+
+class TestBiorxivEndpoint(unittest.TestCase):
+    """bioRxiv 官方 API 的 URL 形式与游标语义。
+
+    旧形式 /details/{server}/{start}/{count} 现在返回 HTTP 200 + 空 collection，
+    看起来像"检索到 0 篇"；现行形式需要日期区间 + 游标。
+    """
+
+    def test_uses_date_range_endpoint_not_legacy_form(self):
+        def responder(url):
+            return {'messages': [{'status': 'ok', 'total': '100'}],
+                    'collection': []}
+
+        fake = _FakeHttp(responder)
+        orig = preprints._get_json
+        preprints._get_json = fake
+        try:
+            preprints.search_biorxiv('obesity', retmax=10, server='biorxiv')
+        finally:
+            preprints._get_json = orig
+
+        self.assertTrue(fake.urls, '应当发起过请求')
+        for u in fake.urls:
+            # 旧形式是 /details/biorxiv/0/20；现行形式是 /details/biorxiv/DATE/DATE/CURSOR
+            self.assertNotRegex(u, r'/details/biorxiv/\d+/\d+$')
+            self.assertRegex(u, r'/details/biorxiv/\d{4}-\d{2}-\d{2}/')
+
+    def test_cursors_include_newest_and_are_within_range(self):
+        """最新记录在窗口末尾，cursor = total - 30。"""
+        cursors = preprints._biorxiv_plan_cursors(total=1000, pages=8)
+        self.assertTrue(cursors)
+        self.assertLessEqual(max(cursors), 1000)
+        self.assertGreaterEqual(min(cursors), 0)
+        self.assertIn(970, cursors)   # total - PAGE_SIZE
+        # 一半分层，覆盖窗口前段
+        self.assertLess(min(cursors), 900)
+
+    def test_plan_cursors_handles_edge_cases(self):
+        self.assertEqual(preprints._biorxiv_plan_cursors(0, 8), [])
+        self.assertEqual(preprints._biorxiv_plan_cursors(100, 0), [])
+        # 总数小于一页时，cursor 只能是 0
+        self.assertEqual(preprints._biorxiv_plan_cursors(10, 8), [0])
+
+    def test_keeps_latest_version_per_doi(self):
+        """同一 DOI 的 v1/v2 只保留最新版。
+
+        故意让 v2 先出现、v1 后出现：只按"最后一条覆盖"去重的实现会留下 v1，
+        因此这个用例能区分"取最新版"和"随便留一条"。
+        """
+        def responder(url):
+            return {'messages': [{'status': 'ok', 'total': '60'}], 'collection': [
+                {'doi': '10.1101/a', 'title': 'New', 'version': '2',
+                 'date': '2026-01-02', 'abstract': 'obesity'},
+                {'doi': '10.1101/a', 'title': 'Old', 'version': '1',
+                 'date': '2026-01-01', 'abstract': 'obesity'},
+                {'doi': '10.1101/b', 'title': 'Other', 'version': '1',
+                 'date': '2026-01-03', 'abstract': 'obesity'},
+            ]}
+
+        fake = _FakeHttp(responder)
+        orig = preprints._get_json
+        preprints._get_json = fake
+        try:
+            r = preprints.search_biorxiv('obesity', retmax=10, server='biorxiv')
+        finally:
+            preprints._get_json = orig
+
+        dois = [p['doi'] for p in r['papers']]
+        self.assertEqual(len(dois), len(set(dois)), '同一 DOI 不应重复出现')
+        titles = [p['title'] for p in r['papers']]
+        self.assertIn('New', titles)
+        self.assertNotIn('Old', titles)
+
+    def test_upstream_error_status_is_reported_not_swallowed(self):
+        """上游 200 + status != ok 必须报错，不能当成"命中 0 篇"。
+
+        刻意让一部分页成功、一部分页失败：这样"有记录但也有故障"时，
+        error 字段必须非空。如果翻页环节不检查 status，错误会被静默吞掉，
+        看起来就是"一切正常，只是命中少了一点"。
+        """
+        def responder(url):
+            cursor = url.rsplit('/', 1)[-1]
+            if cursor == '0':
+                return {'messages': [{'status': 'ok', 'total': '1000'}], 'collection': [
+                    {'doi': '10.1101/ok', 'title': 'Obesity', 'version': '1',
+                     'date': '2026-01-01', 'abstract': 'obesity'},
+                ]}
+            return {'messages': [{'status': 'Server not recognized'}],
+                    'collection': []}
+
+        fake = _FakeHttp(responder)
+        orig = preprints._get_json
+        preprints._get_json = fake
+        try:
+            r = preprints.search_biorxiv('obesity', retmax=10, server='biorxiv')
+        finally:
+            preprints._get_json = orig
+
+        self.assertTrue(r['error'],
+                        '部分页失败时 error 必须非空（翻页环节要检查上游 status）')
+        self.assertGreaterEqual(r['count'], 1)
+
+    def test_network_failure_returns_error_not_exception(self):
+        def boom(url, timeout=45, retries=2):
+            raise RuntimeError('network down')
+
+        orig = preprints._get_json
+        preprints._get_json = boom
+        try:
+            r = preprints.search_biorxiv('obesity', retmax=10, server='biorxiv')
+            r2 = preprints.search_preprints('obesity', retmax=10)
+        finally:
+            preprints._get_json = orig
+
+        self.assertEqual(r['count'], 0)
+        self.assertTrue(r['error'])
+        self.assertEqual(r2['count'], 0)
+        self.assertTrue(r2['error'])
+        self.assertEqual(r2['papers'], [])
+
+    def test_preprints_have_no_pmid(self):
+        """预印本没有 PMID——ids 用 doi: 前缀，绝不伪造 PMID。"""
+        def responder(url):
+            return {'messages': [{'status': 'ok', 'total': '60'}], 'collection': [
+                {'doi': '10.1101/x', 'title': 'Obesity study', 'version': '1',
+                 'date': '2026-01-01', 'abstract': 'obesity and weight',
+                 'authors': 'Harvey, D. Y.; Stoll, H.'},
+            ]}
+
+        fake = _FakeHttp(responder)
+        orig = preprints._get_json
+        preprints._get_json = fake
+        try:
+            r = preprints.search_biorxiv('obesity', retmax=10, server='biorxiv')
+        finally:
+            preprints._get_json = orig
+
+        self.assertEqual(r['ids'], ['doi:10.1101/x'])
+        self.assertEqual(r['papers'][0]['pmid'], '')
+        self.assertEqual(r['papers'][0]['authors'], ['Harvey D Y', 'Stoll H'])
+
+
+class TestAuthorSplitting(unittest.TestCase):
+    def test_semicolon_separated_authors(self):
+        self.assertEqual(
+            preprints._split_authors('Harvey, D. Y.; Stoll, H.; Hamilton, R. H.'),
+            ['Harvey D Y', 'Stoll H', 'Hamilton R H'])
+
+    def test_single_author_with_initials(self):
+        self.assertEqual(preprints._split_authors('Smith, J.'), ['Smith J'])
+
+    def test_plain_comma_separated_names(self):
+        self.assertEqual(preprints._split_authors('Smith J, Doe A'),
+                         ['Smith J', 'Doe A'])
+
+    def test_list_input_passthrough(self):
+        self.assertEqual(preprints._split_authors(['Smith J', 'Doe A']),
+                         ['Smith J', 'Doe A'])
+
+    def test_empty_input(self):
+        self.assertEqual(preprints._split_authors(''), [])
+        self.assertEqual(preprints._split_authors(None), [])
+
+
+class TestTokenizer(unittest.TestCase):
+    def test_drops_stopwords_and_short_tokens(self):
+        toks = preprints._tokenize('the and of GLP-1 obesity')
+        self.assertIn('obesity', toks)
+        self.assertNotIn('the', toks)
+        self.assertNotIn('and', toks)
+
+    def test_keeps_hyphenated_variants(self):
+        toks = preprints._tokenize('GLP-1 receptor')
+        self.assertIn('glp-1', toks)
+        self.assertIn('glp1', toks)
+        self.assertIn('receptor', toks)
+
+    def test_chinese_tokens(self):
+        toks = preprints._tokenize('肥胖症 糖尿病')
+        self.assertIn('肥胖症', toks)
+
+    def test_empty_term_yields_no_tokens(self):
+        self.assertEqual(preprints._tokenize(''), [])
+        self.assertEqual(preprints._tokenize('   '), [])
+
+
 if __name__ == '__main__':
     unittest.main()
