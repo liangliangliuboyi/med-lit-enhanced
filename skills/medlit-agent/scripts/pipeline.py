@@ -28,6 +28,22 @@ try:
     import preprints as preprintmod
 except Exception:  # noqa: BLE001
     preprintmod = None
+try:
+    import verify as verifymod          # B5 语义比对 + B8 相关度交叉验证
+except Exception:  # noqa: BLE001
+    verifymod = None
+try:
+    import compare as comparemod        # N5 干预横向对比
+except Exception:  # noqa: BLE001
+    comparemod = None
+try:
+    import cache as cachemod            # N8 检索缓存
+except Exception:  # noqa: BLE001
+    cachemod = None
+try:
+    import pricing as pricingmod        # N9 分档计价
+except Exception:  # noqa: BLE001
+    pricingmod = None
 
 
 # ---------------- 通用工具 ----------------
@@ -146,6 +162,7 @@ class Run:
         self.evidence: list[dict] = []
         self.excluded: list[dict] = []          # C6：带排除理由
         self.search_log: list[dict] = []
+        self.translations: list[dict] = []   # N2：PubMed 对检索式的解读
         self.plan: dict = {}
         self.critique: dict = {}
         self.answer = ''
@@ -171,6 +188,8 @@ class Run:
         self._log_lines: list[str] = []
         self._ft_lock = threading.Lock()
         self._ft_claimed = 0
+        self.cache = None
+        self.cache_stats = None
         self._checkpoint: dict = {}
 
         if resume_dir:
@@ -208,6 +227,17 @@ class Run:
         n = res.get('tokens')
         if n:
             self.trace['tokens'][role] = self.trace['tokens'].get(role, 0) + int(n)
+        if pricingmod:
+            # N9：按模型分档计价，不同模型价格差很多
+            table = (self.cfg.get('runtime') or {}).get('price_table')
+            usage = dict(self.trace['tokens'])
+            role_models = dict(self.trace.get('models') or {})
+            try:
+                self.trace['cost_estimate'] = pricingmod.estimate_cost(
+                    usage, table, role_models)
+            except Exception:  # noqa: BLE001
+                self.trace['cost_estimate'] = {}
+            return
         price = (self.cfg.get('runtime') or {}).get('price_per_million_tokens')
         if price and self.trace['tokens']:
             total = sum(self.trace['tokens'].values())
@@ -275,10 +305,12 @@ class Run:
             prev = '；'.join(h.get('question', '') for h in self.history[-3:])
             hist = (f'\n\n【对话历史】用户此前连续提问：{prev}\n'
                     f'本次问题若是追问，请在检索式中保留必要的前序概念，不要重复问清。')
+        cq_opts = '\n'.join(f'  - {k}：{v["label"]}' for k, v in self.cq_all.items())
         msgs = [{'role': 'system', 'content': prompts.PLANNER_SYSTEM},
                 {'role': 'user', 'content': prompts.PLANNER_USER.format(
                     question=self.question + hist,
-                    constraints=self.constraints or '（无）')}]
+                    constraints=self.constraints or '（无）',
+                    cq_options=cq_opts or '  （无）')}]
         res = self.router.chat('planner', msgs,
                                temperature=self.cfg['runtime']['temperature_plan'],
                                max_tokens=1600)
@@ -295,6 +327,15 @@ class Run:
                  f'（{res["model"]}，{res["elapsed"]}s）')
         for q in data.get('queries', []):
             self.log(f'   · [{q.get("label")}] {q.get("query", "")[:110]}')
+        # N7：planner 建议的过滤器只提示，不自动生效
+        sug = data.get('suggested_cq') or ''
+        if sug:
+            if sug in self.cq_all:
+                self.log(f'   · 建议的临床查询过滤器：{sug}（{self.cq_all[sug]["label"]}）'
+                         f'—— 仅作建议，未自动生效；要用请加 --cq {sug}')
+            else:
+                self.log(f'   · planner 给出的过滤器 id 不认识，已忽略：{sug}')
+                data['suggested_cq'] = ''
         return data
 
     def revise_queries(self, failed: list[dict]) -> list[dict]:
@@ -320,6 +361,25 @@ class Run:
         return qs
 
     # ---------- 2. 检索 ----------
+    def _esearch(self, term: str, retmax: int = 20,
+                 mindate: str | None = None) -> dict:
+        """N8：带缓存的检索。同一检索式重复跑不再打 NCBI 的 API。"""
+        if not cachemod:
+            return self.pubmed.esearch(term, retmax=retmax, mindate=mindate)
+        if self.cache is None:
+            self.cache = cachemod.EsearchCache(self._cache_dir())
+            self.cache_stats = cachemod.CacheStats()
+        r = cachemod.cached_esearch(self.pubmed, self.cache, term,
+                                    retmax=retmax, mindate=mindate,
+                                    stats=self.cache_stats)
+        return r
+
+    def _cache_dir(self) -> str:
+        """缓存目录放在 runs_root 的同级，不混进每次运行的产物目录。"""
+        root = os.path.abspath(self.cfg['paths'].get('runs_root') or './runs')
+        parent = os.path.dirname(root) or '.'
+        return os.path.join(parent, '.medlit-cache')
+
     def search(self, queries: list[dict], tag: str = 'round1',
                retmax: int = 20, min_year: str | None = None):
         if tag == 'round1':
@@ -333,6 +393,9 @@ class Run:
             self.log(f'   临床查询过滤器：{cq_id}（{self.cq_all[cq_id]["label"]}）')
 
         exclude_animals = bool((self.cfg['retrieval'] or {}).get('exclude_animals'))
+        langs = (self.cfg['retrieval'] or {}).get('languages') or []
+        if langs:
+            self.log(f'   语种限制：{", ".join(langs)}')
 
         for q in queries:
             term = (q.get('query') or '').strip()
@@ -343,10 +406,12 @@ class Run:
                 full = pm.apply_clinical_query(full, self.cq_all[cq_id]['query'])
             if exclude_animals:
                 full = pm.apply_animal_exclusion(full, True)
+            if langs:
+                full = pm.apply_language_filter(full, langs)
             self.log(f'② 检索 [{q.get("label")}] {term[:90]}')
             t0 = time.time()
             try:
-                r = self.pubmed.esearch(full, retmax=retmax, mindate=min_year)
+                r = self._esearch(full, retmax=retmax, mindate=min_year)
             except Exception as e:  # noqa: BLE001
                 self.err('esearch', e)
                 continue
@@ -367,6 +432,14 @@ class Run:
                 'translation': r.get('translation', '')[:300],
             })
             self.log(f'   命中 {r["count"]}，取回 {len(got)}，新增 {len(fresh)}')
+            # N2：PubMed 会告诉我们"它自己怎么理解你的检索式"（自动 MeSH 映射、拆词等）。
+            # 命中异常少时，这段解释是判断"检索式被误解"的第一手线索，必须让人看见。
+            trans = (r.get('translation') or '').strip()
+            if trans:
+                self.translations.append({'query': term, 'translation': trans[:600]})
+                if r['count'] < 5:
+                    self.log(f'   ! 命中偏少，PubMed 对检索式的解读：{trans[:260]}')
+                    self.log('     （若解读与你的原意不符，多半是 MeSH 自动映射或拆词出了问题）')
             if fresh:
                 self.fetch_metadata(fresh)
         self._save_checkpoint()
@@ -706,12 +779,81 @@ class Run:
                     self.prisma['excluded_fulltext'] += 1
                     self.log(f'   [{done}/{total}] {key} 抽取失败')
         self.trace['timings']['read'] = round(time.time() - t0, 1)
+        self._cross_check_relevance()
         self.evidence.sort(key=lambda d: (-(d.get('relevance') or 0), str(d.get('_year') or '')))
         self.prisma['fulltext_assessed'] = total
         self.prisma['included'] = len(self.evidence)
         self.prisma['excluded_fulltext'] = max(0, total - len(self.evidence))
         self.log(f'   精读完成：成功 {len(self.evidence)} 篇，{self.trace["timings"]["read"]}s')
         self._save_checkpoint()
+
+    def _cross_check_relevance(self):
+        """B8：相关度交叉验证——两个不同模型各打一次分取平均。
+
+        单次打分会有偶然性；两个模型分歧大时，这本身就是个信号。
+        """
+        if not verifymod or not self.evidence:
+            return
+        if not (self.cfg['retrieval'] or {}).get('cross_check_relevance', True):
+            return
+        self.log('   · 相关度交叉验证（两个模型各打一次分）')
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
+            if model:
+                # 指定模型时直接走 provider，绕开路由器的角色链
+                res = self.provider.chat(model, messages, temperature, max_tokens)
+                self._track_tokens('reader', res)
+                return res
+            return self.router.chat(role, messages, temperature, max_tokens)
+
+        # 两个模型必须**真的不同**，否则就是自己跟自己对账，白花一倍的钱。
+        chain = self.cfg['models']['chain']
+        reader_chain = chain.get('reader') or []
+        critic_chain = chain.get('critic') or []
+        model_a = (reader_chain[0] if reader_chain else None)
+        # 第二个模型刻意跨厂商/跨家族取，交叉验证才有意义
+        model_b = None
+        for cand in (reader_chain[2:] + critic_chain):
+            if cand and cand != model_a:
+                model_b = cand
+                break
+        if not model_b:
+            model_b = reader_chain[1] if len(reader_chain) > 1 else model_a
+        if model_a == model_b:
+            self.log('   · 相关度交叉验证：可用模型不足两个，跳过（否则是自证）')
+            return
+        self.log(f'   · 相关度交叉验证：{model_a} vs {model_b}')
+
+        try:
+            before = len(self.evidence)
+            self.evidence = verifymod.cross_check_relevance(
+                self.evidence, chat_fn, model_a=model_a, model_b=model_b)
+            after = self.evidence
+            if len(after) != before:
+                self.evidence = after
+            # verify.py 把交叉分放在 relevance_cross，原分留在 relevance。
+            # **必须把交叉分采纳为有效分**，否则交叉验证算了却不影响排序，等于白花一倍的钱。
+            adopted = 0
+            for d in self.evidence:
+                cross = d.get('relevance_cross')
+                if cross is None or d.get('relevance_cross_failed'):
+                    continue
+                try:
+                    if abs(float(cross) - float(d.get('relevance', 0))) > 1e-9:
+                        adopted += 1
+                    d['relevance'] = cross
+                except (TypeError, ValueError):
+                    continue
+            gain = verifymod.cross_check_gain(
+                [dict(d, relevance=d.get('_relevance_original', d.get('relevance')))
+                 for d in after], after)
+            gain['adopted'] = adopted
+            self.trace['relevance_cross_check'] = gain
+            self.log(f'     交叉验证完成：{gain.get("changed", 0)} 篇分数变化'
+                     f'（已采纳 {adopted} 篇），'
+                     f'{gain.get("divergent", 0)} 篇两模型分歧大')
+        except Exception as e:  # noqa: BLE001
+            self.err('cross_check', e)
 
     # ---------- 8. 效应量合并（B4） ----------
     def pool_effects(self):
@@ -911,6 +1053,36 @@ class Run:
         return '\n'.join(out)
 
     # ---------- 11. 成文 ----------
+    REQUIRED_SECTIONS = ('一句话结论', '证据概况', '核心发现', '证据冲突与不确定性',
+                         '证据空隙', '检索覆盖说明', '适用边界', '对你的具体启示')
+
+    def check_answer_structure(self, answer: str) -> dict:
+        """N4：检查答案的结构完整性。
+
+        两件事：① 承诺的八个段落是否都在；② 关键段落里是否真的挂了引用。
+        「结构不全」的答案看起来完整、实则缺斤少两，用户很难察觉，所以要程序查。
+        """
+        text = answer or ''
+        missing = []
+        for sec in self.REQUIRED_SECTIONS:
+            if f'## {sec}' not in text:
+                missing.append(sec)
+        # 逐段看引用数
+        sections = {}
+        current = None
+        for line in text.split('\n'):
+            if line.startswith('## '):
+                current = line[3:].strip()
+                sections[current] = 0
+            elif current and ('[PMID:' in line or '[DOI:' in line):
+                sections[current] += 1
+        no_cite = [k for k in ('核心发现', '证据概况', '一句话结论')
+                   if k in sections and sections[k] == 0]
+        return {'ok': not missing and not no_cite,
+                'missing_sections': missing,
+                'sections_without_citation': no_cite,
+                'section_citation_counts': sections}
+
     def write(self) -> str:
         msgs = [{'role': 'system', 'content': prompts.WRITER_SYSTEM},
                 {'role': 'user', 'content': prompts.WRITER_USER.format(
@@ -932,11 +1104,50 @@ class Run:
             self.trace['timings']['write'] = res['elapsed']
             self.trace['models']['writer'] = res['model']
             self._track_tokens('writer', res)
-            self.log(f'   完成（{res["model"]}，{res["elapsed"]}s）')
-            return res['content']
+            answer = res['content']
         except Exception as e:  # noqa: BLE001
             self.err('write', e)
             return '## 生成失败\n\n模型调用出错，请查看 09_log.txt。\n'
+
+        # N4：结构校验，不合格就让模型重写一次
+        check = self.check_answer_structure(answer)
+        self.trace['answer_structure'] = check
+        if not check['ok'] and (self.cfg['retrieval'] or {}).get(
+                'rewrite_on_structure_fail', True):
+            problems = []
+            if check['missing_sections']:
+                problems.append('缺少这些段落：' + '、'.join(check['missing_sections']))
+            if check['sections_without_citation']:
+                problems.append('这些段落里没有任何引用标记：'
+                                + '、'.join(check['sections_without_citation']))
+            self.log('   ! 结构校验未通过：' + '；'.join(problems) + ' → 让 writer 重写一次')
+            retry = msgs + [
+                {'role': 'assistant', 'content': answer[:4000]},
+                {'role': 'user', 'content':
+                    '上一版答案结构不完整：' + '；'.join(problems)
+                    + '。请按要求的结构完整重写一遍，八个段落一个都不能少，'
+                      '并且「一句话结论」「证据概况」「核心发现」里必须有 [PMID:xxx] 引用。'},
+            ]
+            try:
+                res2 = self.router.chat('writer', retry,
+                                        temperature=0.2,
+                                        max_tokens=self.cfg['runtime']['max_tokens'] + 2000)
+                self._track_tokens('writer', res2)
+                check2 = self.check_answer_structure(res2['content'])
+                self.trace['answer_structure_retry'] = check2
+                if check2['ok']:
+                    self.log('   ✓ 重写后结构完整')
+                    answer = res2['content']
+                    self.trace['answer_structure'] = check2
+                else:
+                    self.log('   ! 重写后仍不完整，保留原版并记入 trace')
+            except Exception as e:  # noqa: BLE001
+                self.err('write-retry', e)
+        elif not check['ok']:
+            self.log('   ! 结构校验未通过（已关闭自动重写）')
+        else:
+            self.log('   ✓ 结构校验通过：八个段落齐全，关键段落均有引用')
+        return answer
 
     # ---------- 12. PMID 越界校验 ----------
     def validate_pmids(self) -> dict:
@@ -1000,19 +1211,40 @@ class Run:
                                          'err': '正文中未出现任何 [PMID:xxx] / [DOI:xxx] 引用标记'})
         self.pmid_check = check
         return check
-        if orphan:
-            msg = (f'正文引用了 {len(orphan)} 个不在候选池中的 PMID：'
-                   f'{", ".join(orphan[:10])}{"…" if len(orphan) > 10 else ""}')
-            self.trace['errors'].append({'stage': 'pmid_check', 'err': msg})
-            self.log(f'!! PMID 校验未通过：{msg}')
-        elif cited:
-            self.log(f'   ✓ PMID 校验通过：正文引用 {len(cited)} 个，全部来自候选池')
-        else:
-            self.log('   ! 正文没有出现任何 [PMID:xxxx]，可能是证据不足或模型未遵守写作纪律')
-            self.trace['errors'].append({'stage': 'pmid_check',
-                                         'err': '正文中未出现任何 PMID 引用标记'})
-        self.pmid_check = check
-        return check
+
+    def _verify_claims(self):
+        """B5：正文论断与被引文献的语义比对。
+
+        只校验"PMID 在不在候选池"是不够的——模型完全可能挂一篇真实存在但内容无关
+        的文献，读者点进去才发现对不上。这里让模型逐条核对"这篇真的支持这句话吗"。
+        """
+        if not verifymod or not self.answer:
+            return
+        if not (self.cfg['retrieval'] or {}).get('verify_claims', True):
+            return
+        self.log('   · 论断与文献语义比对（抽查最关键的若干条）')
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=800, model=None):
+            if model:
+                res = self.provider.chat(model, messages, temperature, max_tokens)
+                self._track_tokens('reader', res)
+                return res
+            return self.router.chat(role, messages, temperature, max_tokens)
+
+        try:
+            res = verifymod.verify_claims(self.answer, self.evidence, chat_fn,
+                                          max_checks=int(
+                                              (self.cfg['retrieval'] or {}).get(
+                                                  'claim_check_limit', 12)))
+            self.trace['claim_verification'] = res
+            self.log(f'     比对完成：核验 {res.get("checked", 0)} 条，'
+                     f'不支持 {len(res.get("unsupported", []))} 条，'
+                     f'部分支持 {len(res.get("partial", []))} 条')
+            for item in res.get('unsupported', [])[:3]:
+                self.log(f'       ⚠ 可能不支持：{str(item.get("text", ""))[:80]}'
+                         f' {item.get("citations", [])}')
+        except Exception as e:  # noqa: BLE001
+            self.err('verify_claims', e)
 
     # ---------- 13. 落盘 ----------
     def _w(self, name: str, content: str):
@@ -1023,7 +1255,15 @@ class Run:
         self._w('01_question.md',
                 f'# 问题\n\n{self.question}\n\n## 补充限定\n\n{self.constraints or "（无）"}\n\n'
                 f'## 检索范围\n\n全 PubMed（不限刊源、不限学科；仅英文国际文献，未检索中文数据库）\n')
-        self._w('02_plan.json', json.dumps(self.plan, ensure_ascii=False, indent=2))
+        plan_out = dict(self.plan)
+        # N2：把 PubMed 的检索式解读一并落盘，便于事后判断检索式是否被误解
+        plan_out['query_translations'] = self.translations
+        # N7：过滤器只是"建议"，程序不会自动 AND 进去——是否使用由使用者决定
+        if self.plan.get('suggested_cq'):
+            plan_out['suggested_cq_note'] = (
+                'planner 建议的临床查询过滤器（仅供参考，未自动生效；'
+                '要用请显式加 --cq ' + str(self.plan['suggested_cq']))
+        self._w('02_plan.json', json.dumps(plan_out, ensure_ascii=False, indent=2))
         self._w('03_papers.json', json.dumps(list(self.papers.values()), ensure_ascii=False, indent=1))
         clean = [{k: v for k, v in d.items() if not k.startswith('_')} for d in self.evidence]
         self._w('04_evidence.json', json.dumps(clean, ensure_ascii=False, indent=1))
@@ -1065,22 +1305,31 @@ class Run:
         self._save_checkpoint()
 
     def _update_index(self):
-        """C4：维护 runs 根目录下的汇总索引。"""
+        """C4：维护 runs 根目录下的汇总索引（新增的排在最前，便于按时间倒序看）。"""
         try:
             root = os.path.abspath(self.cfg['paths'].get('runs_root') or './runs')
             os.makedirs(root, exist_ok=True)
             idx = os.path.join(root, '_index.md')
             title = (self.plan.get('core_question_en') or self.question)[:80]
+            grading = self.mech_grading.get('certainty', '—')
             row = (f'| {self.stamp} | {title} | {len(self.evidence)} | '
-                   f'{self.pmid_check.get("cited_count", 0)} | '
+                   f'{grading} | {self.pmid_check.get("cited_count", 0)} | '
                    f'{self.prisma.get("identified", 0)} | '
                    f'{self.trace.get("elapsed_total", 0)}s |')
             if not os.path.exists(idx):
                 with open(idx, 'w', encoding='utf-8') as f:
-                    f.write('# 运行索引\n\n| 时间 | 问题 | 纳入 | 引用PMID | 命中 | 耗时 |\n')
-                    f.write('|---|---|---|---|---|---|\n')
-            with open(idx, 'a', encoding='utf-8') as f:
-                f.write(row + '\n')
+                    f.write('# 运行索引\n\n'
+                            '> 最新的排在最前。GRADE 确定性由程序机械定级。\n\n'
+                            '| 时间 | 问题 | 纳入 | GRADE | 引用数 | 命中 | 耗时 |\n'
+                            '|---|---|---|---|---|---|---|\n')
+            with open(idx, 'r', encoding='utf-8') as f:
+                lines = f.read().split('\n')
+            # 找到表体起始行，把新行插在它前面
+            body_start = next((i for i, l in enumerate(lines)
+                               if l.startswith('|---')), len(lines))
+            lines.insert(body_start + 1, row)
+            with open(idx, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
         except Exception as e:  # noqa: BLE001
             self.err('index', e)
 
@@ -1153,6 +1402,7 @@ class Run:
                  f'（{self.mech_grading.get("reason", "")}）')
         self.critique = self.critique_all()
         self.answer = self.write()
+        self._verify_claims()
         self.validate_pmids()
         self.save()
         return self.dir

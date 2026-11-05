@@ -100,12 +100,15 @@ FIX_HINTS = {
         '   有了它 NCBI 限速从 3 请求/秒 提升到 10 请求/秒。\n'
         '   不填也能用，只是慢一些。'),
     'email': (
-        '建议填写 NCBI 开发者邮箱（可选项）：\n'
-        '   在 .env 里写 NCBI_EMAIL=<你的邮箱>。\n'
-        '   NCBI 规定 email 填「软件开发者」的邮箱，不是终端使用者的邮箱——'
-        '   万一这个软件被违规使用并导致 IP 被封，NCBI 需要能联系到作者。\n'
-        '   填了之后使用者也可以在 config.json 的 pubmed.email 里改成自己的。'),
+        '缺少 NCBI 邮箱（**首次使用必须填你自己的**）：\n'
+        '   NCBI 要求登记「软件使用者/开发者」的邮箱与 email 地址，'
+        '这样一旦有人违规使用导致 IP 被封，NCBI 能联系到本人处理。\n'
+        '   请在 .env 里写 NCBI_EMAIL=<你自己的邮箱>。\n'
+        '   ⚠️ 不要填别人的邮箱——责任会落到那个人头上。'),
 }
+
+# 首次使用必须由使用者自己提供的三项
+REQUIRED_USER_ITEMS = ('provider', 'email')
 
 
 def resolve_secret(block: dict, dotenv: dict, label: str,
@@ -208,8 +211,9 @@ def doctor() -> list[dict]:
     prov_env = prov.get('api_key_env') or 'SILICONFLOW_API_KEY'
     has_key = bool((os.environ.get(prov_env) or dotenv.get(prov_env) or '').strip())
     items.append({
-        'item': '模型服务密钥',
+        'item': '模型服务密钥（必填）',
         'ok': has_key,
+        'required': True,
         'detail': ('已配置（' + prov_env + '）' if has_key else FIX_HINTS['provider']),
     })
 
@@ -223,9 +227,11 @@ def doctor() -> list[dict]:
 
     has_mail = bool((cfg.get('pubmed') or {}).get('email'))
     items.append({
-        'item': 'NCBI 开发者邮箱（建议）',
+        'item': 'NCBI 邮箱（必填，须填你自己的）',
         'ok': has_mail,
-        'detail': ('已配置' if has_mail else FIX_HINTS['email']),
+        'required': True,
+        'detail': ('已配置：' + (cfg.get('pubmed') or {}).get('email', '')) if has_mail
+                   else FIX_HINTS['email'],
     })
 
     items.append({'item': '配置文件', 'ok': True, 'detail': describe_sources(cfg)})
@@ -236,7 +242,34 @@ def doctor() -> list[dict]:
                   'detail': str(v.major) + '.' + str(v.minor) + '.' + str(v.micro) + '（需要 ≥ 3.9）'})
     items.append({'item': '第三方依赖', 'ok': True,
                   'detail': '无（纯标准库，可直接运行）'})
+
+    # 必填项要附带"该怎么问用户"——智能体照着这句问就行
+    asks = {
+        '模型服务密钥（必填）':
+            '请提供你的模型服务 API Key（例如硅基流动的密钥）。'
+            '想用别的服务也可以，告诉我用哪家、改一下 base_url 就行。',
+        'NCBI 邮箱（必填，须填你自己的）':
+            '请提供你自己的邮箱。它会写进 NCBI 请求里，用于在有人违规使用、'
+            '导致你的 IP 被 NCBI 限流时联系到你。这不是我的邮箱，也不该填别人的。',
+    }
+    for it in items:
+        if it.get('required') and not it.get('ok'):
+            it['ask'] = asks.get(it['item'], '请补充这项信息。')
     return items
+
+
+def missing_user_items() -> list[dict]:
+    """当前缺失、且必须由使用者自己提供的项。
+
+    这是「首次使用主动提醒」的入口：智能体拿到这个列表后应当**逐项向用户询问**，
+    而不是自己编造一个值填进去。
+    """
+    out = []
+    for it in doctor():
+        if it.get('required') and not it.get('ok'):
+            out.append({'item': it['item'], 'ask': it.get('ask', ''),
+                        'how': it.get('detail', '')})
+    return out
 
 
 def save_env(values: dict, path=ENV_FILE) -> str:

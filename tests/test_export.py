@@ -394,5 +394,307 @@ class TestDocx(unittest.TestCase):
             self.assertTrue(os.path.exists(out))
 
 
+# ---------------- DOCX 真表格 ----------------
+W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+
+def _read_doc_xml(markdown: str, tmpdir: str, name: str = 'out.docx') -> str:
+    """把 Markdown 转成 docx，返回 word/document.xml 的文本。"""
+    out = os.path.join(tmpdir, name)
+    export.to_docx(markdown, out)
+    with zipfile.ZipFile(out) as zf:
+        return zf.read('word/document.xml').decode('utf-8')
+
+
+def _parse_doc_xml(markdown: str, tmpdir: str, name: str = 'out.docx'):
+    """把 Markdown 转成 docx，返回解析后的 document.xml 根元素。"""
+    return ET.fromstring(_read_doc_xml(markdown, tmpdir, name))
+
+
+def _w(tag: str) -> str:
+    """带命名空间的标签名。"""
+    return f'{{{W_NS}}}{tag}'
+
+
+class TestDocxTable(unittest.TestCase):
+    """Markdown 管道表格 → 真正的 Word 表格（w:tbl）。
+
+    改造前的实现把表格行降级成 tab 分隔的普通段落，读者在 Word 里看到的是
+    一堆制表符而不是表格。
+    """
+
+    TABLE_MD = ('| 列1 | 列2 | 列3 |\n'
+                '|---|---|---|\n'
+                '| a | b | c |\n'
+                '| d | e | f |\n')
+
+    def test_table_produces_w_tbl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml(self.TABLE_MD, tmp)
+        self.assertIn('<w:tbl>', doc)
+
+    def test_table_row_count(self):
+        """表格行数 = 表头行 + 数据行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.TABLE_MD, tmp)
+        tbls = root.iter(_w('tbl'))
+        tbl = next(tbls)
+        rows = list(tbl.iter(_w('tr')))
+        self.assertEqual(len(rows), 3)  # 1 表头 + 2 数据
+
+    def test_table_header_row_is_repeated_and_bold(self):
+        """表头行要有 <w:tblHeader/>（跨页重复）且内容加粗。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.TABLE_MD, tmp)
+        tbl = next(root.iter(_w('tbl')))
+        rows = list(tbl.iter(_w('tr')))
+        header = rows[0]
+        self.assertIsNotNone(header.find(_w('trPr')))
+        self.assertIsNotNone(header.find(f'{_w("trPr")}/{_w("tblHeader")}'))
+        # 表头单元格里的每个文本 run 都带 <w:b/>
+        for run in header.iter(_w('r')):
+            self.assertIsNotNone(run.find(f'{_w("rPr")}/{_w("b")}'))
+        # 数据行不加粗
+        for run in rows[1].iter(_w('r')):
+            self.assertIsNone(run.find(f'{_w("rPr")}/{_w("b")}'))
+
+    def test_table_followed_by_paragraph(self):
+        """<w:tbl> 后面必须紧跟一个 <w:p>，否则 Word 会判定文件损坏。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml(self.TABLE_MD, tmp)
+        self.assertIn('</w:tbl><w:p>', doc)
+
+    def test_table_at_end_of_document_still_followed_by_paragraph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml('| a | b |\n|---|---|\n| 1 | 2 |\n', tmp)
+        self.assertIn('</w:tbl><w:p>', doc)
+
+    def test_cell_widths_equal_split(self):
+        """列宽平分，且表格总宽用 <w:tblW>。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.TABLE_MD, tmp)
+        tbl = next(root.iter(_w('tbl')))
+        tblpr = tbl.find(_w('tblPr'))
+        self.assertIsNotNone(tblpr.find(_w('tblW')))
+        widths = [tc.find(f'{_w("tcPr")}/{_w("tcW")}').get(f'{_w("w")}')
+                  for tc in tbl.iter(_w('tc'))]
+        # 三列 → 每列宽度相同
+        self.assertEqual(len(set(widths[:3])), 1)
+        # 所有单元格（表头 + 数据）宽度一致
+        self.assertEqual(len(set(widths)), 1)
+
+    def test_table_has_borders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.TABLE_MD, tmp)
+        tbl = next(root.iter(_w('tbl')))
+        borders = tbl.find(f'{_w("tblPr")}/{_w("tblBorders")}')
+        self.assertIsNotNone(borders)
+        for side in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+            self.assertIsNotNone(borders.find(_w(side)))
+
+    def test_missing_columns_are_padded(self):
+        """数据行缺列 → 补空单元格，列数由表头决定。"""
+        md = '| a | b | c |\n|---|---|---|\n| 1 |\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(md, tmp)
+        tbl = next(root.iter(_w('tbl')))
+        rows = list(tbl.iter(_w('tr')))
+        self.assertEqual(len(rows), 2)
+        cells = list(rows[1].iter(_w('tc')))
+        self.assertEqual(len(cells), 3)
+        texts = [''.join(t.text or '' for t in c.iter(_w('t'))) for c in cells]
+        self.assertEqual(texts, ['1', '', ''])
+
+    def test_extra_columns_are_ignored(self):
+        """数据行多列 → 多出来的列忽略。"""
+        md = '| a | b |\n|---|---|\n| 1 | 2 | 3 | 4 |\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(md, tmp)
+        tbl = next(root.iter(_w('tbl')))
+        rows = list(tbl.iter(_w('tr')))
+        self.assertEqual(len(rows), 2)
+        cells = list(rows[1].iter(_w('tc')))
+        self.assertEqual(len(cells), 2)
+        texts = [''.join(t.text or '' for t in c.iter(_w('t'))) for c in cells]
+        self.assertEqual(texts, ['1', '2'])
+
+    def test_cell_text_escaped(self):
+        """单元格里的 & < > 必须转义，且不能出现裸的 & 。"""
+        md = '| a & b | < c > |\n|---|---|\n| x & y | < z > |\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml(md, tmp)
+        self.assertIn('&amp;', doc)
+        self.assertIn('&lt;', doc)
+        self.assertIn('&gt;', doc)
+        # 每个 & 都必须是合法实体的开始
+        for m in re.finditer(r'&', doc):
+            self.assertTrue(re.match(r'&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);',
+                                     doc[m.start():]), f'裸的 & : {doc[m.start() - 20:m.start() + 20]}')
+
+    def test_cell_text_roundtrip(self):
+        """转义之后，解析出来的文本应与原文一致。"""
+        md = '| a & b | < c > |\n|---|---|\n| x & y | < z > |\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(md, tmp)
+        tbl = next(root.iter(_w('tbl')))
+        rows = list(tbl.iter(_w('tr')))
+        texts = [''.join(t.text or '' for t in c.iter(_w('t')))
+                 for c in rows[0].iter(_w('tc'))]
+        self.assertEqual(texts, ['a & b', '< c >'])
+
+    def test_table_document_xml_is_valid(self):
+        """document.xml 必须能被 ElementTree 解析（Word 打不开的最常见原因）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.TABLE_MD, tmp)
+        self.assertTrue(root.tag.endswith('document'))
+
+    def test_table_zip_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, 'tbl.docx')
+            export.to_docx(self.TABLE_MD, out)
+            with zipfile.ZipFile(out) as zf:
+                self.assertIsNone(zf.testzip())
+
+    def test_all_parts_valid_with_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, 'all.docx')
+            export.to_docx('# 标题\n\n' + self.TABLE_MD + '\n- 条目\n', out)
+            with zipfile.ZipFile(out) as zf:
+                for name in zf.namelist():
+                    if name.endswith('.xml') or name.endswith('.rels'):
+                        try:
+                            ET.fromstring(zf.read(name))
+                        except ET.ParseError as e:
+                            self.fail(f'{name} 不是合法 XML：{e}')
+
+    def test_body_ends_with_sectpr(self):
+        """<w:body> 最后一个子元素必须是 <w:sectPr>，否则 Word 会提示修复。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.TABLE_MD, tmp)
+        body = root.find(_w('body'))
+        self.assertEqual(list(body)[-1].tag, _w('sectPr'))
+
+    def test_table_keeps_original_order(self):
+        """表格必须按原文顺序混排在标题/段落之间，不能被挪到末尾。"""
+        md = ('# 标题\n\n'
+              '表格前的一段\n\n'
+              '| a | b |\n|---|---|\n| 1 | 2 |\n\n'
+              '表格后的一段\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml(md, tmp)
+        i_head = doc.index('标题')
+        i_before = doc.index('表格前的一段')
+        i_tbl = doc.index('<w:tbl>')
+        i_after = doc.index('表格后的一段')
+        self.assertLess(i_head, i_before)
+        self.assertLess(i_before, i_tbl)
+        self.assertLess(i_tbl, i_after)
+
+    def test_two_tables_in_order(self):
+        md = ('| a | b |\n|---|---|\n| 1 | 2 |\n\n'
+              '中间段落\n\n'
+              '| c | d |\n|---|---|\n| 3 | 4 |\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(md, tmp)
+        tbls = list(root.iter(_w('tbl')))
+        self.assertEqual(len(tbls), 2)
+        # 两个表格之间必须有段落（Word 要求）
+        body = root.find(_w('body'))
+        children = [c.tag for c in body]
+        tbl_idx = [i for i, t in enumerate(children) if t == _w('tbl')]
+        self.assertEqual(len(tbl_idx), 2)
+        self.assertGreater(tbl_idx[1] - tbl_idx[0], 1)
+
+    def test_lone_pipe_row_stays_paragraph(self):
+        """没有分隔行的孤立 | 行仍然走原来的制表符段落（向后兼容）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml('| a | b |\n', tmp)
+        self.assertNotIn('<w:tbl>', doc)
+        self.assertIn('<w:tab/>', doc)
+
+    def test_separator_row_without_header_dropped(self):
+        """孤立的 |---|---| 行被丢弃，不产生表格。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml('|---|---|\n', tmp)
+        self.assertNotIn('<w:tbl>', doc)
+
+    def test_horizontal_rule_kept_as_paragraph(self):
+        """正文里的 '---' 水平分隔线不是表格分隔行，必须保留。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml('前\n\n---\n\n后\n', tmp)
+        self.assertNotIn('<w:tbl>', doc)
+        self.assertIn('---', doc)
+
+    def test_pipe_row_followed_by_horizontal_rule_not_a_table(self):
+        """`| a | b |` 后面跟纯 '---'（水平线）不构成表格。
+
+        Markdown 的表头分隔行必须含竖线，纯 '---' 是水平分隔线；
+        混为一谈会把正文里的水平线吃掉。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml('| a | b |\n\n---\n\n后\n', tmp)
+        self.assertNotIn('<w:tbl>', doc)
+        self.assertIn('<w:tab/>', doc)
+
+    def test_alignment_colons_accepted_as_separator(self):
+        """带对齐冒号的分隔行（|:---|---:|）要能识别成表格。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml('| a | b |\n|:---|---:|\n| 1 | 2 |\n', tmp)
+        tbls = list(root.iter(_w('tbl')))
+        self.assertEqual(len(tbls), 1)
+        self.assertEqual(len(list(tbls[0].iter(_w('tr')))), 2)
+
+    def test_evidence_markdown_becomes_table(self):
+        """evidence_markdown 的输出（证据表）应直接变成 Word 表格。"""
+        md = export.evidence_markdown([PAPER], [EVIDENCE])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(md, tmp)
+        tbls = list(root.iter(_w('tbl')))
+        self.assertEqual(len(tbls), 1)
+        rows = list(tbls[0].iter(_w('tr')))
+        # 1 表头 + 1 数据行
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(list(rows[0].iter(_w('tc')))), 9)
+
+    def test_table_with_only_header(self):
+        """只有表头没有数据行，也要生成合法的表格。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml('| a | b |\n|---|---|\n', tmp)
+        tbl = next(root.iter(_w('tbl')))
+        self.assertEqual(len(list(tbl.iter(_w('tr')))), 1)
+
+
+class TestDocxRegression(unittest.TestCase):
+    """不含表格的 Markdown，转换结果必须与改造前一致。"""
+
+    PLAIN = '# 标题\n\n## 二级\n\n### 三级\n\n正文一段。\n\n- 条目一\n- 条目二\n\n**粗体**与普通\n'
+
+    def test_plain_markdown_structure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = _read_doc_xml(self.PLAIN, tmp)
+        self.assertNotIn('<w:tbl>', doc)
+        self.assertIn('Heading1', doc)
+        self.assertIn('Heading2', doc)
+        self.assertIn('Heading3', doc)
+        self.assertIn('ListParagraph', doc)
+        self.assertIn('• ', doc)
+        self.assertIn('<w:b/>', doc)
+
+    def test_plain_markdown_body_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.PLAIN, tmp)
+        body = root.find(_w('body'))
+        tags = [c.tag for c in body]
+        self.assertEqual(tags[-1], _w('sectPr'))
+        self.assertEqual(tags.count(_w('tbl')), 0)
+        # 3 个标题 + 1 段正文 + 2 个列表 + 1 段粗体 = 7 个段落
+        self.assertEqual(tags.count(_w('p')), 7)
+
+    def test_plain_markdown_document_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _parse_doc_xml(self.PLAIN, tmp)
+        self.assertTrue(root.tag.endswith('document'))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

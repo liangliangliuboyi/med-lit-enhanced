@@ -153,6 +153,11 @@ def _europepmc_to_record(r: dict) -> dict | None:
         if not journal:
             journal = (ji.get('journal') or {}).get('medlineAbbreviation', '') or ''
     year = str(r.get('pubYear') or '').strip()
+    # P7：部分预印本平台（如 Research Square）的 pubYear 不准，
+    # firstPublicationDate 更接近真实首次公开时间，优先用它。
+    fpd = str(r.get('firstPublicationDate') or '').strip()
+    if len(fpd) >= 4 and fpd[:4].isdigit():
+        year = fpd[:4]
     ptypes = [t for t in (r.get('pubTypeList') or {}).get('pubType', []) if t]
     return {
         'id': ident,

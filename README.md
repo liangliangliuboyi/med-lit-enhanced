@@ -52,16 +52,18 @@ cd medlit-agent
 
 ```bash
 cd <装好的目录>
-python scripts/ask.py --doctor
+python scripts/ask.py --doctor          # 人看的报告
+python scripts/ask.py --doctor-json     # 机器读的结构化清单
 ```
 
-它会逐项检查并给出**可执行的补救说明**（缺什么、写到哪、怎么拿）：
+这个工具需要几项**只有你本人能提供**的信息。体检会逐项检查，对必填项还会附一句"该怎么问"：
 
 ```
-[✓] 模型服务密钥
+[✓] 模型服务密钥（必填）
       已配置（SILICONFLOW_API_KEY）
-[·] NCBI API key（选填）
-      未配置，限速 3 请求/秒（功能正常，只是稍慢）
+[!] NCBI 邮箱（必填，须填你自己的）
+      缺少 NCBI 邮箱（首次使用必须填你自己的）：…
+      该怎么问：请提供你自己的邮箱。它会写进 NCBI 请求里…
 ```
 
 **2. 填密钥。** 装好的目录里会有一个 `.env`（由 `.env.example` 生成）：
@@ -69,8 +71,11 @@ python scripts/ask.py --doctor
 ```
 SILICONFLOW_API_KEY=你的模型服务密钥     # 必填
 NCBI_API_KEY=你的NCBI密钥               # 选填，有则限速 3/s → 10/s
-NCBI_EMAIL=你的邮箱                     # 建议填（NCBI 规定这里填开发者邮箱）
+NCBI_EMAIL=你的邮箱                     # 必填，必须是你自己的
 ```
+
+> NCBI 要求登记使用者的邮箱：万一有人违规使用这个工具导致你的 IP 被限流，
+> NCBI 需要能联系到你本人。**工具不会替你填写，也不要填别人的邮箱。**
 
 或者让向导代填：`python scripts/ask.py --setup`（采集并写入 `.env`，自动自检）。
 
@@ -109,10 +114,14 @@ python scripts/ask.py "GLP-1 受体激动剂对青少年肥胖的效果如何？
 | 引用可靠性 | 靠模型自觉写引用 | **参考文献由脚本生成，模型无权写**；正文引用逐条校验（PubMed 用 `[PMID:xxx]`、预印本用 `[DOI:xxx]`），越界即报警 |
 | 可复现性 | 通常只给一段对话 | **11 个文件留痕**：检索式、题录、证据、审查意见、PRISMA 流程、模型命中、耗时 |
 | 循证规范 | 无 | **GRADE 确定性分级（程序机械定级 + 模型复核）+ PRISMA 流程计数**，可直接用于系统评价的方法学部分 |
+| 引用是否名副其实 | 只查 PMID 在不在池里 | **逐条核对"这篇真的支持这句话吗"**（语义比对，不支持的论断单独列出）；相关度由**两个模型交叉打分**取平均，分歧大的单独标记 |
+| 结论完整性 | 靠模型自觉 | 答案八段结构**程序校验**，缺段或关键段无引用会**自动重写**；正文还必须交代"检索覆盖了什么、没覆盖什么" |
 | 证据把关 | 无 | **撤稿文献自动拦截并标注**；**偏倚评估要素**结构化抽取；**PICO 匹配度**区分直接/间接证据；**预印本单独标记且证据等级下调** |
 | 效应量 | 各说各的 | 同指标自动**合并效应量**（逆方差加权 + I² 异质性 + 随机效应敏感性） |
+| 横向对比 | 跑两次人工对比 | `**--compare "A" "B"**` 并排给出证据量、GRADE、效应量、直接证据占比 |
 | 漏检 | 只做关键词检索 | **检索式命中 0 自动修订重试** + **被引/相似文献链接扩展** + **引文滚雪球** + 年份下限自适应 + **Europe PMC 预印本**（`--preprints`） |
 | 检索范围 | 常常默认限定某些刊 | **全 PubMed，不限刊源、不限学科**——不同专业背景都能用 |
+| 成本 | 不知道花了多少 | 按模型分档计价，每次运行输出 token 与估算费用；检索结果**本地缓存**，重复检索不重复打 API |
 | 安装成本 | `pip install biopython httpx ...` | **零第三方依赖**，`git clone` 就能跑 |
 | 服务端点 | 绑定单一厂商 | **任意 OpenAI 兼容端点**，rerank 可选 |
 
@@ -165,6 +174,7 @@ python scripts/ask.py "问题" --export bib                 # 顺带导出 BibTe
 python scripts/ask.py "问题" --export ris                 # 顺带导出 RIS（EndNote/Zotero 可导入）
 python scripts/ask.py "问题" --export docx                # 顺带导出 Word
 python scripts/ask.py "问题" --export notes               # 顺带导出 Zotero 笔记
+python scripts/ask.py --compare "司美格鲁肽" "替尔泊肽"   # 两个干预横向对比
 python scripts/ask.py --resume runs/20261105-1830_xxx     # 断点续跑
 python scripts/ask.py "问题" --reuse-plan runs/xxx/02_plan.json   # 复用检索式
 python scripts/ask.py "问题" --cq prognosis.narrow        # 按研究设计筛

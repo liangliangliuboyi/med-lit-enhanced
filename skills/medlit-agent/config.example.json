@@ -19,8 +19,8 @@
   "pubmed": {
     "api_key_env": "NCBI_API_KEY",
     "tool": "medlit-agent",
-    "email": "3352292450@qq.com",
-    "_comment": "tool 是项目级标识；email 按 NCBI 规定填「软件开发者」的邮箱（不是终端使用者的），使用者可在自己的 config.json 里改成自己的。不填也能用，只是 NCBI 无法联系到作者。"
+    "email": "",
+    "_comment": "email 必须由使用者填自己的邮箱（NCBI 要求：一旦有人违规使用导致 IP 被限流，需要能联系到本人）。不要填别人的邮箱。首次运行 ask.py 会检查这一项并主动提醒补齐；也可用 --setup 由向导采集。"
   },
   "models": {
     "chain": {
@@ -75,16 +75,27 @@
       "Letter",
       "News",
       "Published Erratum",
-      "Retraction of Publication"
+      "Retraction of Publication",
+      "Retracted Publication",
+      "Preprint",
+      "Duplicate of the same article",
+      "Comment on a Article"
     ],
     "exclude_animals": true,
+    "languages": [
+      "english"
+    ],
     "expand_by_links": true,
     "expand_by_references": true,
     "max_link_expansion": 15,
     "max_snowball_titles": 3,
     "include_preprints": false,
     "preprint_limit": 15,
-    "max_revisions": 2
+    "max_revisions": 2,
+    "rewrite_on_structure_fail": true,
+    "cross_check_relevance": true,
+    "verify_claims": true,
+    "claim_check_limit": 12
   },
   "runtime": {
     "timeout": 180,

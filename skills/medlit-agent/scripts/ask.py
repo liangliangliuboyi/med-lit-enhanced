@@ -59,28 +59,63 @@ def cmd_models(cfg):
           f"（enabled={rr.get('enabled')}）")
 
 
-def cmd_doctor():
+def cmd_doctor(as_json: bool = False):
     """环境体检：把「缺什么、怎么补」一次说清楚。"""
+    items = cfgmod.doctor()
+    if as_json:
+        print(json.dumps({'items': items,
+                          'missing_required': cfgmod.missing_user_items()},
+                         ensure_ascii=False, indent=2))
+        return 0
     print('=' * 66)
     print('环境体检')
     print('=' * 66)
     missing = []
-    for it in cfgmod.doctor():
-        mark = '✓' if it['ok'] else '·'
+    for it in items:
+        mark = '✓' if it['ok'] else ('!' if it.get('required') else '·')
         print(f'[{mark}] {it["item"]}')
         detail = str(it['detail'])
         if it['ok']:
             print(f'      {detail}')
         else:
             print(detail)
-            missing.append(it['item'])
+            if it.get('required'):
+                missing.append(it)
     print('=' * 66)
     if missing:
-        print(f'有 {len(missing)} 项需要补：' + '、'.join(missing))
-        print('运行 `python scripts/ask.py --setup` 可以由向导代填。')
+        print(f'有 {len(missing)} 项必须由你自己提供（工具不会替你填写）：')
+        for it in missing:
+            print(f'  · {it["item"]}')
+            if it.get('ask'):
+                print(f'    该怎么问：{it["ask"]}')
+        print('\n运行 `python scripts/ask.py --setup` 可以由向导采集并写入 .env。')
         return 1
     print('环境齐备，可以正常使用。')
     return 0
+
+
+def first_run_notice():
+    """首次使用提示：把「必须由使用者自己提供」的信息列在最显眼的位置。
+
+    这一段会出现在每次运行的输出开头——智能体读到它就知道该先去问用户要什么，
+    而不是自己编一个值填进去。
+    """
+    miss = cfgmod.missing_user_items()
+    if not miss:
+        return ''
+    lines = ['', '=' * 66,
+             '⚠️  首次使用提示：以下信息需要你自己提供，工具不会替你填写',
+             '=' * 66]
+    for i, it in enumerate(miss, 1):
+        lines.append(f'{i}. {it["item"]}')
+        if it.get('ask'):
+            lines.append(f'   {it["ask"]}')
+        lines.append(f'   填写方式：{it.get("how", "")}'.rstrip())
+    lines.append('')
+    lines.append('   或者运行 `python scripts/ask.py --setup` 由向导采集并自动写入 .env。')
+    lines.append('=' * 66)
+    lines.append('')
+    return '\n'.join(lines)
 
 
 def cmd_setup():
@@ -117,15 +152,18 @@ def cmd_setup():
         print('   ✗ 没有填密钥，无法继续。稍后可以随时运行 --setup 补上。')
         return 1
 
-    print('\n③ NCBI API key（选填）')
+    print('\n③ 你的邮箱（必填，必须是你自己的）')
+    print('   NCBI 要求登记使用者的邮箱：万一有人违规使用这个工具导致你的 IP 被 NCBI 限流，')
+    print('   NCBI 需要能联系到你。工具不会替你填写，也不会填别人的邮箱。')
+    email = _ask('   你的邮箱', default='')
+    if not email:
+        print('   ✗ 没填邮箱。首次使用必须填自己的邮箱，稍后可以随时补。')
+        return 1
+
+    print('\n④ NCBI API key（选填）')
     print('   没有也能用，只是限速 3 请求/秒；申请：'
           'https://www.ncbi.nlm.nih.gov/account/settings/')
     ncbi_key = _ask('   NCBI API Key（可留空）', default='')
-
-    print('\n④ 你的邮箱（选填，强烈建议）')
-    print('   NCBI 规定这里填「软件开发者」的邮箱：万一这个软件被违规使用导致 IP 被封，'
-          'NCBI 需要能联系到作者。使用者也可以在 config.json 里改成自己的。')
-    email = _ask('   邮箱（可留空）', default='')
 
     env_name = 'SILICONFLOW_API_KEY' if key == 'siliconflow' else 'OPENAI_COMPATIBLE_API_KEY'
     values = {env_name: api_key}
@@ -271,6 +309,59 @@ def cmd_chat(cfg, args):
     return 0
 
 
+def cmd_compare(cfg, args):
+    """N5：两个干预的横向对比。
+
+    分别跑两轮完整检索，然后并排给出：证据量、研究设计、GRADE 确定性、
+    关键效应量、直接证据占比，以及差异说明与措辞谨慎的结论。
+    """
+    import compare as comparemod
+
+    arms = []
+    for label in args.compare:
+        print(f'\n===== 检索「{label}」 =====')
+        q = f'{args.question} {label}' if args.question else label
+        run = pipeline.Run(q, args.constraints, cfg, cq_explicit=_cq_list(args))
+        out_dir = run.execute(quick=args.quick)
+        arms.append({
+            'label': label,
+            'evidence': run.evidence,
+            'pooled': run.pooled,
+            'grading': run.mech_grading,
+            'query': run.plan.get('core_question_en', ''),
+            'dir': out_dir,
+        })
+        print(f'  → 纳入 {len(run.evidence)} 篇，'
+              f'GRADE {run.mech_grading.get("certainty", "未评估")}')
+
+    table = comparemod.build_comparison(arms, args.question or '')
+    summary = comparemod.compare_summary(arms)
+    wording = comparemod.recommend_wording(arms)
+
+    out_dir = os.path.join(os.path.abspath(
+        cfg['paths'].get('runs_root') or './runs'),
+        comparemod.comparison_dir_name(args.question or ' '.join(args.compare)))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, 'comparison.md'), 'w', encoding='utf-8') as f:
+        f.write('# 干预横向对比\n\n')
+        f.write(table + '\n\n')
+        f.write('## 结论措辞\n\n' + wording + '\n')
+    for arm in arms:
+        if arm.get('dir'):
+            with open(os.path.join(out_dir, f'evidence_{arm["label"]}.md'),
+                      'w', encoding='utf-8') as f:
+                f.write(run.evidence_table() + '\n')
+    with open(os.path.join(out_dir, 'comparison.json'), 'w', encoding='utf-8') as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print('\n' + '=' * 70)
+    print('对比结果：', out_dir)
+    print('=' * 70)
+    print(table)
+    print('\n结论措辞：\n' + wording)
+    return 0
+
+
 def _cq_list(args):
     if not args.cq:
         return []
@@ -337,12 +428,16 @@ def main():
     ap.add_argument('--preprints', action='store_true', help='同时检索 bioRxiv/medRxiv 预印本')
     ap.add_argument('--export', choices=['bib', 'ris', 'notes', 'docx'],
                     help='跑完后额外导出参考文献或笔记')
+    ap.add_argument('--compare', nargs=2, metavar=('A', 'B'),
+                    help='横向对比两个干预：分别检索后输出对照表与各自的 GRADE')
     ap.add_argument('--reuse-plan', metavar='FILE',
                     help='复用上次保存的检索式（02_plan.json），不重新规划')
     ap.add_argument('--resume', metavar='DIR', help='从上次运行的目录断点续跑')
     ap.add_argument('--chat', action='store_true', help='连续提问模式')
     ap.add_argument('--setup', action='store_true', help='首次配置向导')
     ap.add_argument('--doctor', action='store_true', help='环境体检：缺什么、怎么补')
+    ap.add_argument('--doctor-json', action='store_true',
+                    help='环境体检的 JSON 输出（供智能体解析后逐项向用户询问）')
     ap.add_argument('--models', action='store_true', help='打印模型路由链')
     ap.add_argument('--list-cq', action='store_true', help='列出可用的临床查询过滤器')
     ap.add_argument('--pubmed-only', metavar='TERM', help='只检索 PubMed，不调模型')
@@ -353,6 +448,8 @@ def main():
 
     if args.setup:
         return cmd_setup()
+    if args.doctor_json:
+        return cmd_doctor(as_json=True)
     if args.doctor:
         return cmd_doctor()
     if args.list_cq:
@@ -372,12 +469,25 @@ def main():
     if args.chat:
         return cmd_chat(cfg, args)
 
+    if args.compare:
+        if not args.question:
+            args.question = '比较两种干预的疗效与安全性证据'
+        return cmd_compare(cfg, args)
+
     if not args.question:
         ap.print_help()
         return 2
 
+    # ---- 首次使用提示：必须由使用者自己提供的信息，放在输出最显眼处 ----
+    notice = first_run_notice()
+    if notice:
+        print(notice)
+
     # ---- 参数覆盖配置 ----
     if args.quick:
+        # N11：快速模式只关掉「第二轮扩写」与两种链接扩展，
+        # **保留检索式质量闸门**（max_revisions）——检索式写歪了才是最大的坑，
+        # 快速模式同样要能自我修正。
         cfg['retrieval'].update({'rounds': 1, 'retmax_per_query': 12,
                                  'max_papers': 4, 'fulltext_limit': 2,
                                  'expand_by_links': False, 'expand_by_references': False})

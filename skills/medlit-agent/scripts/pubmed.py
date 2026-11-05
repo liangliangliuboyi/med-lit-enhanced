@@ -318,6 +318,20 @@ def apply_animal_exclusion(term: str, enabled: bool = True) -> str:
     return f'({term}) AND {ANIMAL_EXCLUSION}'
 
 
+# ---------- 语种限制 ----------
+def apply_language_filter(term: str, languages: list[str]) -> str:
+    """按语种限制检索范围（PubMed 的 [la] 字段）。
+
+    默认只留英文：PubMed 收录了大量非英文文献，不限制会稀释精读名额。
+    传空列表即可关闭。
+    """
+    langs = [str(x).strip().lower() for x in (languages or []) if str(x).strip()]
+    if not langs:
+        return term
+    parts = ' OR '.join(f'{x}[la]' for x in langs)
+    return f'({term}) AND ({parts})'
+
+
 # ---------- 研究论文判定（程序侧，不用检索式） ----------
 def is_research_article(p: dict, exclude: list[str] | None = None,
                         min_abstract: int = 300) -> bool:

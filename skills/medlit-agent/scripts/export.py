@@ -403,23 +403,30 @@ def _xesc(text: str) -> str:
     return html.escape(_XML_ILLEGAL.sub('', text), quote=False)
 
 
-def _runs(text: str) -> str:
+def _runs(text: str, force_bold: bool = False) -> str:
     """把一行文字转成 w:r 序列，并识别 **粗体**。
 
     只处理粗体：这是本项目自己产出的 Markdown 里唯一会用到的行内标记，
     再多就是过度设计。
+
+    force_bold=True 时整段文字都加粗——表头单元格要用它。
     """
     out = []
     pos = 0
     for m in _BOLD.finditer(text):
         if m.start() > pos:
-            out.append(f'<w:r><w:t xml:space="preserve">{_xesc(text[pos:m.start()])}</w:t></w:r>')
-        out.append(f'<w:r><w:rPr><w:b/></w:rPr>'
-                   f'<w:t xml:space="preserve">{_xesc(m.group(1))}</w:t></w:r>')
+            out.append(_run(text[pos:m.start()], force_bold))
+        out.append(_run(m.group(1), True))
         pos = m.end()
     if pos < len(text):
-        out.append(f'<w:r><w:t xml:space="preserve">{_xesc(text[pos:])}</w:t></w:r>')
+        out.append(_run(text[pos:], force_bold))
     return ''.join(out)
+
+
+def _run(text: str, bold: bool = False) -> str:
+    """单个 w:r（文本 run）。bold=True 时带 <w:rPr><w:b/></w:rPr>。"""
+    rpr = '<w:rPr><w:b/></w:rPr>' if bold else ''
+    return f'<w:r>{rpr}<w:t xml:space="preserve">{_xesc(text)}</w:t></w:r>'
 
 
 def _paragraph(style: str | None, content: str) -> str:
@@ -427,27 +434,173 @@ def _paragraph(style: str | None, content: str) -> str:
     return f'<w:p>{ppr}{content}</w:p>'
 
 
+# ---------------- Markdown 表格 → OOXML 表格 ----------------
+# 表格相关：列宽按 A4 正文可用宽度平分
+# A4 页宽 11906 twips，左右页边距各 1440，正文可用 9026
+_USABLE_WIDTH_DXA = 9026
+
+# 分隔行的字符集：只允许 - : | 和空白
+_SEP_CHARS = set('-:| \t')
+
+# 单线边框，六个方向（外框 4 个 + 内部 2 个）
+_TABLE_BORDERS = ('<w:tblBorders>'
+                  '<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+                  '<w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+                  '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+                  '<w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+                  '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+                  '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>'
+                  '</w:tblBorders>')
+
+
+def _split_md_row(line: str) -> list[str]:
+    """把一行 Markdown 表格行拆成单元格列表（去掉首尾竖线，逐格 trim）。"""
+    s = line.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|'):
+        s = s[:-1]
+    return [c.strip() for c in s.split('|')]
+
+
+def _is_pipe_row(line: str) -> bool:
+    """是不是一行"以 | 开头并以 | 结尾"的 Markdown 表格行。"""
+    s = line.strip()
+    return len(s) >= 2 and s.startswith('|') and s.endswith('|')
+
+
+def _is_sep_row(line: str) -> bool:
+    """是不是 Markdown 表格的分隔行（|---|---|、|:---:| 等）。
+
+    判据：整行只由 - : | 和空白组成，且至少有一个 '-' 和一个 '|'。
+    要求必须有 '|'，是为了不和 Markdown 的水平分隔线 '---' 混淆——
+    '| a | b |' 后面跟一行 '---' 不是表格，是表格 + 水平线。
+    这个判据只用于"表头行的下一行是不是分隔行"这一处判定。
+    """
+    s = line.strip()
+    if not s or '-' not in s or '|' not in s:
+        return False
+    return not (set(s) - _SEP_CHARS)
+
+
+def _is_sep_pipe_row(line: str) -> bool:
+    """是不是"纯竖线包裹的"分隔行（|---|---|）。
+
+    单独出现的这种行只是 Markdown 的表头装饰，转成 Word 后没有意义，
+    直接丢掉。判定比 _is_sep_row 严格，是为了不误伤正文里的 '---'
+    这类水平分隔线（它没有竖线，保留成普通段落）。
+    """
+    s = line.strip()
+    if not _is_pipe_row(s):
+        return False
+    cells = _split_md_row(s)
+    return bool(cells) and all(re.fullmatch(r':?-+:?', c) for c in cells)
+
+
+def _cell_text(text: str) -> str:
+    """单元格文本：换行压成空格（XML 1.0 的 w:t 不含换行）。"""
+    return re.sub(r'\s*\n\s*', ' ', text or '').strip()
+
+
+def _table_xml(header: list[str], rows: list[list[str]]) -> str:
+    """生成真正的 OOXML 表格（<w:tbl>）。
+
+    为什么手写而不是用 python-docx：本项目零第三方依赖是硬约束，
+    装了 python-docx 的机器和没装的机器行为会不一致，所以这里用标准库
+    直接拼 OOXML。
+
+    结构（顺序有严格要求，Word 对 tblPr / tblGrid / tr 的次序敏感）：
+        w:tbl
+          w:tblPr   宽度 + 边框 + 固定布局
+          w:tblGrid 列宽网格（CT_Tbl 要求必须有）
+          w:tr      表头行带 w:tblHeader（跨页重复标题行）
+            w:tc    每格带 w:tcW（列宽），至少含一个 w:p
+    """
+    ncols = max(1, len(header))
+    # 列宽严格平分（余数不补给最后一列，否则各列宽度不等，表格看着歪）
+    # 表格总宽另由 <w:tblW> 按 100% 给，不依赖这里的 dxa 累加
+    widths = [_USABLE_WIDTH_DXA // ncols] * ncols
+
+    grid = ''.join(f'<w:gridCol w:w="{w}"/>' for w in widths)
+
+    def _row(cells: list[str], is_header: bool) -> str:
+        trpr = '<w:trPr><w:tblHeader/></w:trPr>' if is_header else ''
+        tcs = []
+        for i in range(ncols):
+            raw = cells[i] if i < len(cells) else ''
+            text = _cell_text(raw)
+            if text:
+                runs = _runs(text, force_bold=is_header)
+                content = f'<w:p>{runs}</w:p>'
+            else:
+                content = '<w:p></w:p>'
+            tcs.append(f'<w:tc><w:tcPr><w:tcW w:w="{widths[i]}" w:type="dxa"/>'
+                       f'</w:tcPr>{content}</w:tc>')
+        return f'<w:tr>{trpr}{"".join(tcs)}</w:tr>'
+
+    body = _row(header, True) + ''.join(_row(r, False) for r in rows)
+
+    return ('<w:tbl><w:tblPr>'
+            '<w:tblW w:w="5000" w:type="pct"/>'
+            + _TABLE_BORDERS +
+            '<w:tblLayout w:type="fixed"/>'
+            '</w:tblPr>'
+            f'<w:tblGrid>{grid}</w:tblGrid>'
+            f'{body}</w:tbl>')
+
+
 def _md_to_paragraphs(markdown_text: str) -> str:
-    """Markdown 行 → OOXML 段落。
+    """Markdown 行 → OOXML 正文片段（段落 + 表格，按原文顺序混排）。
 
     映射规则：
     - `# / ## / ###` → Heading1/2/3
     - `- ` 开头 → 列表样式段落（缩进 + 项目符号字符，不依赖 numbering.xml）
-    - `| a | b |` → 用制表符分隔的段落（真正的 Word 表格要 numbering/tbl 一大套，
-      性价比不高；用制表位排版在 Word 里照样能对齐）
+    - Markdown 表格（表头行 + 下一行是分隔行）→ 真正的 Word 表格 w:tbl
+    - 孤立的 `| a | b |` 行（后面没有分隔行）→ 制表符分隔的段落
     - 其余 → 普通段落
+
+    表格用真表格而不是制表符：读者在 Word 里需要能选中、排序、复制单元格，
+    制表符排版只是"看起来像表格"。
     """
+    lines = (markdown_text or '').split('\n')
     out = []
-    for raw in (markdown_text or '').split('\n'):
-        line = raw.rstrip()
-        stripped = line.strip()
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+
         if not stripped:
+            i += 1
+            continue
+
+        # ---- 表格：表头行 + 下一行是分隔行 ----
+        if (_is_pipe_row(stripped) and i + 1 < n
+                and _is_sep_row(lines[i + 1].strip())):
+            header = _split_md_row(stripped)
+            i += 2  # 跳过表头与分隔行
+            rows = []
+            while i < n:
+                nxt = lines[i].strip()
+                if not nxt or not _is_pipe_row(nxt):
+                    break
+                rows.append(_split_md_row(nxt))
+                i += 1
+            out.append(_table_xml(header, rows))
+            # 表格后面必须跟一个段落：Word 要求表格之间/表格之后有 <w:p>，
+            # 否则打开时会提示"文件已损坏"。
+            out.append('<w:p></w:p>')
+            continue
+
+        # ---- 孤立的分隔行（没有表头）：Markdown 的表头装饰，转成 Word 后没意义 ----
+        if _is_sep_pipe_row(stripped):
+            i += 1
             continue
 
         heading = re.match(r'^(#{1,3})\s+(.*)$', stripped)
         if heading:
             level = len(heading.group(1))
             out.append(_paragraph(f'Heading{level}', _runs(heading.group(2))))
+            i += 1
             continue
 
         bullet = re.match(r'^[-*+]\s+(.*)$', stripped)
@@ -456,22 +609,22 @@ def _md_to_paragraphs(markdown_text: str) -> str:
             content = (f'<w:r><w:t xml:space="preserve">• </w:t></w:r>'
                        + _runs(bullet.group(1)))
             out.append(_paragraph('ListParagraph', content))
+            i += 1
             continue
 
-        if stripped.startswith('|') and stripped.endswith('|'):
-            cells = [c.strip() for c in stripped.strip('|').split('|')]
-            # 表格分隔行（|---|---|）只是 Markdown 的表头装饰，转成 Word 后没有意义
-            if cells and all(re.fullmatch(r':?-{2,}:?', c) for c in cells):
-                continue
+        if _is_pipe_row(stripped):
+            cells = _split_md_row(stripped)
             pieces = []
-            for i, cell in enumerate(cells):
-                if i:
+            for idx, cell in enumerate(cells):
+                if idx:
                     pieces.append('<w:r><w:tab/></w:r>')
                 pieces.append(_runs(cell))
             out.append(_paragraph(None, ''.join(pieces)))
+            i += 1
             continue
 
         out.append(_paragraph(None, _runs(stripped)))
+        i += 1
     return ''.join(out)
 
 
