@@ -16,9 +16,10 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
+import json
+
 import config as cfgmod
 import pipeline
-import presets as pmod
 import pubmed as pm
 import sf
 
@@ -83,27 +84,34 @@ def main():
 
     check('配置读取', t_config)
 
-    def t_presets():
-        ps = pmod.list_presets()
-        if not ps:
-            raise RuntimeError('没有读到任何预设')
-        pid, score, hits = pmod.detect('GLP-1 受体激动剂对青少年肥胖的效果')
-        if pid != 'diabetes-metabolism':
-            raise RuntimeError(f'预设自动识别异常：得到 {pid}')
-        return f'{len(ps)} 个预设；自动识别 → {pid}（{score} 分，命中 {hits[:3]}）'
-
-    check('学科域预设', t_presets)
-
     def t_cq():
-        cq = pmod.load_clinical_queries()
+        path = os.path.join(cfgmod.ROOT, 'data', 'clinical_queries.json')
+        try:
+            with open(path, encoding='utf-8') as f:
+                cq = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f'Clinical Queries 表读取失败：{e}')
+        cq = {k: v for k, v in cq.items() if not k.startswith('_')}
         if 'therapy.narrow' not in cq:
             raise RuntimeError('Clinical Queries 表缺失')
-        prof = pmod.load_journal_profile('clinical', 'ta')
-        if 'N Engl J Med' not in prof:
-            raise RuntimeError('临床期刊画像缺失 NEJM')
-        return f'{len(cq)} 个过滤器；临床期刊画像 {len(prof)} 本'
+        return f'{len(cq)} 个过滤器（默认不启用，需 --cq 显式指定）'
 
-    check('期刊画像与临床查询', t_cq)
+    check('临床查询过滤器表', t_cq)
+
+    def t_no_restriction():
+        """必须确保没有刊源或学科限制残留。"""
+        run = pipeline.Run.__new__(pipeline.Run)
+        import pipeline as _pl
+        src = open(_pl.__file__, encoding='utf-8').read()
+        for bad in ('journal_clause', 'journal_profiles', 'preset_id', 'pmod.'):
+            if bad in src:
+                raise RuntimeError(f'pipeline.py 仍残留限制逻辑：{bad}')
+        j = cfg.get('retrieval', {}).get('journals')
+        if j:
+            raise RuntimeError('config 里仍有 journals 限制块')
+        return '无刊源限制、无学科预设残留'
+
+    check('检索范围无限制', t_no_restriction)
 
     prov = cfg.get('provider') or {}
     p = sf.Provider(prov.get('name', 'provider'), prov.get('base_url', ''),

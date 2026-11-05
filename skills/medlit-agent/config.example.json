@@ -1,5 +1,5 @@
 {
-  "_comment": "配置模板。复制为 config.json 后可自由修改；密钥请写进 .env 或系统环境变量，不要写在这里。config.local.json 可覆盖本文件的任意字段（已 gitignore）。",
+  "_comment": "配置模板。复制为 config.json 后可自由修改；密钥请写进 .env 或系统环境变量，不要写在这里。config.local.json 可覆盖本文件的任意字段（已 gitignore）。检索范围固定为全 PubMed，不做刊源或学科限制。",
 
   "provider": {
     "name": "siliconflow",
@@ -79,13 +79,7 @@
       "News",
       "Published Erratum",
       "Retraction of Publication"
-    ],
-    "journals": {
-      "enabled": false,
-      "mode": "ta",
-      "profile": "clinical",
-      "list": []
-    }
+    ]
   },
 
   "runtime": {

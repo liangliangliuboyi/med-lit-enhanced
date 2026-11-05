@@ -15,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import config as cfgmod
-import presets as pmod
 import prompts
 import pubmed as pm
 import sf
@@ -53,18 +52,12 @@ def _json_load(text: str):
 
 class Run:
     def __init__(self, question: str, constraints: str = '', cfg: dict | None = None,
-                 preset_id: str | None = None, no_preset: bool = False,
                  cq_explicit: list[str] | None = None):
         self.cfg = cfg or cfgmod.load_config()
         self.question = (question or '').strip()
         self.constraints = (constraints or '').strip()
         self.t0 = time.time()
         self.stamp = datetime.now().strftime('%Y%m%d-%H%M')
-
-        # ---- 学科域预设 ----
-        self.preset_id, self.preset, self.preset_hits = pmod.resolve(
-            self.question, self.constraints, preset_id, no_preset)
-        pmod.apply_to_config(self.cfg, self.preset)
 
         # ---- 输出目录 ----
         root = self.cfg['paths'].get('runs_root') or './runs'
@@ -89,11 +82,9 @@ class Run:
             email=self.cfg['pubmed'].get('email', ''),
         )
 
-        # ---- 期刊与 Clinical Query ----
-        self.journal_names = self._resolve_journals()
-        self.cq_all = pmod.load_clinical_queries()
+        # ---- Clinical Query（仅在用户显式指定时启用）----
+        self.cq_all = self._load_cq()
         self.cq_explicit = list(cq_explicit or [])
-        self.cq_allowed = self._resolve_cq_allowed()
         self.cq_used: list[str] = []
         self.search_failed = False
 
@@ -114,13 +105,9 @@ class Run:
             'question': self.question, 'constraints': self.constraints,
             'timings': {}, 'models': {}, 'errors': [], 'counts': {},
             'provider': {'name': self.provider.name, 'base_url': self.provider.base},
-            'preset': {'id': self.preset_id, 'name': self.preset.get('name'),
-                       'matched_keywords': self.preset_hits},
-            'scope_on': bool(self.journal_names and (self.cfg['retrieval'].get('journals') or {}).get('enabled')),
-            'scope_mode': (self.cfg['retrieval'].get('journals') or {}).get('mode', 'ta'),
-            'scope_names': list(self.journal_names) if self.journal_names else [],
-            'clinical_queries': {'allowed': list(self.cq_allowed.keys()),
-                                 'used': list(self.cq_used)},
+            'scope_on': False,
+            'scope_note': '本工具不做刊源限制，检索全 PubMed',
+            'clinical_queries': {'used': list(self.cq_used)},
         }
         self._log_lines: list[str] = []
 
@@ -129,26 +116,15 @@ class Run:
         self._ft_claimed = 0
 
     # ---------- 配置解析 ----------
-    def _resolve_journals(self) -> list[str]:
-        j = self.cfg['retrieval'].get('journals') or {}
-        if not j.get('enabled'):
-            return []
-        names = j.get('list') or []
-        if names:
-            return list(names)
-        profile = j.get('profile')
-        if profile:
-            return pmod.load_journal_profile(profile, j.get('mode', 'ta'))
-        return []
-
-    def _resolve_cq_allowed(self) -> dict:
-        """预设限定了可用过滤器；显式指定时放开全部。"""
-        if self.cq_explicit:
-            return dict(self.cq_all)
-        allowed = self.preset.get('cq') or []
-        if allowed:
-            return {k: v for k, v in self.cq_all.items() if k in allowed}
-        return dict(self.cq_all)
+    def _load_cq(self) -> dict:
+        """载入 PubMed 官方 Clinical Query 过滤器表（仅供 --cq 显式调用）。"""
+        path = os.path.join(cfgmod.ROOT, 'data', 'clinical_queries.json')
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            return {}
+        return {k: v for k, v in data.items() if not k.startswith('_')}
 
     # ---------- 日志 ----------
     def log(self, msg: str):
@@ -162,15 +138,10 @@ class Run:
 
     # ---------- 1. 规划 ----------
     def plan_queries(self) -> dict:
-        hint = pmod.build_hint(self.preset)
-        cq_opts = '\n'.join(f'  - {k}：{v["label"]}' for k, v in self.cq_allowed.items())
         msgs = [{'role': 'system', 'content': prompts.PLANNER_SYSTEM},
                 {'role': 'user', 'content': prompts.PLANNER_USER.format(
                     question=self.question,
-                    constraints=self.constraints or '（无）',
-                    preset_hint=(hint + '\n\n') if hint else '',
-                    cq_options=('可用的临床查询过滤器（选一个填进 clinical_query 字段，不要把文本写进检索式）：\n'
-                                + cq_opts + '\n') if cq_opts else '')}]
+                    constraints=self.constraints or '（无）')}]
         res = self.router.chat('planner', msgs,
                                temperature=self.cfg['runtime']['temperature_plan'],
                                max_tokens=1600)
@@ -182,21 +153,11 @@ class Run:
             data = {'core_question_en': self.question,
                     'queries': [{'label': '直译', 'query': self.question}],
                     'pico': {}, 'notes': '模型未给出检索式，已回退为原问题'}
-        # 校验 clinical_query 是否在允许集合内
-        cq = data.get('clinical_query') or ''
-        if cq and cq not in self.cq_allowed:
-            self.log(f'   忽略模型给出的非法 clinical_query：{cq}')
-            data['clinical_query'] = ''
         self.plan = data
         self.log(f'① 规划完成：{len(data.get("queries", []))} 条检索式'
                  f'（{res["model"]}，{res["elapsed"]}s）')
-        if self.preset_id:
-            self.log(f'   学科域预设：{self.preset.get("name")}'
-                     f'（命中关键词 {", ".join(map(str, self.preset_hits[:5]))}）')
         for q in data.get('queries', []):
             self.log(f'   · [{q.get("label")}] {q.get("query", "")[:110]}')
-        if data.get('clinical_query'):
-            self.log(f'   · 临床查询过滤器：{data["clinical_query"]}')
         return data
 
     # ---------- 2. 扩写（第二轮） ----------
@@ -211,7 +172,7 @@ class Run:
             self.log(f'   候选已充足（{len(self.papers)} ≥ {need}），跳过扩写')
             return []
         used = '\n'.join(f'- {q.get("query", "")}' for q in self.plan.get('queries', []))
-        gaps = self.preset.get('notes') or '（无特别提示；请补充缩写、旧术语、同义表述）'
+        gaps = ('（请补充缩写、旧术语、同义表述，以及该问题常用的其他 MeSH 专指词）')
         msgs = [{'role': 'system', 'content': prompts.PLANNER_EXPAND_SYSTEM},
                 {'role': 'user', 'content': prompts.PLANNER_EXPAND_USER.format(
                     core_question=self.plan.get('core_question_en') or self.question,
@@ -236,19 +197,12 @@ class Run:
     # ---------- 3. 检索 ----------
     def search(self, queries: list[dict], tag: str = 'round1',
                retmax: int = 20, min_year: str | None = None):
-        scope = ''
-        jcfg = self.cfg['retrieval'].get('journals') or {}
-        if self.journal_names and jcfg.get('enabled'):
-            scope = pm.journal_clause(self.journal_names, jcfg.get('mode', 'ta'))
-            self.log(f'   期刊限定：开启，{len(self.journal_names)} 本'
-                     f'（模式 {jcfg.get("mode", "ta")}，画像 {jcfg.get("profile", "自定义")}）')
-        elif tag == 'round1':
-            self.log('   期刊限定：关闭，检索全 PubMed（不设刊源限制）')
+        # 本工具不做刊源限制：检索全 PubMed，任何期刊、任何出版社都进入候选。
+        if tag == 'round1':
+            self.log('   检索范围：全 PubMed（不限刊源，不限学科）')
 
-        # 显式指定的 Clinical Query 优先；否则用 planner 选的那个
-        cq_ids = list(self.cq_explicit) or ([self.plan.get('clinical_query')]
-                                             if self.plan.get('clinical_query') else [])
-        for cq_id in cq_ids:
+        # Clinical Query 仅在用户显式指定时启用
+        for cq_id in self.cq_explicit:
             if cq_id not in self.cq_all:
                 self.log(f'   ! 未知 clinical query：{cq_id}（已忽略）')
                 continue
@@ -259,8 +213,8 @@ class Run:
             term = (q.get('query') or '').strip()
             if not term:
                 continue
-            full = f'({term}) AND {scope}' if scope else term
-            for cq_id in cq_ids:
+            full = term
+            for cq_id in self.cq_used:
                 full = pm.apply_clinical_query(full, self.cq_all[cq_id]['query'])
             self.log(f'② 检索 [{q.get("label")}] {term[:90]}')
             try:
@@ -502,11 +456,8 @@ class Run:
             f'- 年份范围：{ymin}–{ymax}',
             '- 设计分布：' + '；'.join(f'{k} {v} 篇' for k, v in designs.items()),
             '- 期刊来源：' + '；'.join(sorted({p.get("journal", "") for p in self.papers.values()})[:8]),
+            '- 检索范围：全 PubMed（不限刊源，不限学科）',
         ]
-        if self.preset_id:
-            lines.insert(0, f'- 学科域预设：{self.preset.get("name", self.preset_id)}')
-        if self.journal_names:
-            lines.append(f'- 期刊限定：开启（{len(self.journal_names)} 本）')
         if self.cq_used:
             lines.append('- 临床查询过滤器：' + '、'.join(self.cq_used))
         return '\n'.join(lines)
@@ -621,8 +572,7 @@ class Run:
     def save(self):
         self._w('01_question.md',
                 f'# 问题\n\n{self.question}\n\n## 补充限定\n\n{self.constraints or "（无）"}\n\n'
-                f'## 学科域预设\n\n'
-                f'{self.preset.get("name", self.preset_id) if self.preset_id else "（未使用）"}\n')
+                f'## 检索范围\n\n全 PubMed（不限刊源，不限学科）\n')
         self._w('02_plan.json', json.dumps(self.plan, ensure_ascii=False, indent=2))
         self._w('03_papers.json', json.dumps(list(self.papers.values()), ensure_ascii=False, indent=1))
 

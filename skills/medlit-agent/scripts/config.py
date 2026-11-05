@@ -150,7 +150,6 @@ def load_config(path: str | None = None, *, require_secrets: bool = True) -> dic
     cfg['_paths'] = {
         'root': str(ROOT),
         'data': str(ROOT / 'data'),
-        'presets': str(ROOT / 'presets'),
         'examples': str(ROOT / 'examples'),
     }
     return cfg

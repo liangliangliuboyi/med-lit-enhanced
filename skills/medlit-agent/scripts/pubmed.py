@@ -236,22 +236,9 @@ class PubMed:
         return {'source': 'pmc_bioc', 'text': '\n'.join(buf), 'sections': secs}
 
 
-# ---------- 期刊白名单子句 ----------
-def journal_clause(names: list[str], mode: str = 'ta') -> str:
-    """把刊名列表拼成 PubMed 检索子句。
-
-    mode='ta' 用 NLM ISO 缩写匹配（默认，命中率高）；mode='full' 用期刊全称。
-    """
-    items = [n for n in (names or []) if n]
-    if not items:
-        return ''
-    tag = 'ta' if mode == 'ta' else 'Journal'
-    parts = [f'"{n}"[{tag}]' for n in items]
-    return '(' + ' OR '.join(parts) + ')'
-
-
+# ---------- Clinical Query 过滤器 ----------
 def apply_clinical_query(term: str, cq_query: str) -> str:
-    """把 PubMed Clinical Query 过滤器 AND 进检索式。"""
+    """把 PubMed Clinical Query 过滤器 AND 进检索式（仅用户显式指定时使用）。"""
     if not cq_query:
         return term
     return f'({term}) AND ({cq_query})'
