@@ -43,6 +43,7 @@ pdfplumber / pypdf / PyMuPDF，于是「只拿到 PDF」时全文长度为 0，
 from __future__ import annotations
 
 import base64
+import codecs
 import re
 import sys
 import time
@@ -74,15 +75,40 @@ _FILTER_ALIASES = {
     'RL': 'RunLengthDecode',
 }
 
+# 预定义 CMap（Adobe CJK 集合）-> Python 编解码器。
+# 中文文献 PDF 有两种常见形态：
+#   1) 字体带 /ToUnicode（现代排版软件生成）—— 走 CMap 解析
+#   2) 字体用 /Encoding /GBK-EUC-H 这类「预定义 CMap」（老排版/OCR 生成）——
+#      此时字符码**本身就是** GBK/Big5 编码的字节，可以直接用标准库的
+#      codec 解出来。不支持这一类的话，中文 PDF 会整篇变成乱码。
+_PREDEFINED_CMAP_CODEC = {
+    'GBK-EUC-H': 'gbk', 'GBK-EUC-V': 'gbk',
+    'GB-EUC-H': 'gbk', 'GB-EUC-V': 'gbk',
+    'GBpc-EUC-H': 'gbk', 'GBpc-EUC-V': 'gbk',
+    'GBKp-EUC-H': 'gbk', 'GBKp-EUC-V': 'gbk',
+    'GBK-V': 'gbk',
+    'B5pc-H': 'big5', 'B5pc-V': 'big5',
+    'ETen-B5-H': 'big5', 'ETen-B5-V': 'big5',
+    'CNS-EUC-H': 'big5', 'CNS-EUC-V': 'big5',
+    '90ms-RKSJ-H': 'shift_jis', '90ms-RKSJ-V': 'shift_jis',
+    '90msp-RKSJ-H': 'shift_jis', '90msp-RKSJ-V': 'shift_jis',
+    'EUC-H': 'euc_jp', 'EUC-V': 'euc_jp',
+    'KSC-EUC-H': 'euc_kr', 'KSC-EUC-V': 'euc_kr',
+    'KSCms-UHC-H': 'euc_kr', 'KSCms-UHC-V': 'euc_kr',
+    'UniGB-UCS2-H': 'utf-16-be', 'UniGB-UCS2-V': 'utf-16-be',
+    'UniCNS-UCS2-H': 'utf-16-be', 'UniCNS-UCS2-V': 'utf-16-be',
+    'UniJIS-UCS2-H': 'utf-16-be', 'UniJIS-UCS2-V': 'utf-16-be',
+}
+
 # 词法记号。正则切分比逐字符扫描快一个量级（内容流动辄上百 KB）。
 _TOKEN_RE = re.compile(rb"""
       (?P<ws>[\x00\t\n\x0c\r ]+)
     | (?P<comment>%[^\r\n]*)
-    | (?P<dictopen><<)
-    | (?P<dictclose>>>)
+    | (?P<dict_open><<)
+    | (?P<dict_close>>>)
     | (?P<hexstr><[0-9A-Fa-f\s]*>)
-    | (?P<arropen>\[)
-    | (?P<arrclose>\])
+    | (?P<arr_open>\[)
+    | (?P<arr_close>\])
     | (?P<name>/[^\s\(\)\[\]<>/%]*)
     | (?P<num>[+-]?(?:\d+\.?\d*|\.\d+))
     | (?P<op>[A-Za-z*'"]+)
@@ -98,7 +124,9 @@ _STREAM_RE = re.compile(rb'(?<![A-Za-z0-9])stream(?![A-Za-z0-9])'
                          rb'(?:\r\n|\n|\r)')
 # 内容流里是否出现过文本块的粗判
 _BT_RE = re.compile(rb'(?<![A-Za-z0-9])BT(?![A-Za-z0-9])')
-_SHOW_RE = re.compile(rb'(?<![A-Za-z0-9])(?:Tj|TJ)(?![A-Za-z0-9])')
+# 显示文本的算子有四种：Tj / TJ / ' / "，探测时都要认。
+_SHOW_RE = re.compile(rb'(?<![A-Za-z0-9])(?:Tj|TJ)(?![A-Za-z0-9])'
+                      rb"|(?<![A-Za-z0-9])[\'\"]")
 # CMap 段落
 _BFCHAR_RE = re.compile(rb'beginbfchar(.*?)endbfchar', re.S)
 _BFRANGE_RE = re.compile(rb'beginbfrange(.*?)endbfrange', re.S)
@@ -179,7 +207,7 @@ def _extract_text(pdf_bytes, max_chars) -> dict:
     uniq = [by_num[n] for n in sorted(by_num)]
 
     pages = _count_pages(uniq)
-    global_cmap, global_width, page_fonts, page_contents, cmap_nums = \
+    global_info, page_fonts, page_contents, cmap_nums = \
         _build_font_maps(uniq, by_num)
 
     chunks = []
@@ -208,7 +236,7 @@ def _extract_text(pdf_bytes, max_chars) -> dict:
             if not (_BT_RE.search(decoded) and _SHOW_RE.search(decoded)):
                 continue
             probed += 1
-        text = _extract_content_text(decoded, fonts, global_cmap, global_width)
+        text = _extract_content_text(decoded, fonts, global_info)
         if text.strip():
             chunks.append(text)
 
@@ -262,10 +290,12 @@ def _scan_objects(data: bytes):
     为什么不用 xref 表：xref 的偏移量在增量更新、线性化 PDF、交叉引用流
     里都容易对不上，而「出现 obj 标记就是一个对象」永远成立。
     """
-    # 预先算出所有 endobj / endstream 的位置，避免每个对象都从头扫一遍
-    # （10MB 的文件有上千个对象时，那是 O(n*k) 的浪费）。
+    # 预先算出所有 endobj / endstream / stream 关键字的位置，避免每个对象
+    # 都从头扫一遍全文（10MB 的文件有上千个对象时，那是 O(n*k) 的浪费，
+    # 实测一篇 2MB 的 arXiv 论文光这一项就要 5.9 秒）。
     endobj_pos = [m.start() for m in re.finditer(rb'endobj', data)]
     endstream_pos = [m.start() for m in re.finditer(rb'endstream', data)]
+    stream_pos = [m.start() for m in _STREAM_RE.finditer(data)]
 
     objs = []
     pos = 0
@@ -275,7 +305,7 @@ def _scan_objects(data: bytes):
         if not m:
             break
         obj = _parse_object(data, int(m.group(1)), int(m.group(2)),
-                            m.end(), endobj_pos, endstream_pos)
+                            m.end(), endobj_pos, endstream_pos, stream_pos)
         if obj is None:
             pos = m.end()
             continue
@@ -299,11 +329,11 @@ def _next_pos(positions, start):
 
 
 def _parse_object(data: bytes, num: int, gen: int, body_start: int,
-                  endobj_pos, endstream_pos):
+                  endobj_pos, endstream_pos, stream_pos):
     """切出对象体，并解析出字典与流数据。"""
     end_obj = _next_pos(endobj_pos, body_start)
-    sm = _STREAM_RE.search(data, body_start)
-    has_stream = bool(sm) and (end_obj < 0 or sm.start() < end_obj)
+    s_pos = _next_pos(stream_pos, body_start)
+    has_stream = s_pos >= 0 and (end_obj < 0 or s_pos < end_obj)
 
     if not has_stream:
         body_end = end_obj if end_obj >= 0 else len(data)
@@ -311,7 +341,6 @@ def _parse_object(data: bytes, num: int, gen: int, body_start: int,
         obj_end = (end_obj + 6) if end_obj >= 0 else len(data)
         return _Obj(num, gen, obj_end, dct, b'', False)
 
-    s_pos = sm.start()
     dct = _parse_dict(data[body_start:s_pos])
     # 'stream' 关键字后必须跟一个 EOL
     data_start = s_pos + len(b'stream')
@@ -766,6 +795,7 @@ def _build_font_maps(objects, by_num):
     global_cmap = {}
     widths = set()
     cmap_stream_nums = set()
+    codec_votes = {}
     # 先把所有字体对象的 /ToUnicode 收进全局表（后出现的覆盖先出现的）
     for obj in objects:
         tu = obj.dict.get('ToUnicode')
@@ -779,7 +809,21 @@ def _build_font_maps(objects, by_num):
             global_cmap.update(mapping)
             if width:
                 widths.add(width)
+        else:
+            # 没有 ToUnicode，但字体可能用预定义 CMap（如 GBK-EUC-H）。
+            # 这类字体的字符码本身就是 GBK 字节，可以直接用 codec 解。
+            codec = _font_codec(obj.dict)
+            if codec:
+                codec_votes[codec] = codec_votes.get(codec, 0) + 1
     global_width = widths.pop() if len(widths) == 1 else 0
+    # 全局兜底用的 codec：取用得最多的那个；票数并列就不猜了
+    global_codec = None
+    if codec_votes:
+        best = max(codec_votes.values())
+        winners = [c for c, n in codec_votes.items() if n == best]
+        if len(winners) == 1:
+            global_codec = winners[0]
+    global_info = (global_cmap, global_width, global_codec)
 
     page_fonts = {}
     page_contents = set()
@@ -793,7 +837,7 @@ def _build_font_maps(objects, by_num):
             continue
         for cnum in contents:
             page_fonts.setdefault(cnum, fonts)
-    return global_cmap, global_width, page_fonts, page_contents, cmap_stream_nums
+    return (global_info, page_fonts, page_contents, cmap_stream_nums)
 
 
 def _is_page(obj: _Obj) -> bool:
@@ -835,7 +879,7 @@ def _resolve_resources(obj: _Obj, by_num, depth: int = 0):
 
 
 def _page_fonts(obj: _Obj, by_num):
-    """页面字体表：{字体名: (cmap, 每字符字节数)}。"""
+    """页面字体表：{字体名: (cmap, 每字符字节数, 预定义CMap的codec)}。"""
     res = _resolve_resources(obj, by_num)
     if not res:
         return {}
@@ -851,12 +895,28 @@ def _page_fonts(obj: _Obj, by_num):
         cmap = _cmap_of_ref(tu, by_num)
         if cmap:
             mapping, width = cmap
+            codec = None
         else:
+            # 没有 ToUnicode：看看 /Encoding 是不是预定义 CMap
+            # （中文 PDF 常见 GBK-EUC-H / ETen-B5-H 等）
             mapping, width = {}, 0
+            codec = _font_codec(fd)
         if not width:
             width = _code_width(fd)
-        fonts[name] = (mapping, width)
+        fonts[name] = (mapping, width, codec)
     return fonts
+
+
+def _font_codec(fdict: dict):
+    """从字体的 /Encoding 推出 Python codec 名（预定义 CMap）。
+
+    返回 None 表示这个字体不是预定义 CMap（要么是 Identity-H 这种
+    没有内置编码表的，要么编码表在文件里、但我们没能力反查 CID）。
+    """
+    enc = fdict.get('Encoding')
+    if enc is None or enc[0] != 'name':
+        return None
+    return _PREDEFINED_CMAP_CODEC.get(enc[1])
 
 
 def _code_width(fdict: dict) -> int:
@@ -1078,12 +1138,11 @@ def _utf16_text(raw: bytes) -> str:
 # 文本算子
 # ----------------------------------------------------------------------
 
-def _extract_content_text(content: bytes, fonts, global_cmap: dict,
-                           global_width: int) -> str:
+def _extract_content_text(content: bytes, fonts, global_info) -> str:
     """从一个内容流里抽文本。
 
-    fonts：{字体名: (cmap, 每字符字节数)}，来自页面 /Resources；
-    找不到时退回 global_cmap（所有 CMap 合并的全局表）。
+    fonts：{字体名: (cmap, 每字符字节数, 预定义CMap的codec)}，来自页面
+    /Resources；找不到时退回 global_info（所有 CMap 合并的全局表）。
     """
     out = []
     stack = []        # 操作数栈
@@ -1094,8 +1153,13 @@ def _extract_content_text(content: bytes, fonts, global_cmap: dict,
     def resolve(raw: bytes) -> str:
         info = fonts.get(cur_font) if fonts else None
         if info is None:
-            return _decode_bytes(raw, {}, 0, global_cmap, global_width)
-        return _decode_bytes(raw, info[0], info[1], global_cmap, global_width)
+            info = global_info
+        cmap, width, codec = info
+        if codec:
+            # 预定义 CMap（GBK/Big5/Shift-JIS 等）：字符码是变长的多字节
+            # 序列，必须整串解码，逐字节解会把汉字劈成两半。
+            return _decode_with_codec(raw, codec)
+        return _decode_bytes(raw, cmap, width, global_info[0], global_info[1])
 
     def push(item):
         # 数组里的元素要进数组，不能直接进操作数栈
@@ -1182,6 +1246,22 @@ def _extract_content_text(content: bytes, fonts, global_cmap: dict,
             # 其余操作符（q/Q/cm/gs/Do/re/...）：清掉操作数栈
             stack = []
     return ''.join(out)
+
+
+def _decode_with_codec(raw: bytes, codec: str) -> str:
+    """用 Python codec 解一段字符码（预定义 CMap 路径）。
+
+    解不出来时退回 latin-1：宁可给出可辨认的字节，也不要整段丢掉。
+    """
+    if not raw:
+        return ''
+    try:
+        return raw.decode(codec, errors='replace')
+    except (LookupError, UnicodeDecodeError):
+        try:
+            return raw.decode(codec, errors='ignore')
+        except Exception:  # noqa: BLE001
+            return raw.decode('latin-1', 'replace')
 
 
 def _decode_bytes(raw: bytes, cmap: dict, width: int, global_cmap: dict,

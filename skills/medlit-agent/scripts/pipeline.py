@@ -763,10 +763,10 @@ class Run:
         rr = (self.cfg.get('provider') or {}).get('rerank') or {}
         if not rr.get('enabled'):
             self.log(f'④ 跳过重排（未启用 rerank）→ 取前 {limit} 篇')
-            return ids[:limit]
+            return self._diversify(ids, limit)
         if len(ids) <= limit:
             self.log(f'④ 跳过重排（候选 {len(ids)} ≤ {limit}）')
-            return ids[:limit]
+            return self._diversify(ids, limit)
         q = self.plan.get('core_question_en') or self.question
         docs = [f'{self.papers[i].get("title", "")}. {self.papers[i].get("abstract", "")[:1600]}'
                 for i in ids]
@@ -782,11 +782,84 @@ class Run:
                 if 0 <= idx < len(ids):
                     self.papers[ids[idx]]['rerank_score'] = r.get('relevance_score')
             self.log('   重排完成')
-            return ranked[:limit]
+            return self._diversify(ranked, limit)
         except Exception as e:  # noqa: BLE001
             self.log(f'   ! 重排失败，退回原始顺序：{e}')
             self.err('rerank', e)
             return ids[:limit]
+
+    def _design_group(self, paper: dict) -> str:
+        """把文献归成两类：原始研究 / 综述类。
+
+        分类依据是 PubMed 的 PublicationType，不是模型给的标签——
+        模型给的 `study_design` 是在精读阶段才有的，而这里还没读。
+        """
+        types = [str(t).lower() for t in (paper.get('pub_types') or [])]
+        blob = ' | '.join(types)
+        if ('meta-analysis' in blob or 'systematic review' in blob
+                or 'review' in blob):
+            return 'review'
+        if ('randomized controlled trial' in blob or 'clinical trial' in blob
+                or 'controlled clinical trial' in blob):
+            return 'primary'
+        if ('cohort studies' in blob or 'cross-sectional studies' in blob
+                or 'case-control studies' in blob or 'comparative study' in blob
+                or 'observational study' in blob):
+            return 'primary'
+        return 'other'
+
+    def _diversify(self, ranked: list[str], limit: int) -> list[str]:
+        """证据池按研究设计做多样性平衡。
+
+        为什么要有：纯按相关度取前 N，会让证据池**全是同一类设计**。
+        实测（2026-11-06，问"GLP-1 对青少年肥胖的疗效与安全性"）：
+        重排选出的 5 篇**全是系统综述**，一篇原始研究都没有。
+
+        这么选有两个问题：
+        ① 系统综述的结论受**它纳入研究的截止时间**限制，可能已经过时；
+           提问者通常也想知道"最新的那项 RCT 怎么说"。
+        ② 系统综述往往只给汇总数字；**原始研究的森林图/生存曲线
+           才带着逐个结局的效应量**——只读综述等于把「图表识别」
+           这个能力整个用不上。
+
+        做法（保守）：在候选里既有原始研究又有综述时，
+        **保证至少保留相关度最高的那篇原始研究**，其余名额仍按相关度分配。
+        不硬性配额、不改变排序权重——只是不让某一类设计把名额吃光。
+        """
+        if not (self.cfg['retrieval'] or {}).get('diversify_by_design', True):
+            return ranked[:limit]
+        if len(ranked) <= 1:
+            return ranked[:limit]
+        min_primary = int((self.cfg['retrieval'] or {}).get('min_primary', 1) or 0)
+        if min_primary <= 0:
+            return ranked[:limit]
+        top = list(ranked[:limit])
+        # 候选池（完整列表，不只是 top-N）里还有没有原始研究？
+        groups = {i: self._design_group(self.papers.get(i) or {})
+                  for i in ranked}
+        primaries = [i for i in ranked if groups.get(i) == 'primary']
+        if not primaries:
+            # 候选里根本没有原始研究 → 无从补起
+            return top
+        n_primary_in_top = sum(1 for i in top if groups.get(i) == 'primary')
+        if n_primary_in_top >= min_primary:
+            return top
+        best_primary = primaries[0]
+        if best_primary in top:
+            return top
+        # 找出 top 里排序最靠后的那一篇综述（综述更"泛"，少一篇损失更小）
+        drop_idx = None
+        for i in range(len(top) - 1, -1, -1):
+            if groups.get(top[i]) == 'review':
+                drop_idx = i
+                break
+        if drop_idx is None:
+            return top
+        top[drop_idx] = best_primary
+        self.log(f'   ↺ 多样性平衡：补入 1 篇原始研究'
+                 f'（{self.papers.get(best_primary, {}).get("journal", "")[:26]}），'
+                 f'替下一篇综述')
+        return top
 
     # ---------- 7. 精读 ----------
     def _claim_fulltext_slot(self) -> bool:
@@ -844,6 +917,13 @@ class Run:
                             (ft.get('figures') or []) if f.get('caption')]
                     if caps:
                         ft['figure_captions'] = caps
+                # 全文尝试的结果**必须留痕**：否则用户看到"只读了摘要"
+                # 不知道为什么，也没法判断该不该开 VPN 重试。
+                if ft.get('text'):
+                    self.log(f'   ↳ 全文来源 {ft.get("source") or "?"}'
+                             f'（{len(ft["text"])} 字）')
+                else:
+                    self.log(f'   ↳ 全文未获取（{ft.get("note") or "无可用来源"}）')
             except Exception as e:  # noqa: BLE001
                 # 全文拿不到不是致命错误——退回摘要继续
                 self.err('fulltext', e)

@@ -33,15 +33,19 @@
 动辄几百 KB、1~3 秒，全文抓取是整条流水线里最慢的一环。所以每个源一旦拿到正文就
 **立即 return**，绝不继续往下试（`fetch()` 里是顺序 if-return，不是循环收集）。
 
-为什么 PDF 一律不解析
-----------------------
-本项目**零第三方依赖**，没有 pdfplumber / pypdf / PyMuPDF 任何一个。PDF 是压缩过的
-二进制格式，标准库解不了；硬要用正则去抠文本只会得到一堆乱码——**乱码比没有文本更糟**，
-因为它会被当成真正文喂给模型。所以：
+为什么 PDF 的文本要过一道「质量闸门」
+--------------------------------------
+本项目**零第三方依赖**，装不了 pdfplumber / pypdf / PyMuPDF；但同目录的
+`pdftext.py` 用纯标准库实现了一个最小 PDF 解析器，能从 PDF 字节里抽正文。
 
-    PDF 只作为「下载交付物」存在；正文文本一律来自 XML/HTML 源。
+问题是：**PDF 解析遇到没料到的结构时，很容易解出二进制乱码而不是文字。**
+实测真实出版商 PDF 上出现过「可打印字符占比只有 0.44」的输出（乱码）。
+乱码比没有文本更糟——它会被下游 pipeline 当成正文喂给模型，污染整条证据链。
 
-只能拿到 PDF 拿不到文本时，`text` 留空并在 `note` 里说清楚，绝不用假文本凑数。
+所以本模块的做法是：
+
+    抽出来的文本要通过「可打印字符占比 ≥ 0.85 且长度 ≥ 200 字」才采用，
+    否则宁可 `text=''` 也不把乱码塞给下游。
 
 「不落地」为什么必须确认删除
 ---------------------------
@@ -50,6 +54,9 @@
 
     删 → 再 `os.path.exists()` 复查 → 只有确认不存在了才置 `temp_removed=True`；
     删不掉就**如实**写进 `note`，绝不假装删成功。
+
+而且正文是在**删文件之前**从内存里的字节抽出来的——所以「不落地」不等于
+「读不到正文」，用户照样能读到全文，磁盘上却一个字节都不留。
 
 临时文件建在 `tempfile.mkdtemp()` 下的独立目录里并**整体 `shutil.rmtree()`**，
 避免只删单个文件时漏掉 `.part` 中间态。
@@ -77,6 +84,8 @@
    必须拼成绝对 URL 才能给用户点。
 7. **Unpaywall 的 `url_for_pdf` 未必真是 PDF**：实测有些 OA 出版商把 HTML 落地页
    也填在这个字段里。所以下载后要验魔数（`%PDF`），不是 PDF 就不存盘。
+8. **PDF 正文抽取必须过质量闸门**：见上面「为什么 PDF 的文本要过一道质量闸门」。
+   乱码比没有文本更糟——它会被当成正文喂给模型。
 """
 from __future__ import annotations
 
@@ -402,6 +411,9 @@ class FullTextFetcher:
         `keep_downloads=False` 时 PDF 会临时下载后立刻删除，此时 `pdf_path` 恒为
         `''`，删除结果写在 `note` 里。
 
+        **PDF 正文也会被抽取**（同目录的 `pdftext`，纯标准库），但要过质量闸门
+        才采用——乱码比没有文本更糟，详见 `_pdf_text`。
+
         **任何异常都不外泄**：网络故障、XML 解析失败、磁盘写不动，全部收进 `note`。
         """
         try:
@@ -409,8 +421,10 @@ class FullTextFetcher:
         except Exception as e:  # noqa: BLE001 —— 顶层兜底，绝不把异常抛给调用方
             res = self._blank()
             res['note'] = '获取全文时发生未预期错误：%s' % type(e).__name__
-        # fetch() 的返回结构固定为这 8 个字段（fetch_ephemeral 才多一个 temp_removed）
-        res.pop('temp_removed', None)
+        # 没走过临时下载的场合，返回结构就是文档里那 8 个字段；
+        # 走过的话额外带上 temp_removed（临时文件是否已确认删除）。
+        if not res.pop('_used_temp', False):
+            res.pop('temp_removed', None)
         return res
 
     def fetch_ephemeral(self, paper: dict) -> dict:
@@ -429,6 +443,7 @@ class FullTextFetcher:
             res = self._blank()
             res['note'] = '获取全文时发生未预期错误：%s' % type(e).__name__
             res['temp_removed'] = True
+        res.pop('_used_temp', None)
         res['temp_removed'] = bool(res.get('temp_removed', True))
         res['pdf_path'] = ''
         return res
@@ -612,8 +627,15 @@ class FullTextFetcher:
 
         # 临时目录：只有真的要落盘时才建；用完整体删掉并复查。
         tmpdir = ''
-        # 需要临时落盘并事后删除的两种情况：显式 ephemeral，或 keep_downloads=False。
-        want_temp = ephemeral or not self.keep_downloads
+        # **要不要留下 PDF 文件**：只有「用户明确要留 + 给了目录」才留。
+        # 其余情况（不落地模式、keep_downloads=False、或压根没给下载目录）
+        # 一律走临时目录：下载 → 抽正文 → 删掉。
+        #
+        # 为什么「没给下载目录」也要走临时下载而不是干脆不下载：
+        # 拿到 PDF 就能抽出正文（见 `_pdf_text`），不抽等于白下一趟。
+        # 而「不存」的本意是**磁盘上不留东西**，临时下载再删正好满足。
+        keep_file = bool(self.keep_downloads) and bool(self.download_dir)
+        want_temp = not keep_file
 
         def _ensure_tmp() -> str:
             nonlocal tmpdir
@@ -722,6 +744,8 @@ class FullTextFetcher:
             if want_temp:
                 removed = _cleanup_tmp()
                 res['temp_removed'] = removed
+                # 标记走过临时路径：fetch() 据此决定要不要多返回 temp_removed
+                res['_used_temp'] = True
                 if not removed:
                     res['note'] = ((res.get('note') or '') +
                                    '；警告：临时文件未能确认删除，请手动检查').strip('；')
@@ -899,19 +923,17 @@ class FullTextFetcher:
         能下载 PDF 就下载（按 keep_downloads 决定留在磁盘还是立刻删）；
         只有落地页 URL 时，把 URL 交出去让用户自己点。
 
-        正文文本一律留空——本模块不解析 PDF，硬凑出来的乱码会污染下游精读。
+        PDF 的正文文本由 `pdftext`（同目录，纯标准库）抽取，但**必须过质量闸门**
+        才采用——见 `_pdf_text`。
         """
         if not pdf_url and not landing:
             return None
         res = {'source': source, 'text': '', 'sections': [], 'figures': [],
                'pdf_path': '', 'url': landing or pdf_url, 'ok': True, 'note': ''}
 
-        # 没有下载目录又不打算落盘 → 根本没必要下载（纯粹浪费带宽）
-        if pdf_url and not want_temp and not self.download_dir:
-            res['note'] = ('已找到开放获取副本（%s）：%s，但未配置下载目录，'
-                           '没有下载 PDF；正文请在浏览器中打开上面的链接。%s。'
-                           % (host_type or '开放获取来源', pdf_url, VPN_HINT))
-            return res
+        # 没有下载目录就不落盘，但**照样下载一份到临时目录抽正文**——
+        # 拿到 PDF 就能抽到正文，不抽等于白下一趟。
+        # （`want_temp` 为真时文件随后会被删掉，磁盘上不留东西。）
 
         if not pdf_url:
             res['note'] = ('已找到开放获取的网页版全文（%s），但没有可直接下载的 PDF；'
@@ -920,7 +942,7 @@ class FullTextFetcher:
             return res
 
         try:
-            saved = self._download_pdf(paper, pdf_url, ensure_tmp, want_temp)
+            saved, raw = self._download_pdf(paper, pdf_url, ensure_tmp, want_temp)
         except Exception as e:  # noqa: BLE001 —— 下载失败也要把 URL 交出去
             res['note'] = ('已找到开放获取副本（%s），但 PDF 下载失败（%s）；'
                            '请手动打开：%s。%s。'
@@ -929,17 +951,26 @@ class FullTextFetcher:
             res['url'] = landing or pdf_url
             return res
 
+        # PDF 正文抽取：抽得到就用，抽不到/抽出来是乱码就留空。
+        # 抽取用的是**内存里的字节**，所以临时模式下文件可以立刻删掉，
+        # 用户照样能读到正文——这正是「不落地也能读全文」的意义。
+        ptext, pnote = self._pdf_text(raw)
+        if ptext:
+            res['text'] = ptext
+
         if saved and want_temp:
             # 临时模式下文件马上会被删掉，不能把路径当成「已交付」告诉用户
-            res['note'] = ('已确认开放获取 PDF（%s）可以下载，但按「不落地」要求'
-                           '已在读取后删除本地文件，未保留副本；正文请按链接在浏览器中'
-                           '打开：%s。%s。' % (host_type or '开放获取来源', pdf_url, VPN_HINT))
+            res['note'] = ('已确认开放获取 PDF（%s）可以下载，并抽取到正文；'
+                           '按「不落地」要求已在读取后删除本地文件，未保留副本。%s。'
+                           % (host_type or '开放获取来源', pnote or VPN_HINT))
             return res
         if saved:
             res['pdf_path'] = saved
-            res['note'] = ('已下载开放获取 PDF（%s）：%s。本模块不解析 PDF 正文，'
-                           '请用阅读器打开；或改用上面的网页版链接。%s。'
-                           % (host_type or '开放获取来源', saved, VPN_HINT))
+            res['note'] = ('已下载开放获取 PDF（%s）：%s。%s%s'
+                           % (host_type or '开放获取来源', saved,
+                              '并抽取到正文（%d 字）。' % len(ptext) if ptext else
+                              '本模块未能从该 PDF 抽取到可用正文，',
+                              VPN_HINT))
             return res
         res['note'] = ('已找到开放获取副本（%s），但返回的内容不是 PDF'
                        '（多半是出版商的网页落地页），请手动打开：%s。%s。'
@@ -947,20 +978,86 @@ class FullTextFetcher:
         res['url'] = landing or pdf_url
         return res
 
+    # ---------------- PDF 正文抽取 ----------------
+    @staticmethod
+    def _pdf_text(raw: bytes) -> tuple[str, str]:
+        """从 PDF 字节里抽正文。返回 (文本, 说明)。
+
+        这里用同目录的 `pdftext` 模块（纯标准库实现的最小 PDF 解析器）。
+        但**必须过质量闸门**才采用抽出来的文本。
+
+        闸门的两条判据（实测标定，用「正常文本 / 解码乱码」两组真实样本）：
+
+        1. **控制字符占比 ≤ 2%**（不含 \\n \\t \\r）
+           —— 真正的正文里一个控制字符都没有（实测 0.000）；
+           而解码失败的二进制乱码里控制字符占 22%~26%。
+           这是最灵的一条判据：正常文本与乱码在这条上差了一个数量级。
+        2. **词字符（字母/数字/下划线）占比 ≥ 50%**
+           —— 正文由词和数字构成；乱码里符号、标点、控制符占比很高。
+
+        为什么要有闸门：PDF 解析一旦遇到没料到的结构，很容易**解出二进制乱码**
+        而不是文字（实测真实出版商 PDF 上出现过可打印占比只有 0.44 的情况）。
+        乱码比没有文本更糟——它会被下游 pipeline 当成正文喂给模型，
+        污染的是整条证据链。所以宁可留空，也不能把乱码塞进去。
+        """
+        if not raw:
+            return '', '未取到 PDF 内容。'
+        try:
+            import pdftext  # 同目录，纯标准库；不在也能正常工作（只是没正文）
+        except Exception:  # noqa: BLE001 —— 没这个模块就跳过正文抽取
+            return '', '未安装 PDF 文本抽取模块，正文请看 PDF 文件。'
+        try:
+            got = pdftext.extract_text(raw)
+        except Exception as e:  # noqa: BLE001 —— 解析异常不能外泄
+            return '', 'PDF 正文抽取失败（%s）。' % type(e).__name__
+        text = (got.get('text') or '').strip()
+        if not text:
+            return '', ('PDF 里没有可抽取的文本层（可能是扫描件）：%s'
+                       % (got.get('note') or ''))
+        if not FullTextFetcher._looks_like_text(text):
+            return '', 'PDF 抽取结果不是可读文字（已丢弃，避免乱码污染正文）。'
+        if len(text) < 200:
+            return '', ('PDF 抽取到的文字过短（%d 字），已丢弃。' % len(text))
+        return text, ''
+
+    @staticmethod
+    def _looks_like_text(text: str) -> bool:
+        """判断一段文本像不像「人话」——用来挡 PDF 解码出来的二进制乱码。
+
+        两条判据（阈值由真实样本标定，见 `_pdf_text` 的说明）：
+          - 控制字符占比 ≤ 2%（正文里一个都没有，乱码里占 22%~26%）；
+          - 词字符（字母/数字/下划线）占比 ≥ 50%。
+        """
+        n = len(text)
+        if n == 0:
+            return False
+        ctrl = 0
+        wordchars = 0
+        for ch in text:
+            code = ord(ch)
+            if ch in '\n\r\t':
+                continue
+            if code < 32 or code == 127:
+                ctrl += 1
+                continue
+            if ch.isalnum() or ch == '_':
+                wordchars += 1
+        return (ctrl / n) <= 0.02 and (wordchars / n) >= 0.5
+
     # ---------------- PDF 下载 ----------------
-    def _download_pdf(self, paper: dict, pdf_url: str, ensure_tmp, want_temp: bool) -> str:
-        """下载 PDF。返回保存路径（空字符串表示没保存成功）。
+    def _download_pdf(self, paper: dict, pdf_url: str, ensure_tmp, want_temp: bool
+                      ) -> tuple[str, bytes]:
+        """下载 PDF。返回 (保存路径, 文件字节)。
 
         - `want_temp=True`：落到临时目录（调用方随后连目录一起删掉并复查）；
-        - `want_temp=False` 且配了 `download_dir`：落到 `download_dir` 长期保存；
-        - `want_temp=False` 且没有 `download_dir`：**不下载**（没有地方放，
-          下载下来也只能马上删，纯属浪费带宽）。
+        - `want_temp=False` 且配了 `download_dir`：落到 `download_dir` 长期保存。
 
         写文件用 `.part` 中间名 + `os.replace` 原子改名：中途失败不会留下一个
         被误当成成品 PDF 的半截文件。
+
+        字节一并返回，是为了**在删文件之前**就能把正文抽出来——
+        「不落地」模式下用户照样能读到正文。
         """
-        if not want_temp and not self.download_dir:
-            return ''
         filename = self._pdf_filename(paper)
         if want_temp:
             dest = os.path.join(ensure_tmp(), filename)
@@ -968,7 +1065,7 @@ class FullTextFetcher:
             try:
                 os.makedirs(self.download_dir, exist_ok=True)
             except OSError:
-                return ''
+                return '', b''
             dest = os.path.join(self.download_dir, filename)
 
         tmp = dest + '.part'
@@ -998,7 +1095,7 @@ class FullTextFetcher:
             except OSError:
                 pass
             raise
-        return dest
+        return dest, body
 
     # ---------------- 小工具 ----------------
     @staticmethod

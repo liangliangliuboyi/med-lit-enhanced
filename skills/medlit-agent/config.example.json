@@ -121,7 +121,10 @@
     "rewrite_on_structure_fail": true,
     "cross_check_relevance": true,
     "verify_claims": true,
-    "claim_check_limit": 12
+    "claim_check_limit": 12,
+    "diversify_by_design": true,
+    "min_primary": 1,
+    "_diversify_comment": "证据池按研究设计做多样性平衡：纯按相关度取前 N 会让证据池全是系统综述（实测过），而系统综述只给汇总数字、原始研究的森林图才带逐个结局的效应量。min_primary = 至少保留几篇原始研究（0 = 关闭）。"
   },
   "runtime": {
     "timeout": 180,

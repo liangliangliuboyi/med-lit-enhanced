@@ -713,3 +713,118 @@ class TestEvidenceSourceColumn(unittest.TestCase):
     def test_missing_source_does_not_crash(self):
         t = self._table([{'_citation_key': '1', 'key_findings': ['a']}])
         self.assertIn('|', t)
+
+
+class TestDesignDiversification(unittest.TestCase):
+    """证据池的研究设计多样性。
+
+    背景（2026-11-06 实测）：问「GLP-1 对青少年肥胖的疗效与安全性」，
+    重排选出的 5 篇**全是系统综述**，一篇原始研究都没有。两个问题：
+    ① 系统综述的结论受它纳入研究的截止时间限制，可能过时；
+    ② 系统综述往往只给汇总数字，**原始研究的森林图才带逐个结局的效应量**——
+       只读综述等于把「图表识别」这个能力整个用不上。
+    """
+
+    def _run(self, papers, cfg=None):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = cfg or {'retrieval': {'diversify_by_design': True,
+                                        'min_primary': 1}}
+        run.papers = papers
+        run.log = lambda m: None
+        return run
+
+    def _mk(self, pmid, types):
+        return {'pmid': pmid, 'pub_types': types,
+                'journal': f'J{pmid}', 'title': f'T{pmid}'}
+
+    def test_design_group_classification(self):
+        run = self._run({})
+        self.assertEqual(run._design_group(
+            self._mk('1', ['Meta-Analysis', 'Systematic Review'])), 'review')
+        self.assertEqual(run._design_group(
+            self._mk('2', ['Review'])), 'review')
+        self.assertEqual(run._design_group(
+            self._mk('3', ['Randomized Controlled Trial'])), 'primary')
+        self.assertEqual(run._design_group(
+            self._mk('4', ['Observational Study'])), 'primary')
+        self.assertEqual(run._design_group(
+            self._mk('5', ['Journal Article'])), 'other')
+
+    def test_review_only_pool_is_left_alone(self):
+        """候选里全是综述 → 无从补起，不该硬凑。"""
+        papers = {str(i): self._mk(str(i), ['Systematic Review'])
+                  for i in range(4)}
+        run = self._run(papers)
+        out = run._diversify(['0', '1', '2', '3'], 4)
+        self.assertEqual(out, ['0', '1', '2', '3'])
+
+    def test_primary_is_added_when_top_n_is_all_reviews(self):
+        """top-N 全是综述、但候选里有原始研究 → 补进 1 篇原始研究。"""
+        papers = {
+            '0': self._mk('0', ['Systematic Review']),
+            '1': self._mk('1', ['Systematic Review']),
+            '2': self._mk('2', ['Meta-Analysis']),
+            '9': self._mk('9', ['Randomized Controlled Trial']),
+        }
+        run = self._run(papers)
+        out = run._diversify(['0', '1', '2', '9'], 3)
+        self.assertEqual(len(out), 3)
+        self.assertIn('9', out, '原始研究应被补进证据池')
+        self.assertEqual(out.count('9'), 1)
+
+    def test_replaces_the_last_review_not_the_first(self):
+        """替换的是排序最靠后的综述——综述更泛，少一篇损失更小。"""
+        papers = {
+            '0': self._mk('0', ['Systematic Review']),
+            '1': self._mk('1', ['Meta-Analysis']),
+            '2': self._mk('2', ['Review']),
+            '9': self._mk('9', ['Randomized Controlled Trial']),
+        }
+        run = self._run(papers)
+        out = run._diversify(['0', '1', '2', '9'], 3)
+        self.assertIn('0', out, '排第一的综述不该被替换')
+        self.assertNotIn('2', out, '排最后的综述应被替换')
+        self.assertIn('9', out)
+
+    def test_pool_with_primary_is_untouched(self):
+        """已经有原始研究 → 原样返回，不做任何改动。"""
+        papers = {
+            '0': self._mk('0', ['Systematic Review']),
+            '1': self._mk('1', ['Randomized Controlled Trial']),
+            '2': self._mk('2', ['Meta-Analysis']),
+        }
+        run = self._run(papers)
+        out = run._diversify(['0', '1', '2'], 3)
+        self.assertEqual(out, ['0', '1', '2'])
+
+    def test_can_be_turned_off(self):
+        papers = {
+            '0': self._mk('0', ['Systematic Review']),
+            '9': self._mk('9', ['Randomized Controlled Trial']),
+        }
+        run = self._run(papers, {'retrieval': {'diversify_by_design': False,
+                                              'min_primary': 1}})
+        out = run._diversify(['0', '9'], 1)
+        self.assertEqual(out, ['0'], '关掉后就是纯按相关度取前 N')
+
+    def test_min_primary_zero_means_off(self):
+        papers = {
+            '0': self._mk('0', ['Systematic Review']),
+            '9': self._mk('9', ['Randomized Controlled Trial']),
+        }
+        run = self._run(papers, {'retrieval': {'diversify_by_design': True,
+                                              'min_primary': 0}})
+        out = run._diversify(['0', '9'], 1)
+        self.assertEqual(out, ['0'])
+
+    def test_length_is_preserved(self):
+        """多样性调整不能改变证据池大小。"""
+        papers = {
+            '0': self._mk('0', ['Systematic Review']),
+            '1': self._mk('1', ['Meta-Analysis']),
+            '9': self._mk('9', ['Randomized Controlled Trial']),
+        }
+        run = self._run(papers)
+        out = run._diversify(['0', '1', '9'], 2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(len(set(out)), 2, '不能出现重复项')

@@ -120,6 +120,7 @@ forest_plot（森林图/效应量汇总图）、survival_curve（生存曲线/Ka
 
 3. "key_values" **只抄图上真实印着的数值**（效应量、HR、OR、RR、95%CI、P 值、样本量、AUC、中位生存期等），多个用分号分隔。
    **绝对禁止推测、估算或编造图上没有的数字。** 如果图上没有标注、或者看不清楚，就写「图中未见明确标注」。
+   **只写关键的那几组数值，不要逐条罗列每一行研究。** 例如森林图只写「合并效应量（菱形处）：r = -0.227，95% CI [-0.242, -0.211]，Z = -27.280，P = 0.000；共纳入 30 项研究」；流程图只写各阶段的文献数量。
 
 原图图注（可能为空，仅用于定位这张图，准确性一律以图上实际内容为准）：
 <<CAPTION>>
@@ -150,6 +151,9 @@ def _extract_json(text: Any) -> Optional[dict]:
     if not text:
         return None
     t = str(text).strip()
+    # 部分模型（实测 GLM-4.5V）会带 <|begin_of_box|> / <|end_of_box|> 之类的
+    # 特殊标记，甚至在 JSON 前后混进思考过程痕迹。先剥掉这些壳。
+    t = re.sub(r'<\|[^|]*\|>', '', t).strip()
     try:
         obj = json.loads(t)
         if isinstance(obj, dict):
@@ -542,7 +546,10 @@ class FigureReader:
     # ---- 调模型 ----
     def _chat(self, messages: list[dict]) -> dict:
         """调用 chat_fn，兼容不接受 model / timeout 参数的实现。"""
-        kwargs: dict[str, Any] = {'temperature': 0.1, 'max_tokens': 900}
+        # max_tokens 给 1200 而不是更小：部分模型会先写一段前言再给 JSON，
+        # 截断在 JSON 中间会导致整条结果作废（实测 GLM-4.5V 会逐条罗列
+        # 每项研究，900 token 不够它写完）。
+        kwargs: dict[str, Any] = {'temperature': 0.1, 'max_tokens': 1200}
         if _accepts_kw(self.chat_fn, 'model'):
             kwargs['model'] = self.model
         if _accepts_kw(self.chat_fn, 'timeout'):
@@ -658,11 +665,20 @@ class FigureReader:
                         results[idx] = _blank(
                             idx, '处理失败：%s' % str(e)[:150])
             except Exception as e:  # noqa: BLE001
-                # as_completed 超时：TimeoutError（py3.11+ 是 TimeoutError）
+                # as_completed 超时（TimeoutError）。走到这里说明有图没在
+                # 预算内完成——把已完成但还没被 yield 出来的结果先收走，
+                # 剩下的才记超时，别把好结果当超时丢掉。
                 for fut, idx in futs.items():
-                    if idx not in results:
-                        results[idx] = _blank(
-                            idx, '识别超时：%s' % str(e)[:100])
+                    if idx in results:
+                        continue
+                    if fut.done():
+                        try:
+                            results[idx] = fut.result()
+                            continue
+                        except Exception:  # noqa: BLE001
+                            pass
+                    results[idx] = _blank(
+                        idx, '识别超时：超过 %ds 仍未返回' % self.timeout)
         finally:
             # wait=False：不因为某张图卡死而拖住整轮返回
             try:

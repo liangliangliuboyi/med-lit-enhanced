@@ -379,6 +379,20 @@ class TestOutputParsing(unittest.TestCase):
         self.assertEqual(item['error'], figures.ERR_UNPARSED)
         self.assertEqual(item['description'], '')
 
+    def test_special_box_tokens_stripped(self):
+        """部分模型会带 <|begin_of_box|> 之类的特殊标记（实测 GLM-4.5V）。"""
+        content = ('<|begin_of_box|>' + _ok_json(kind='roc_curve')
+                   + '<|end_of_box|>')
+        item = self._read_one(content)
+        self.assertEqual(item['error'], '')
+        self.assertEqual(item['kind'], 'roc_curve')
+
+    def test_truncated_json_is_error_not_crash(self):
+        """输出被截断（JSON 没闭合）→ 记解析失败，不抛异常。"""
+        item = self._read_one('{"kind": "forest_plot", "description": "很长很长')
+        self.assertTrue(item['error'])
+        self.assertEqual(item['error'], figures.ERR_UNPARSED)
+
     def test_empty_output_is_error(self):
         item = self._read_one('')
         self.assertTrue(item['error'])
@@ -392,6 +406,20 @@ class TestOutputParsing(unittest.TestCase):
         obj = figures._extract_json(_ok_json())
         self.assertIsInstance(obj, dict)
         self.assertEqual(obj['kind'], 'forest_plot')
+
+    def test_extract_json_helper_edge_cases(self):
+        self.assertIsInstance(figures._extract_json('```json\n{"a": 1}\n```'), dict)
+        self.assertIsInstance(figures._extract_json('前缀 {"a": 1} 后缀'), dict)
+        self.assertIsInstance(figures._extract_json('{"a": {"b": 1}}'), dict)
+        self.assertIsNone(figures._extract_json('{不是 JSON}'))
+        # 字符串里带花括号不能把 JSON 截断
+        obj = figures._extract_json('{"desc": "效应量 {HR} 显著"}')
+        self.assertIsInstance(obj, dict)
+        self.assertEqual(obj['desc'], '效应量 {HR} 显著')
+        # 前面的非 JSON 花括号不能挡住后面的真 JSON
+        obj2 = figures._extract_json('{说明} 然后 {"kind": "bar_chart"}')
+        self.assertIsInstance(obj2, dict)
+        self.assertEqual(obj2['kind'], 'bar_chart')
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +636,24 @@ class TestMisc(unittest.TestCase):
                    {'figures': [{'href': None}]}):
             out = reader.read_all(ft)
             self.assertIsInstance(out, list)
+
+    def test_timeout_does_not_hang_forever(self):
+        """模型卡死时要按预算返回，不能无限等。"""
+        def slow_chat(role, messages, **kw):
+            time.sleep(30)
+            return {'content': _ok_json()}
+
+        reader = figures.FigureReader(slow_chat, downloader=_fake_downloader(),
+                                      timeout=3, workers=4, max_figures=4)
+        ft = _fulltext(4)
+        t0 = time.time()
+        out = reader.read_all(ft)
+        dt = time.time() - t0
+        self.assertEqual(len(out), 4)
+        self.assertLess(dt, 25, '卡死时应在预算内返回，实际 %.1fs' % dt)
+        for item in out:
+            self.assertTrue(item['error'])
+            self.assertIn('超时', item['error'])
 
 
 if __name__ == '__main__':

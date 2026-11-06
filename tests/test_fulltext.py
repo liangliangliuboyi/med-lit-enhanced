@@ -20,8 +20,11 @@
 
 import os
 import sys
+import tempfile
+import types
 import unittest
 import urllib.error
+from unittest import mock
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -979,6 +982,208 @@ class TestMisc(FullTextTestBase):
         """SOCKS 代理 urllib 不支持，必须忽略而不是塞进去。"""
         parsed = FullTextFetcher._parse_proxy_spec('socks=127.0.0.1:1080')
         self.assertNotIn('http', parsed)
+
+
+# ---------------------------------------------------------------------
+# 10. PDF 正文抽取（质量闸门）
+# ---------------------------------------------------------------------
+class TestPdfTextExtraction(FullTextTestBase):
+    """从 PDF 字节抽正文，以及「乱码必须被丢弃」这条硬规则。"""
+
+    def test_pdf_text_extracted_from_bytes(self):
+        """抽得到正文就采用（不下载到磁盘也能抽——用的是内存里的字节）。"""
+        fetcher = FullTextFetcher(timeout=5)
+        good = ('This is a readable body of text extracted from a PDF. ' * 8)
+        fake = types.SimpleNamespace(
+            extract_text=lambda raw: {'text': good, 'pages': 3, 'chars': len(good),
+                                      'method': 'content_stream', 'note': ''})
+        with mock.patch.dict(sys.modules, {'pdftext': fake}):
+            text, note = fetcher._pdf_text(b'%PDF-1.4 fake')
+        self.assertIn('readable body of text', text)
+        self.assertEqual(note, '')
+
+    def test_garbage_text_is_discarded(self):
+        """乱码必须被丢弃——它比没有文本更糟（会被当正文喂给模型）。"""
+        fetcher = FullTextFetcher(timeout=5)
+        garbage = ''.join(chr(i % 256) for i in range(3000))
+        fake = types.SimpleNamespace(
+            extract_text=lambda raw: {'text': garbage, 'pages': 1,
+                                      'chars': len(garbage),
+                                      'method': 'content_stream', 'note': ''})
+        with mock.patch.dict(sys.modules, {'pdftext': fake}):
+            text, note = fetcher._pdf_text(b'%PDF-1.4 fake')
+        self.assertEqual(text, '', '乱码不能被采用')
+        self.assertIn('不是可读文字', note)
+
+    def test_too_short_text_is_discarded(self):
+        """太短的文字没有信息量，也要丢弃。"""
+        fetcher = FullTextFetcher(timeout=5)
+        fake = types.SimpleNamespace(
+            extract_text=lambda raw: {'text': 'too short', 'pages': 1,
+                                      'chars': 9, 'method': 'content_stream',
+                                      'note': ''})
+        with mock.patch.dict(sys.modules, {'pdftext': fake}):
+            text, note = fetcher._pdf_text(b'%PDF-1.4 fake')
+        self.assertEqual(text, '')
+        self.assertIn('过短', note)
+
+    def test_empty_extraction_is_reported(self):
+        """扫描件没有文本层 → 如实说明，不报错。"""
+        fetcher = FullTextFetcher(timeout=5)
+        fake = types.SimpleNamespace(
+            extract_text=lambda raw: {'text': '', 'pages': 0, 'chars': 0,
+                                      'method': 'none', 'note': '没有文本层'})
+        with mock.patch.dict(sys.modules, {'pdftext': fake}):
+            text, note = fetcher._pdf_text(b'%PDF-1.4 fake')
+        self.assertEqual(text, '')
+        self.assertIn('文本层', note)
+
+    def test_missing_pdftext_module_is_graceful(self):
+        """没有 pdftext 模块也不能炸——只是没正文而已。"""
+        fetcher = FullTextFetcher(timeout=5)
+        with mock.patch.dict(sys.modules, {'pdftext': None}):
+            text, note = fetcher._pdf_text(b'%PDF-1.4 fake')
+        self.assertEqual(text, '')
+
+    def test_gate_accepts_real_world_text(self):
+        """闸门不能误伤真文本：英文、中文、中英混排、表格数字都要放行。"""
+        samples = [
+            ('english',
+             'and MHRA) and editors of many of the leading medical journals. '
+             'The hope is that the guidelines will better position journal '
+             'editors, peer reviewers, and journal readers.'),
+            ('chinese',
+             '目的为评估该方案在真实世界中的有效性与安全性，研究共纳入随机对照'
+             '试验十五项，涵盖三万余名受试者，结果显示显著降低主要终点事件风险。'),
+            ('mixed',
+             '结论：本研究纳入 15 项 RCT（n=32,410），95% CI 0.72-0.89，'
+             'P<0.001；亚组分析显示获益一致。'),
+            ('table',
+             'TABLE 1 Baseline characteristics: Age 63.4 (11.2) 62.1 (10.8), '
+             'Male 58% 61%, BMI 27.8 (4.1) 27.4 (3.9).'),
+        ]
+        for name, text in samples:
+            self.assertTrue(FullTextFetcher._looks_like_text(text),
+                            '闸门误伤了真实%s文本' % name)
+
+    def test_gate_rejects_decoded_garbage(self):
+        """闸门必须挡住 PDF 解码出来的二进制乱码。"""
+        # 真实样本：pdftext 未修复时从图片流解出来的乱码
+        garbage = ('\x91\x9bQ/\x97\x89Évm7ªnØM&\x8bÀ\n.\npÃn²í¸t]i'
+                   '\x9d¥\x98P\x97Ç-\xad°;\x8a$Î`³hA¶á©')
+        self.assertFalse(FullTextFetcher._looks_like_text(garbage))
+        # 循环乱码
+        cyclic = ''.join(chr(i % 256) for i in range(3000))
+        self.assertFalse(FullTextFetcher._looks_like_text(cyclic))
+
+    def test_ephemeral_reads_text_before_deleting_file(self):
+        """「不落地」也要能读到正文：抽取发生在删文件之前。"""
+        self.clear_proxy_env()
+        good = ('Readable PDF body text for the extraction gate test. ' * 8)
+        fake = types.SimpleNamespace(
+            extract_text=lambda raw: {'text': good, 'pages': 2, 'chars': len(good),
+                                      'method': 'content_stream', 'note': ''})
+        self.patch_network(routes=[
+            ('unpaywall', b'{"best_oa_location": '
+                         b'{"url_for_pdf": "https://example.invalid/p.pdf"}}',
+             'application/json'),
+            ('example.invalid/p.pdf', FAKE_PDF_BYTES, 'application/pdf'),
+        ])
+        with mock.patch.dict(sys.modules, {'pdftext': fake}):
+            fetcher = FullTextFetcher(email='u@example.org', timeout=5)
+            res = fetcher.fetch_ephemeral({
+                'pmid': '99', 'doi': '10.1000/x', 'title': 'T',
+                'journal': 'J', 'year': '2020'})
+        self.assertIn('Readable PDF body text', res['text'])
+        self.assertEqual(res['pdf_path'], '')
+        self.assertTrue(res['temp_removed'])
+
+    def test_download_to_dir_also_extracts_text(self):
+        """落盘模式下同样抽正文（不必再让用户自己想办法读 PDF）。"""
+        import tempfile
+        self.clear_proxy_env()
+        good = ('Readable PDF body text for the on-disk extraction test. ' * 8)
+        fake = types.SimpleNamespace(
+            extract_text=lambda raw: {'text': good, 'pages': 2, 'chars': len(good),
+                                      'method': 'content_stream', 'note': ''})
+        self.patch_network(routes=[
+            ('unpaywall', b'{"best_oa_location": '
+                         b'{"url_for_pdf": "https://example.invalid/p.pdf"}}',
+             'application/json'),
+            ('example.invalid/p.pdf', FAKE_PDF_BYTES, 'application/pdf'),
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(sys.modules, {'pdftext': fake}):
+                fetcher = FullTextFetcher(email='u@example.org', timeout=5,
+                                          download_dir=d, keep_downloads=True)
+                res = fetcher.fetch({'pmid': '88', 'doi': '10.1000/x',
+                                     'title': 'T', 'journal': 'J', 'year': '2020'})
+            self.assertIn('Readable PDF body text', res['text'])
+            self.assertTrue(res['pdf_path'])
+            self.assertTrue(os.path.exists(res['pdf_path']))
+
+    def test_no_download_dir_still_reads_text_and_leaves_nothing(self):
+        """没配下载目录时：正文照样要读到，磁盘上却不能留下任何东西。
+
+        这条很容易被实现成「没地方放就不下载」——但那样就白跑一趟，
+        用户既没有正文也没有文件。
+        """
+        self.clear_proxy_env()
+        before = set(os.listdir(tempfile.gettempdir()))
+        good = ('Readable PDF body text without a configured download dir. ' * 8)
+        fake = types.SimpleNamespace(
+            extract_text=lambda raw: {'text': good, 'pages': 2, 'chars': len(good),
+                                      'method': 'content_stream', 'note': ''})
+        self.patch_network(routes=[
+            ('unpaywall', b'{"best_oa_location": '
+                         b'{"url_for_pdf": "https://example.invalid/p.pdf"}}',
+             'application/json'),
+            ('example.invalid/p.pdf', FAKE_PDF_BYTES, 'application/pdf'),
+        ])
+        with mock.patch.dict(sys.modules, {'pdftext': fake}):
+            fetcher = FullTextFetcher(email='u@example.org', timeout=5)
+            res = fetcher.fetch({'pmid': '77', 'doi': '10.1000/x', 'title': 'T',
+                                 'journal': 'J', 'year': '2020'})
+        self.assertIn('Readable PDF body text', res['text'])
+        self.assertEqual(res['pdf_path'], '', '没配目录就不该留下 PDF 路径')
+        self.assertTrue(res.get('temp_removed'), '走了临时路径就要报告删除结果')
+        after = set(os.listdir(tempfile.gettempdir()))
+        leaked = {n for n in (after - before)
+                  if n.startswith('medlit-ft-') or n.endswith('.pdf')
+                  or n.endswith('.part')}
+        self.assertEqual(leaked, set(), '留下了残留文件：%s' % sorted(leaked))
+
+    def test_fetch_result_has_no_temp_removed_when_file_kept(self):
+        """PDF 被保留时，返回结构就是文档里那 8 个字段（不多带 temp_removed）。"""
+        import tempfile
+        self.clear_proxy_env()
+        self.patch_network(routes=[
+            ('unpaywall', b'{"best_oa_location": '
+                         b'{"url_for_pdf": "https://example.invalid/p.pdf"}}',
+             'application/json'),
+            ('example.invalid/p.pdf', FAKE_PDF_BYTES, 'application/pdf'),
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            fetcher = FullTextFetcher(email='u@example.org', timeout=5,
+                                      download_dir=d, keep_downloads=True)
+            res = fetcher.fetch({'pmid': '66', 'doi': '10.1000/x', 'title': 'T',
+                                 'journal': 'J', 'year': '2020'})
+        self.assertNotIn('temp_removed', res)
+        self.assertNotIn('_used_temp', res)
+        for key in ('source', 'text', 'sections', 'figures', 'pdf_path',
+                    'url', 'ok', 'note'):
+            self.assertIn(key, res)
+
+    def test_ephemeral_always_has_temp_removed(self):
+        """fetch_ephemeral 恒带 temp_removed 字段。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=[])
+        fetcher = FullTextFetcher(email='u@example.org', timeout=1)
+        res = fetcher.fetch_ephemeral({'pmid': '5', 'doi': '10.1/x', 'title': 'T',
+                                       'journal': 'J', 'year': '2020'})
+        self.assertIn('temp_removed', res)
+        self.assertTrue(res['temp_removed'])
+        self.assertNotIn('_used_temp', res)
 
 
 if __name__ == '__main__':
