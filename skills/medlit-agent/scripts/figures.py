@@ -307,6 +307,33 @@ def _absolute_url(href: str, base: str) -> str:
     return urllib.parse.urljoin(b, h)
 
 
+def _as_text(raw: Any) -> str:
+    """把模型给的不确定类型字段归一化成纯文本。
+
+    为什么需要：模型对"多个数值"这种字段有两种常见返回——
+    **一个字符串**（"A; B; C"）或者**一个数组**（["A", "B", "C"]）。
+    实测（Qwen/Qwen3-VL-8B-Instruct 读森林图）返回的就是数组。
+    如果直接 `str()`，数组会变成 Python 字面量：
+        "['Glycated hemoglobin...', 'Fasting plasma glucose...']"
+    下游会把它原样塞进证据表与答案，读者看到的是带引号方括号的乱码。
+
+    统一成：用「；」连接各元素（与提示词里"多个用分号分隔"一致）。
+    """
+    if raw is None:
+        return ''
+    if isinstance(raw, (list, tuple, set)):
+        parts = []
+        for x in raw:
+            t = _as_text(x)
+            if t:
+                parts.append(t)
+        return '；'.join(parts).strip()
+    if isinstance(raw, dict):
+        # 字典不该出现在这里，当成空处理而不是打印出来
+        return ''
+    return str(raw).strip()
+
+
 def _norm_kind(raw: Any) -> str:
     """把模型给的图类型归一化到枚举内。
 
@@ -688,8 +715,8 @@ class FigureReader:
             # 下游需要知道"这张图没能被正确分类"，而不只是看到 other。
             out['error'] = ('模型返回了非法图类型「%s」，已归一为 other'
                             % raw_kind[:40])
-        out['description'] = str(obj.get('description') or '').strip()
-        out['key_values'] = str(obj.get('key_values') or '').strip()
+        out['description'] = _as_text(obj.get('description'))
+        out['key_values'] = _as_text(obj.get('key_values'))
         return out
 
     # ---- 调模型 ----

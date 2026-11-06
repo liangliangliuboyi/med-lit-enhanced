@@ -445,6 +445,114 @@ class TestFontIsolation(unittest.TestCase):
         self.assertEqual(text.count('中'), 1)
 
 
+class TestExtractImages(unittest.TestCase):
+    """从 PDF 里抠出内嵌图片。"""
+
+    def _jpeg_pdf(self, width=200, height=150, payload=None, extra=b''):
+        if payload is None:
+            payload = b'\xff\xd8\xff\xe0' + b'\x00' * 4000 + b'\xff\xd9'
+        body = (b'<< /Type /XObject /Subtype /Image /Width %d /Height %d '
+                b'/ColorSpace /DeviceRGB /BitsPerComponent 8 '
+                b'/Filter /DCTDecode /Length %d'
+                % (width, height, len(payload))) + extra + b' >>\nstream\n'
+        return build_pdf([(1, body + payload + b'\nendstream')])
+
+    def test_extracts_dct_jpeg(self):
+        imgs = pdftext.extract_images(self._jpeg_pdf())
+        self.assertEqual(len(imgs), 1)
+        img = imgs[0]
+        self.assertEqual(img['ext'], 'jpg')
+        self.assertEqual(img['width'], 200)
+        self.assertEqual(img['height'], 150)
+        self.assertEqual(img['index'], 0)
+        self.assertTrue(img['data'].startswith(b'\xff\xd8'))
+
+    def test_small_image_filtered_out(self):
+        # 像素太少（8x8）-> 被过滤
+        imgs = pdftext.extract_images(self._jpeg_pdf(width=8, height=8))
+        self.assertEqual(imgs, [])
+
+    def test_extreme_aspect_ratio_filtered_out(self):
+        # 2000x100，比例 20:1 -> 判定为分隔线，过滤
+        imgs = pdftext.extract_images(self._jpeg_pdf(width=2000, height=100))
+        self.assertEqual(imgs, [])
+
+    def test_too_small_bytes_filtered_out(self):
+        # 像素够多但字节数太小（默认 3KB 门槛）
+        payload = b'\xff\xd8\xff\xe0' + b'\x00' * 100 + b'\xff\xd9'
+        imgs = pdftext.extract_images(self._jpeg_pdf(payload=payload))
+        self.assertEqual(imgs, [])
+
+    def test_non_pdf_returns_empty(self):
+        self.assertEqual(pdftext.extract_images(b'not a pdf at all'), [])
+        self.assertEqual(pdftext.extract_images(b''), [])
+        self.assertEqual(pdftext.extract_images('a string'), [])
+
+    def test_pdf_without_images_returns_empty(self):
+        pdf = build_pdf([(1, stream_obj(b'BT (Hello) Tj ET'))])
+        self.assertEqual(pdftext.extract_images(pdf), [])
+
+    def test_max_images_limit(self):
+        objs = []
+        for i in range(1, 8):
+            payload = b'\xff\xd8\xff\xe0' + bytes([i]) * 4000 + b'\xff\xd9'
+            objs.append((i, (b'<< /Type /XObject /Subtype /Image '
+                             b'/Width 200 /Height 150 /Filter /DCTDecode '
+                             b'/Length %d >>\nstream\n' % len(payload))
+                            + payload + b'\nendstream'))
+        imgs = pdftext.extract_images(build_pdf(objs), max_images=3)
+        self.assertEqual(len(imgs), 3)
+        self.assertEqual([i['index'] for i in imgs], [0, 1, 2])
+
+    def test_oversized_stream_is_skipped_not_fatal(self):
+        # 声明的像素尺寸超过 max_pixels -> 跳过，但不影响其它图片
+        big = self._jpeg_pdf(width=8000, height=8000)
+        good = self._jpeg_pdf(width=200, height=150)
+        # 拼两个 PDF 不现实，改为直接测：超大图被跳过、函数不抛异常
+        self.assertEqual(pdftext.extract_images(big, max_pixels=1000000), [])
+        self.assertEqual(len(pdftext.extract_images(good)), 1)
+
+    def test_stream_over_max_bytes_skipped(self):
+        # 单张流超过 max_bytes -> 跳过并继续，不中断整篇
+        payload = b'\xff\xd8\xff\xe0' + b'\x00' * 9000 + b'\xff\xd9'
+        pdf = self._jpeg_pdf(payload=payload)
+        self.assertEqual(pdftext.extract_images(pdf, max_bytes=1000), [])
+        # 默认门槛下这张图是能抠出来的
+        self.assertEqual(len(pdftext.extract_images(pdf)), 1)
+
+    def test_flate_image_becomes_png(self):
+        # /FlateDecode 的裸位图 -> 自己包成 PNG
+        # 尺寸要过 10000 像素的门槛（120x100=12000）
+        width, height = 120, 100
+        pixels = bytes([(x * 7) % 256 for x in range(width * height * 3)])
+        comp = zlib.compress(pixels)
+        body = (b'<< /Type /XObject /Subtype /Image /Width %d /Height %d '
+                b'/ColorSpace /DeviceRGB /BitsPerComponent 8 '
+                b'/Filter /FlateDecode /Length %d >>\nstream\n'
+                % (width, height, len(comp))) + comp + b'\nendstream'
+        imgs = pdftext.extract_images(build_pdf([(1, body)]), min_bytes=10)
+        self.assertEqual(len(imgs), 1)
+        self.assertEqual(imgs[0]['ext'], 'png')
+        data = imgs[0]['data']
+        self.assertTrue(data.startswith(b'\x89PNG\r\n\x1a\n'))
+        # PNG 结构自检：签名 + IHDR + IDAT + IEND，CRC 正确
+        self.assertIn(b'IHDR', data)
+        self.assertIn(b'IDAT', data)
+        self.assertTrue(data.endswith(b'IEND\xaeB`\x82'))
+        # IDAT 里的 zlib 数据能解开，且长度 = 每行(1 过滤字节 + 像素)
+        pos = data.find(b'IDAT')
+        length = int.from_bytes(data[pos - 4:pos], 'big')
+        idat = data[pos + 4:pos + 4 + length]
+        raw = zlib.decompress(idat)
+        self.assertEqual(len(raw), height * (1 + width * 3))
+
+    def test_dct_stream_without_jpeg_magic_rejected(self):
+        # 流数据不是 JPEG（魔数不对）-> 跳过
+        payload = b'NOTJPEG' + b'\x00' * 4000
+        imgs = pdftext.extract_images(self._jpeg_pdf(payload=payload))
+        self.assertEqual(imgs, [])
+
+
 class TestRealWorldShapes(unittest.TestCase):
     """接近真实排版的结构。"""
 
@@ -502,6 +610,23 @@ class TestRealWorldShapes(unittest.TestCase):
         self.assertIn('line1', text)
         self.assertIn('line2', text)
         self.assertLess(text.index('line1'), text.index('line2'))
+
+    def test_page_with_multiple_content_streams(self):
+        # 页面的 /Contents 可以是引用数组（一页拆成多个流），
+        # 两个流的内容都要抽出来。
+        pdf = build_pdf([
+            (1, b'<< /Type /Catalog /Pages 4 0 R >>'),
+            (2, b'<< /Type /Page /Parent 4 0 R /Resources << /Font '
+                b'<< /F1 5 0 R >> >> /Contents [3 0 R 6 0 R] >>'),
+            (3, stream_obj(b'BT /F1 12 Tf (FirstHalf) Tj ET')),
+            (4, b'<< /Type /Pages /Kids [2 0 R] /Count 1 >>'),
+            (5, b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'),
+            (6, stream_obj(b'BT /F1 12 Tf (SecondHalf) Tj ET')),
+        ])
+        res = pdftext.extract_text(pdf)
+        self.assertEqual(res['pages'], 1)
+        self.assertIn('FirstHalf', res['text'])
+        self.assertIn('SecondHalf', res['text'])
 
     def test_xobject_image_is_not_extracted(self):
         pdf = build_pdf([

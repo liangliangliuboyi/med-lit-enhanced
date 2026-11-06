@@ -37,8 +37,13 @@ def _ok_json(kind='forest_plot', desc='横轴为风险比，纵轴为研究名�
 class StubChat:
     """桩模型调用。
 
-    记录调用次数与并发峰值；可以给每个调用指定延迟（用来制造乱序完成），
-    也可以指定某个调用抛异常（用来测失败隔离）。
+    记录调用次数与并发峰值；可以按**图的序号**指定延迟（用来制造乱序完成），
+    也可以指定某个序号抛异常（用来测失败隔离）。
+
+    ⚠️ 按序号定位而不是按"第几次调用"定位：并发下调用到达桩的先后是
+    不确定的，按序号定位才能稳定地测到"指定的**那张**图失败"。
+    早期版本按调用序号抛异常，偶发地把错误落到别的图上——这类 flaky
+    测试比没有测试更糟。
     """
 
     def __init__(self, content=None, delays=None, raise_on=None,
@@ -53,25 +58,51 @@ class StubChat:
         self.peak = 0
         self.completed = []          # 完成顺序（用于验证乱序）
         self.seen_messages = []
+        self.fig_order = []          # 各图完成时的序号（用于验证乱序）
 
     def __call__(self, role, messages, temperature=0.2, max_tokens=800,
                  model=None, **kwargs):
+        fig = _fig_index_of(messages)
         with self.lock:
             self.calls += 1
-            n = self.calls
             self.active += 1
             self.peak = max(self.peak, self.active)
         try:
-            time.sleep(self.delays.get(n, 0))
+            time.sleep(self.delays.get(fig, 0))
             self.seen_messages.append(messages)
             with self.lock:
-                self.completed.append(n)
-            if n in self.raise_on:
-                raise RuntimeError(self.errors.get(n, 'boom'))
+                self.completed.append(fig)
+                self.fig_order.append(fig)
+            if fig in self.raise_on:
+                raise RuntimeError(self.errors.get(fig, 'boom'))
             return {'content': self.content, 'model': 'stub-model'}
         finally:
             with self.lock:
                 self.active -= 1
+
+
+def _fig_index_of(messages) -> int:
+    """从桩收到的消息里认出这是第几张图。
+
+    认法：下载替身把图片 URL 塞进了图片字节里（b'FIGURL:<url>'），
+    这里把它抠出来，从 URL 末尾的 fig<N> 取出序号。
+    认不出就返回 -1（表示"不针对特定图"）。
+    """
+    try:
+        import base64
+        import re
+        content = messages[0]['content']
+        img = content[1]
+        url = img['image_url']['url']
+        b64 = url.split(',', 1)[-1]
+        raw = base64.b64decode(b64)
+        m = re.search(rb'FIGURL:(.*?)FIGEND', raw, re.S)
+        if not m:
+            return -1
+        um = re.search(r'fig(\d+)', m.group(1).decode('utf-8', 'ignore'))
+        return int(um.group(1)) if um else -1
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 def _fake_downloader(payloads=None, ctype='image/png'):
@@ -80,6 +111,8 @@ def _fake_downloader(payloads=None, ctype='image/png'):
     默认**每个 URL 返回不同的字节**——真实的图各不相同；如果所有 URL
     都返回同一份内容，内容指纹去重会把后面的图全判成重复（那正是
     去重逻辑该做的事，但会掩盖其他测试）。
+
+    返回的字节里嵌了 b'FIGURL:<url>FIGEND'，供 StubChat 认出是第几张图。
     """
     payloads = payloads or {}
 
@@ -90,7 +123,8 @@ def _fake_downloader(payloads=None, ctype='image/png'):
                     return val[0], val[1]
                 return val, ctype
         # 按 URL 派生一份稳定且互不相同的内容
-        return PNG_BYTES + url.encode('utf-8'), ctype
+        return (PNG_BYTES + b'FIGURL:' + url.encode('utf-8') + b'FIGEND',
+                ctype)
 
     return _dl
 
@@ -122,8 +156,8 @@ class TestOrderPreserved(unittest.TestCase):
     """并发下完成顺序是乱的，返回顺序必须还原成输入顺序。"""
 
     def test_output_order_matches_input_order(self):
-        # 延迟递减 → 完成顺序与提交顺序正好相反
-        chat = StubChat(delays={1: 0.30, 2: 0.24, 3: 0.18, 4: 0.12, 5: 0.06})
+        # 延迟按图序号递减 → 完成顺序与提交顺序正好相反
+        chat = StubChat(delays={0: 0.30, 1: 0.24, 2: 0.18, 3: 0.12, 4: 0.06})
         reader = _reader(chat)
         ft = _fulltext(5)
         out = reader.read_all(ft)
@@ -135,9 +169,9 @@ class TestOrderPreserved(unittest.TestCase):
 
     def test_completion_order_was_actually_scrambled(self):
         """确认上一条测试真的制造出了乱序（否则顺序断言是假阳性）。"""
-        chat = StubChat(delays={1: 0.30, 2: 0.24, 3: 0.18, 4: 0.12, 5: 0.06})
+        chat = StubChat(delays={0: 0.30, 1: 0.24, 2: 0.18, 3: 0.12, 4: 0.06})
         out = _reader(chat).read_all(_fulltext(5))
-        self.assertNotEqual(chat.completed, sorted(chat.completed))
+        self.assertNotEqual(chat.fig_order, sorted(chat.fig_order))
         # 但返回顺序仍然是输入顺序
         self.assertEqual([o['index'] for o in out], [0, 1, 2, 3, 4])
 
@@ -153,14 +187,14 @@ class TestOrderPreserved(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestConcurrency(unittest.TestCase):
     def test_concurrency_actually_happens(self):
-        chat = StubChat(delays={n: 0.15 for n in range(1, 6)})
+        chat = StubChat(delays={n: 0.15 for n in range(0, 5)})
         out = _reader(chat).read_all(_fulltext(5))
         self.assertEqual(len(out), 5)
         self.assertGreater(chat.peak, 1, '应当真的并发，而不是串行')
 
     def test_peak_concurrency_within_cap(self):
         """并发度硬上限 8：即使调用方要 64，也不得超过 8。"""
-        chat = StubChat(delays={n: 0.15 for n in range(1, 21)})
+        chat = StubChat(delays={n: 0.15 for n in range(0, 20)})
         reader = _reader(chat, workers=64, max_figures=20)
         out = reader.read_all(_fulltext(20))
         self.assertEqual(len(out), 20)
@@ -183,7 +217,7 @@ class TestConcurrency(unittest.TestCase):
 class TestFailureIsolation(unittest.TestCase):
     def test_one_failure_does_not_affect_others(self):
         """第 2 张抛异常：其余照常，失败那条 error 非空，函数不抛异常。"""
-        chat = StubChat(raise_on={2}, errors={2: '模型服务 500'})
+        chat = StubChat(raise_on={1}, errors={1: '模型服务 500'})
         reader = _reader(chat)
         out = reader.read_all(_fulltext(5))   # 不抛异常即为通过
         self.assertEqual(len(out), 5)
@@ -196,7 +230,7 @@ class TestFailureIsolation(unittest.TestCase):
             self.assertTrue(out[i]['description'])
 
     def test_all_failing_still_returns_entries(self):
-        chat = StubChat(raise_on={1, 2, 3})
+        chat = StubChat(raise_on={0, 1, 2})
         out = _reader(chat).read_all(_fulltext(3))
         self.assertEqual(len(out), 3)
         for item in out:
@@ -755,3 +789,62 @@ class TestMisc(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestFieldTypeNormalization(unittest.TestCase):
+    """模型返回的字段类型不确定，要归一化成纯文本。
+
+    背景（2026-11-06 实测）：Qwen/Qwen3-VL-8B-Instruct 读森林图时，
+    `key_values` 返回的是**数组**：
+        ["Glycated hemoglobin, %: ETD (95% CI) -0.44 (-0.68 to -0.21)", ...]
+    原实现用 `str()` 转，数组会变成 Python 字面量
+    `['Glycated hemoglobin...', 'Fasting plasma glucose...']`——
+    下游会把它原样塞进证据表与答案，读者看到的是带引号方括号的乱码。
+    """
+
+    def test_list_is_joined_with_semicolon(self):
+        self.assertEqual(
+            figures._as_text(['A: ETD -0.44', 'B: ETD -1.45']),
+            'A: ETD -0.44；B: ETD -1.45')
+
+    def test_string_passes_through(self):
+        self.assertEqual(figures._as_text('单个字符串'), '单个字符串')
+
+    def test_empty_list_becomes_empty_string(self):
+        """空数组不能变成 '[]'。"""
+        self.assertEqual(figures._as_text([]), '')
+
+    def test_none_becomes_empty_string(self):
+        self.assertEqual(figures._as_text(None), '')
+
+    def test_numbers_are_stringified(self):
+        self.assertEqual(figures._as_text(3.5), '3.5')
+
+    def test_dict_is_treated_as_empty(self):
+        """字典不该出现在这个字段里，别把它打印出来。"""
+        self.assertEqual(figures._as_text({'a': 1}), '')
+
+    def test_list_elements_are_stripped_and_blanks_dropped(self):
+        self.assertEqual(figures._as_text(['  A  ', '', '  ', 'B']),
+                         'A；B')
+
+    def test_nested_list_is_flattened(self):
+        self.assertEqual(figures._as_text([['A', 'B'], 'C']), 'A；B；C')
+
+    def test_real_model_output_shape_is_normalized(self):
+        """按实测拿到的真实返回形状跑一遍。"""
+        raw = {
+            'kind': 'forest_plot',
+            'description': '这张森林图展示了多个代谢指标的疗效比较。',
+            'key_values': [
+                'Glycated hemoglobin, %: ETD (95% CI) -0.44 (-0.68 to -0.21)',
+                'Fasting plasma glucose, mg/dL: ETD (95% CI) -9.92 (-16.20 to -3.64)',
+                'BMI: ETD (95% CI) -1.45 (-2.40 to -0.49)',
+            ],
+        }
+        kv = figures._as_text(raw['key_values'])
+        self.assertNotIn('[', kv)
+        self.assertNotIn("'", kv)
+        self.assertIn('；', kv)
+        self.assertIn('ETD (95% CI) -0.44', kv)
+        self.assertEqual(figures._norm_kind(raw['kind']), 'forest_plot')

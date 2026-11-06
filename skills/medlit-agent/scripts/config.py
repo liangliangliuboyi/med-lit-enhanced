@@ -236,6 +236,48 @@ def doctor() -> list[dict]:
 
     items.append({'item': '配置文件', 'ok': True, 'detail': describe_sources(cfg)})
 
+    # ---- 面向交医场景的可选能力 ----
+    # 这些都不是"缺了就跑不了"，但配了会明显更好用，
+    # 所以要让人一眼看出"现在能用哪些"。
+    res = cfg.get('resources') or {}
+    up_email = str(res.get('unpaywall_email') or '').strip()
+    if not up_email:
+        up_email = str((cfg.get('pubmed') or {}).get('email') or '').strip()
+    items.append({
+        'item': '开放获取全文查询（Unpaywall，选填）',
+        'ok': bool(up_email),
+        'detail': ('已配置邮箱：' + up_email) if up_email else
+                  '未配置。Unpaywall 的接口必须带邮箱参数（他们的要求），'
+                  '留空则跳过这一路全文来源（PMC / Europe PMC 不受影响）',
+    })
+
+    figs = cfg.get('figures') or {}
+    fig_model = str(figs.get('model') or '').strip()
+    items.append({
+        'item': '图表识别（选填）',
+        'ok': True,
+        'detail': ('已开启，模型 ' + fig_model) if figs.get('enabled') else
+                  ('未开启（用 --figures 临时开启）。模型 ' + (fig_model or '默认') +
+                   '；开启后会用多模态模型读论文插图里的效应量'),
+    })
+
+    # JCR 索引：文件在不在决定"证据表有没有 IF/分区列"
+    try:
+        import jcr
+        jidx = jcr.get_index()
+        n = len(jidx.raw)
+        items.append({
+            'item': '期刊评价索引（JCR + 中科院分区）',
+            'ok': bool(n),
+            'detail': (f'已加载 {n} 本刊（IF / JCR 分区 / 中科院大区）') if n else
+                      '未找到 assets/jcr_2026_index.json；'
+                      '证据表将不显示 IF/分区列（其余功能不受影响）',
+        })
+    except Exception as e:  # noqa: BLE001
+        items.append({'item': '期刊评价索引（JCR + 中科院分区）', 'ok': False,
+                      'detail': '加载失败：%s（证据表将不显示 IF/分区列）'
+                                % type(e).__name__})
+
     import sys
     v = sys.version_info
     items.append({'item': 'Python 版本', 'ok': v >= (3, 9),

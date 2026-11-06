@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import base64
 import re
+import struct
 import sys
 import time
 import zlib
@@ -179,6 +180,298 @@ def extract_text(pdf_bytes: bytes, max_chars: int = 200000) -> dict:
                        'PDF 解析异常：%s: %s' % (type(exc).__name__, exc))
 
 
+def extract_images(pdf_bytes: bytes, min_bytes: int = 3000,
+                   max_images: int = 20,
+                   max_pixels: int = 4000000,
+                   max_bytes: int = 32 * 1024 * 1024) -> list:
+    """从 PDF 字节里抠出内嵌图片。
+
+    返回 [{'data': bytes, 'ext': 'jpg'|'png', 'width': int, 'height': int,
+           'index': int}, ...]
+
+    为什么需要它：现在的链路是「HTML/XML 全文 -> 找 <img> -> 下载 -> 送 VL
+    识图」。但很多开放获取论文**只有 PDF**（Europe PMC 给不出 XML），
+    这时拿不到图，图表识别功能直接失效，而 PDF 里的内嵌图是可以直接抠的。
+
+    两条路径：
+      - /DCTDecode（JPEG）：流数据**原样就是完整 JPEG**，直接截出来即可，
+        零解码成本。这类占绝大多数。
+      - /FlateDecode（zlib 压缩的裸位图）：解压后自己包一层 PNG。
+
+    过滤规则（否则会抠出一堆期刊 logo、页眉横线）：
+      - 字节数 < min_bytes：装饰性小图标、线条
+      - 单张 > max_bytes：超大图跳过（防御畸形 PDF 里的巨图）
+      - width*height < 10000 或 > max_pixels：期刊 logo、分子结构示意图
+      - 宽高比 > 8:1 或 < 1:8：分隔线
+      - 最多返回 max_images 张
+
+    任何异常都不外泄——最坏情况返回空列表；单张图出错只跳过它，
+    不会中断整篇。
+    """
+    try:
+        return _extract_images(pdf_bytes, min_bytes, max_images, max_pixels,
+                               max_bytes)
+    except Exception:  # noqa: BLE001 —— 兜底，绝不让异常外泄
+        return []
+
+
+def _extract_images(pdf_bytes, min_bytes, max_images, max_pixels, max_bytes):
+    if isinstance(pdf_bytes, (bytearray, memoryview)):
+        pdf_bytes = bytes(pdf_bytes)
+    if not isinstance(pdf_bytes, bytes) or not pdf_bytes:
+        return []
+    if not is_pdf(pdf_bytes):
+        return []
+
+    objects = _scan_objects(pdf_bytes)
+    if not objects:
+        return []
+    by_num = {}
+    for obj in objects:
+        by_num[obj.num] = obj
+    _expand_object_streams(pdf_bytes, objects, by_num)
+
+    images = []
+    for obj in by_num.values():
+        if len(images) >= max_images:
+            break
+        if not obj.has_stream:
+            continue
+        # 超大流直接跳过：既省内存，也不该让整篇提取失败
+        if len(obj.stream_raw) > max_bytes:
+            continue
+        if not _is_image_xobject(obj):
+            continue
+        width = _int_of(obj.dict.get('Width'), 0)
+        height = _int_of(obj.dict.get('Height'), 0)
+        if width <= 0 or height <= 0:
+            continue
+        # 像素数过滤：太小是图标/logo，太大是没必要的巨图
+        pixels = width * height
+        if pixels < 10000 or pixels > max_pixels:
+            continue
+        # 宽高比过滤：极端比例基本是分隔线或页眉横条
+        ratio = width / float(height)
+        if ratio > 8.0 or ratio < 0.125:
+            continue
+
+        try:
+            data = _image_payload(obj, width, height)
+        except Exception:  # noqa: BLE001 —— 单张图失败只跳过它
+            continue
+        if data is None:
+            continue
+        if len(data) < min_bytes:
+            continue
+        images.append({
+            'data': data,
+            'ext': 'jpg' if data[:2] == b'\xff\xd8' else 'png',
+            'width': width,
+            'height': height,
+            'index': len(images),
+        })
+    return images
+
+
+def _is_image_xobject(obj: _Obj) -> bool:
+    """这个对象是不是图片 XObject（/Type /XObject /Subtype /Image）。"""
+    dct = obj.dict
+    t = dct.get('Type')
+    st = dct.get('Subtype')
+    if not (t and t[0] == 'name' and t[1] == 'XObject'):
+        return False
+    return bool(st and st[0] == 'name' and st[1] == 'Image')
+
+
+def _int_of(val, default: int = 0) -> int:
+    """从 ('num', x) 里取整数。"""
+    if val is None or val[0] != 'num':
+        return default
+    try:
+        return int(val[1])
+    except (TypeError, ValueError):
+        return default
+
+
+def _image_payload(obj: _Obj, width: int, height: int):
+    """取出图片的字节数据与格式（jpg / png）。
+
+    DCTDecode：流数据原样就是 JPEG，直接返回。
+    FlateDecode：解压后是裸像素，自己包一层 PNG。
+    """
+    filters = _filters_of(obj.dict)
+    if 'DCTDecode' in filters:
+        # JPEG：原样就是完整 JPEG 文件
+        data = obj.stream_raw
+        # 去掉流数据末尾多出来的 EOL（PDF 里 stream...endstream 之间
+        # 常见一个换行，不去掉会让某些 JPEG 解码器报错）
+        if data.endswith(b'\r\n'):
+            data = data[:-2]
+        elif data.endswith(b'\n') or data.endswith(b'\r'):
+            data = data[:-1]
+        return data if data[:2] == b'\xff\xd8' else None
+
+    if 'FlateDecode' in filters:
+        raw = _inflate(obj.stream_raw)
+        if not raw:
+            return None
+        return _pack_png(raw, width, height, obj.dict)
+    return None
+
+
+def _pack_png(raw: bytes, width: int, height: int, dct: dict):
+    """把裸像素数据包成 PNG。
+
+    PNG = 签名 + IHDR + IDAT(zlib) + IEND，每块都要算 CRC32。
+    只支持 8 位深度的 DeviceGray / DeviceRGB / DeviceCMYK / Indexed，
+    以及带 /DecodeParms /Predictor 的 PNG 预测器（部分 PDF 用它压缩位图）。
+    """
+    bits = _int_of(dct.get('BitsPerComponent'), 8)
+    if bits != 8:
+        # 16 位/1 位/4 位的位图打包很麻烦，且论文里的图基本都是 8 位
+        return None
+    colors = _color_components(dct.get('ColorSpace'))
+    if not colors:
+        return None
+    expected = width * height * colors
+    if len(raw) < expected:
+        return None
+    pixels = raw[:expected]
+
+    # /DecodeParms /Predictor 12（PNG 预测器）：每行前面有一个过滤类型字节
+    predictor = _predictor_of(dct)
+    row_len = width * colors
+    if predictor >= 10:
+        pixels = _undo_png_predictor(pixels, width, height, colors)
+        if pixels is None:
+            return None
+        row_len = width * colors + 1
+
+    # PNG 的每行前面要加一个「过滤类型」字节（0 = None）
+    rows = []
+    for r in range(height):
+        start = r * row_len
+        end = start + row_len
+        if end > len(pixels):
+            break
+        rows.append(b'\x00' + pixels[start:end])
+    if len(rows) != height:
+        return None
+    body = zlib.compress(b''.join(rows), 6)
+
+    color_type = {1: 0, 3: 2, 4: 6}.get(colors)
+    if color_type is None:
+        return None
+    ihdr = _png_chunk(b'IHDR', struct.pack('>IIBBBBB', width, height,
+                                           8, color_type, 0, 0, 0))
+    return (b'\x89PNG\r\n\x1a\n' + ihdr
+            + _png_chunk(b'IDAT', body) + _png_chunk(b'IEND', b''))
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    """拼一个 PNG 块：长度 + 类型 + 数据 + CRC32。"""
+    return (struct.pack('>I', len(data)) + kind + data
+            + struct.pack('>I', zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+
+def _color_components(colorspace):
+    """从 /ColorSpace 推出每像素的字节数（1=灰度 3=RGB 4=CMYK）。"""
+    if colorspace is None:
+        return None
+    if colorspace[0] == 'name':
+        name = colorspace[1]
+        if name in ('DeviceGray', 'CalGray', 'G'):
+            return 1
+        if name in ('DeviceRGB', 'CalRGB', 'RGB'):
+            return 3
+        if name == 'DeviceCMYK':
+            return 4
+        return None
+    if colorspace[0] == 'array':
+        items = colorspace[1]
+        if not items:
+            return None
+        first = items[0]
+        if first[0] == 'name':
+            name = first[1]
+            if name in ('DeviceGray', 'CalGray', 'G'):
+                return 1
+            if name in ('DeviceRGB', 'CalRGB', 'RGB'):
+                return 3
+            if name == 'DeviceCMYK':
+                return 4
+            return None
+        if first[0] == 'ref':
+            # ICCBased：要看被引用流字典里的 /N
+            return 3      # ICCBased 最常见是 3 通道
+        if first[0] == 'dict':
+            # Indexed：调色板，1 通道
+            return 1
+    return None
+
+
+def _predictor_of(dct: dict) -> int:
+    """读 /DecodeParms 里的 /Predictor（没有就是 1）。"""
+    parms = dct.get('DecodeParms')
+    if parms is None:
+        return 1
+    if parms[0] == 'array' and parms[1]:
+        parms = parms[1][0]
+    if parms[0] != 'dict':
+        return 1
+    return _int_of(parms[1].get('Predictor'), 1)
+
+
+def _undo_png_predictor(data: bytes, width: int, height: int, colors: int):
+    """还原 PNG 预测器（/Predictor 10~15，常见 12=PNG Up）。
+
+    每行开头有一个过滤类型字节，之后按类型做加减。
+    """
+    bpp = colors
+    row_len = width * colors
+    out = bytearray()
+    prev = bytearray(row_len)
+    pos = 0
+    for _ in range(height):
+        if pos >= len(data):
+            return None
+        ft = data[pos]
+        pos += 1
+        row = bytearray(data[pos:pos + row_len])
+        if len(row) < row_len:
+            return None
+        pos += row_len
+        if ft == 1:      # Sub
+            for i in range(bpp, row_len):
+                row[i] = (row[i] + row[i - bpp]) & 0xFF
+        elif ft == 2:    # Up
+            for i in range(row_len):
+                row[i] = (row[i] + prev[i]) & 0xFF
+        elif ft == 3:    # Average
+            for i in range(row_len):
+                left = row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif ft == 4:    # Paeth
+            for i in range(row_len):
+                a = row[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                if pa <= pb and pa <= pc:
+                    pr = a
+                elif pb <= pc:
+                    pr = b
+                else:
+                    pr = c
+                row[i] = (row[i] + pr) & 0xFF
+        elif ft != 0:
+            return None
+        out.extend(row)
+        prev = row
+    return bytes(out)
+
+
 # ----------------------------------------------------------------------
 # 内部实现
 # ----------------------------------------------------------------------
@@ -249,9 +542,16 @@ def _extract_text(pdf_bytes, max_chars) -> dict:
             chunks.append(text)
 
     if not chunks:
+        # 区分「流解压失败」和「确实没有文本层」——这两种情况的原因
+        # 完全不同，上游要能据此判断是该重试还是该走 OCR。
+        notes = []
+        if skipped:
+            notes.append('有 %d 个流解压失败，已跳过' % skipped)
         if encrypted:
-            note = ('PDF 含 /Encrypt 加密标记，内容流需要口令才能解密，'
-                    '本次未取到文本层（也可能是扫描件）')
+            notes.append('PDF 含 /Encrypt 加密标记，内容流需要口令才能解密')
+        if notes:
+            notes.append('未取到文本层（也可能是扫描件）')
+            note = '；'.join(notes)
         else:
             note = '内容流里没有文本算子，可能是扫描件（无文本层）'
         return _result('', pages, 'none', note)
