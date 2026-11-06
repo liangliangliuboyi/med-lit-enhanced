@@ -374,9 +374,23 @@ def _pmc_id_from_url(url: str) -> str:
     `/rest/{PMCID}/supplementaryFiles`，返回该文全部图片的 zip。
     当 PMC 的 /bin/ 直链拿不到图时（实测：对部分文献返回 404 或一个
     HTML 的反爬页而不是图片），可以从这个 zip 里按文件名取图。
+
+    要认两种地址形态（实测两种都真实存在）：
+      1. `.../pmc/articles/PMC4580597/bin/xxx.jpg` —— 传统归档地址
+      2. `.../pmc/blobs/d5b5/4580597/8c02.../xxx.jpg` —— PMC 新版
+         HTML 源给的 CDN 直链（路径里是**纯数字**的 PMCID，没有 PMC 前缀）
+    第 2 种现在由 `fulltext.py` 的 PMC HTML 源产出，是**最稳的一条路**
+    （CDN 不撞反爬），所以必须能认出它，否则 CDN 链接一旦失效就没有兜底。
     """
-    m = re.search(r'PMC(\d{5,})', url or '', re.I)
-    return m.group(1) if m else ''
+    u = url or ''
+    m = re.search(r'PMC(\d{5,})', u, re.I)
+    if m:
+        return m.group(1)
+    # CDN 形态：/pmc/blobs/<2段>/<PMCID>/<hash>/<file>
+    m = re.search(r'/pmc/blobs/[^/]+/(\d{5,})/', u, re.I)
+    if m:
+        return m.group(1)
+    return ''
 
 
 def _package_zip_url(pmcid: str) -> str:
@@ -418,18 +432,51 @@ def _image_from_zip(blob: bytes, url: str, max_bytes: int) -> tuple[bytes, str]:
     mime = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
             'gif': 'image/gif', 'webp': 'image/webp', 'tif': 'image/tiff',
             'tiff': 'image/tiff', 'svg': 'image/svg+xml'}.get(ext, 'image/png')
+    # 打包包里偶尔混着 HTML 或表格 XML（扩展名骗人），同样要验魔数
+    if ext.lower() not in ('svg',) and not _looks_like_image(data):
+        raise ValueError('打包文件里的 %s 不是图片（文件头魔数不符）'
+                         % (target or '该项'))
     return data, mime
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """看文件头魔数，判断这坨字节到底是不是图片。
+
+    为什么 Content-Type 不够：服务器可以返回 `Content-Type: image/jpeg`
+    但内容其实是一个 HTML 错误页（出版商的反爬就常这么干）。
+    把错误页当图喂给多模态模型，模型会对着报错页编出一段图解——
+    比"没有图"糟糕得多。
+
+    认得的格式：PNG / JPEG / GIF / BMP / WEBP / TIFF。
+    """
+    if not data or len(data) < 12:
+        return False
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return True
+    if data[:2] == b'\xff\xd8':          # JPEG
+        return True
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return True
+    if data[:2] == b'BM':                # BMP
+        return True
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return True
+    if data[:4] in (b'II*\x00', b'MM\x00*'):
+        return True                        # TIFF
+    return False
 
 
 def _download_image(url: str, max_bytes: int, timeout: int) -> tuple[bytes, str]:
     """下载一张图片，返回 (字节, content-type)。
 
-    三道防护：
+    四道防护：
       1. 只接受 image/* 的 Content-Type：出版商页面会返回 HTML，
          把它当图片喂给模型纯属浪费 token，还可能让模型对着报错页胡说。
-      2. 先看 Content-Length、再流式读并累加——**任何时候都不能超限**，
+      2. **再看文件头魔数**：Content-Type 可以撒谎（服务器声明 image/jpeg
+         但内容是 HTML 错误页），所以下载完再验一次字节。
+      3. 先看 Content-Length、再流式读并累加——**任何时候都不能超限**，
          否则一张几十 MB 的高清图就能把内存撑爆。
-      3. 设超时：图床慢的时候不至于卡死整轮。
+      4. 设超时：图床慢的时候不至于卡死整轮。
     """
     req = urllib.request.Request(url, headers={
         'User-Agent': UA,
@@ -452,7 +499,11 @@ def _download_image(url: str, max_bytes: int, timeout: int) -> tuple[bytes, str]
             buf.extend(chunk)
             if len(buf) > max_bytes:
                 raise ValueError('图片过大（超过上限 %d 字节）' % max_bytes)
-        return bytes(buf), ctype
+        data = bytes(buf)
+        if not _looks_like_image(data):
+            raise ValueError('内容不是图片（文件头魔数不符，'
+                             '多半是服务器返回了错误页）')
+        return data, ctype
 
 
 # ---------------------------------------------------------------------------

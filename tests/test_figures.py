@@ -794,6 +794,12 @@ class TestMisc(unittest.TestCase):
             figures._pmc_id_from_url(
                 'https://www.ebi.ac.uk/europepmc/webservices/rest/PMC1234567/x'),
             '1234567')
+        # PMC 新版 HTML 源给的 CDN 直链：路径里是纯数字 PMCID，没有 PMC 前缀
+        self.assertEqual(
+            figures._pmc_id_from_url(
+                'https://cdn.ncbi.nlm.nih.gov/pmc/blobs/d5b5/4580597/'
+                '8c020f6343fb/pone.0138511.g002.jpg'),
+            '4580597')
         self.assertEqual(figures._pmc_id_from_url('https://example.org/a.jpg'), '')
         self.assertEqual(figures._pmc_id_from_url(''), '')
 
@@ -937,3 +943,38 @@ class TestFieldTypeNormalization(unittest.TestCase):
         self.assertIn('；', kv)
         self.assertIn('ETD (95% CI) -0.44', kv)
         self.assertEqual(figures._norm_kind(raw['kind']), 'forest_plot')
+
+
+class TestImageMagicNumber(unittest.TestCase):
+    """文件头魔数校验。
+
+    背景：Content-Type 可以撒谎——服务器声明 `image/jpeg` 但内容其实是
+    一个 HTML 错误页（出版商的反爬常这么干）。把错误页当图喂给多模态模型，
+    模型会对着报错页编出一段图解，比"没有图"糟糕得多。
+    """
+
+    def test_real_image_headers_are_accepted(self):
+        png = (b'\x89PNG\r\n\x1a\n' + b'\x00' * 16)
+        jpg = b'\xff\xd8\xff\xe0' + b'\x00' * 16
+        gif = b'GIF89a' + b'\x00' * 16
+        bmp = b'BM' + b'\x00' * 16
+        webp = b'RIFF\x00\x00\x00\x00WEBP' + b'\x00' * 8
+        tiff = b'II*\x00' + b'\x00' * 16
+        for name, data in (('png', png), ('jpg', jpg), ('gif', gif),
+                           ('bmp', bmp), ('webp', webp), ('tiff', tiff)):
+            self.assertTrue(figures._looks_like_image(data), f'{name} 应被认出来')
+
+    def test_html_error_page_is_rejected(self):
+        html = b'<!DOCTYPE html><html><body>Error 404</body></html>'
+        self.assertFalse(figures._looks_like_image(html))
+
+    def test_json_response_is_rejected(self):
+        self.assertFalse(figures._looks_like_image(b'{"error":"not found"}'))
+
+    def test_too_short_is_rejected(self):
+        self.assertFalse(figures._looks_like_image(b''))
+        self.assertFalse(figures._looks_like_image(b'\x89PNG'))
+
+    def test_svg_is_not_binary_magic(self):
+        """SVG 是文本格式，没有二进制魔数——它本来也不该走这条路径。"""
+        self.assertFalse(figures._looks_like_image(b'<svg xmlns="..."></svg>'))
