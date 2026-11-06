@@ -198,6 +198,11 @@ class PubMed:
 
             journal = (article.findtext('Journal/Title') or '').strip()
             jshort = (article.findtext('Journal/ISOAbbreviation') or '').strip()
+            # ISSN 是把题录对齐到 JCR/中科院分区表的**唯一稳定连接键**——
+            # 刊名写法两边经常对不上（PubMed "N Engl J Med" vs JCR
+            # "NEW ENGLAND JOURNAL OF MEDICINE"）， ISSN 不会。
+            issn = (article.findtext('Journal/ISSN') or '').strip()
+            issn_e = (article.findtext('Journal/ISSNLink') or '').strip()
             year = (article.findtext('Journal/JournalIssue/PubDate/Year') or '').strip()
             if not year:
                 md = article.findtext('Journal/JournalIssue/PubDate/MedlineDate') or ''
@@ -245,6 +250,8 @@ class PubMed:
                 'authors': authors,
                 'journal': journal,
                 'journal_short': jshort,
+                'issn': issn,
+                'issn_e': issn_e,
                 'year': year,
                 'doi': doi,
                 'pmcid': pmcid.replace('PMC', '') if pmcid else '',

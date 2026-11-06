@@ -166,6 +166,19 @@ def cmd_setup():
           'https://www.ncbi.nlm.nih.gov/account/settings/')
     ncbi_key = _ask('   NCBI API Key（可留空）', default='')
 
+    print('\n⑤ 开放获取全文查询（Unpaywall，选填）')
+    print('   Unpaywall 的接口必须带邮箱参数（他们的要求）。')
+    print('   填了就能自动帮你找这篇文献的免费 PDF；留空则跳过这一路。')
+    print('   （直接用上面那个邮箱即可——同一个邮箱，两个服务都在用。）')
+    unpaywall_email = _ask('   用于 Unpaywall 的邮箱（可留空）', default=email)
+
+    print('\n⑥ 图表识别（多模态模型读论文插图，选填）')
+    print('   开启后会自动看论文里的森林图、生存曲线、ROC 曲线等，')
+    print('   把图里的效应量（HR/OR/RR 及 95%CI）提取出来。')
+    print('   会额外消耗多模态模型额度，且每张图一次调用。')
+    fig_ans = _ask('   开启图表识别？[y/N]', default='N')
+    enable_figures = fig_ans.strip().lower() in ('y', 'yes', '是')
+
     env_name = 'SILICONFLOW_API_KEY' if key == 'siliconflow' else 'OPENAI_COMPATIBLE_API_KEY'
     values = {env_name: api_key}
     if ncbi_key:
@@ -175,6 +188,10 @@ def cmd_setup():
 
     path = cfgmod.save_env(values)
     print(f'\n✓ 已写入 {path}')
+
+    # 资源接入与功能开关写进 config.local.json
+    _write_local_resources(email=email, unpaywall_email=unpaywall_email,
+                            enable_figures=enable_figures)
 
     # 非默认端点要落到 config.json
     if key != 'siliconflow':
@@ -197,6 +214,40 @@ def cmd_setup():
     print('\n配置完成，现在可以提问了：'
           '\n  python scripts/ask.py "你的问题"')
     return 0
+
+
+def _write_local_resources(email: str = '', unpaywall_email: str = '',
+                           enable_figures: bool = False):
+    """把资源接入与功能开关写进 config.json。
+
+    同样**只改要改的字段**，不覆盖使用者已有的其他设置——
+    这个文件是用户自己的配置，不能被向导整体重写。
+    """
+    data = {}
+    try:
+        with open(cfgmod.LOCAL_CONFIG, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        data = {}
+    if not data:
+        try:
+            with open(cfgmod.EXAMPLE_CONFIG, encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            data = {}
+
+    if unpaywall_email:
+        res = data.setdefault('resources', {})
+        res['unpaywall_email'] = unpaywall_email
+    if email:
+        pub = data.setdefault('pubmed', {})
+        pub.setdefault('email', email)
+    figs = data.setdefault('figures', {})
+    figs['enabled'] = bool(enable_figures)
+
+    with open(cfgmod.LOCAL_CONFIG, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f'✓ 已把资源接入与功能开关写入 {cfgmod.LOCAL_CONFIG}')
 
 
 def _write_provider_config(key: str, base: str, env_name: str):
@@ -298,11 +349,19 @@ def cmd_chat(cfg, args):
 
     追问时会**沿用上一轮的检索式**：重新检索既白花钱，
     又可能捞到和上次不一样的文献，连着看很别扭。
+
+    还会**沿用上一轮已精读过的文献**：同一篇重读一次是一次完整的模型调用，
+    而抽取结果几乎必然一样。追问的成本因此从「检索+全量精读+审稿+成文」
+    降到「检索+只精读新文献+审稿+成文」。
+
+    这正是"一直以现有文献为依据、一轮轮交互"想要的效果：
+    文献池是累积的，不是每轮重置的。
     """
     history: list[dict] = []
     prev_queries: list[dict] = []
+    prior_evidence: list[dict] = []
     print('连续提问模式。输入问题，Enter 提交；输入 quit / exit 退出。')
-    print('（每次提问都会跑一次检索，但会沿用上一轮的检索式，请稍等）\n')
+    print('（每次提问都会跑一次检索，但会沿用上一轮的检索式与已精读文献，请稍等）\n')
     while True:
         try:
             q = input('问题> ').strip()
@@ -315,13 +374,16 @@ def cmd_chat(cfg, args):
             break
         run = pipeline.Run(q, args.constraints, cfg, cq_explicit=_cq_list(args),
                            history=list(history),
-                           reuse_queries=list(prev_queries))
+                           reuse_queries=list(prev_queries),
+                           prior_evidence=list(prior_evidence))
         out_dir = run.execute(quick=args.quick)
         history.append({'question': q,
                         'core_question_en': run.plan.get('core_question_en', '')})
         # 记下本轮实际用的检索式（含沿用的），下一轮继续沿用。
         # 上限 6 条：再多检索式会明显拖慢，而更早的那些通常已经被覆盖了。
         prev_queries = (run.plan.get('queries') or [])[-6:]
+        # 证据池累积：下一轮沿用本轮所有证据（含本轮新精读的）。
+        prior_evidence = list(run.evidence)
         print('\n' + '=' * 70)
         print(run.answer[:2000])
         print(f'\n（完整答案见 {out_dir}/07_answer.md）\n')

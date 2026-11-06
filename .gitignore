@@ -31,3 +31,6 @@ Thumbs.db
 # ===== 抓取的开放全文（版权属出版商，不入库）=====
 06_fulltext/
 *.txt.gz
+
+# 下载的 PDF（版权属出版商，不入库）
+07_fulltext_pdf/

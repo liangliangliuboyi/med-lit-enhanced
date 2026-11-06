@@ -16,7 +16,10 @@ from contextlib import nullcontext
 from datetime import datetime
 
 import config as cfgmod
+import figures as figmod
+import fulltext as ftmod
 import grading
+import jcr
 import prompts
 import pubmed as pm
 import sf
@@ -117,7 +120,8 @@ class Run:
                  cq_explicit: list[str] | None = None,
                  history: list[dict] | None = None,
                  resume_dir: str | None = None,
-                 reuse_queries: list[dict] | None = None):
+                 reuse_queries: list[dict] | None = None,
+                 prior_evidence: list[dict] | None = None):
         self.cfg = cfg or cfgmod.load_config()
         self.question = (question or '').strip()
         self.constraints = (constraints or '').strip()
@@ -126,6 +130,27 @@ class Run:
         # 追问同一课题时重新做检索，白花钱还会捞到不同的文献；
         # 沿用旧检索式 = 保留上次的召回，再叠加新问题的概念。
         self.reuse_queries = reuse_queries or []
+        # 上一轮已精读过的证据（连续提问模式）。
+        #
+        # 为什么复用：用户的真实用法是「围绕一个课题反复追问」。
+        # 同一篇文献重新精读一次 = 一次完整的模型调用，而抽取结果几乎必然一样。
+        # 复用后追问一轮的成本从「检索 + 全量精读 + 审稿 + 成文」
+        # 降到「检索 + 新文献精读 + 审稿 + 成文」。
+        #
+        # 代价（要说清楚）：reader 的抽取是**相对上一个问题**做的，
+        # 所以复用来的 key_findings 带着上一轮问题的视角。
+        # 缓解办法：复用项打上 `_reused` 标记，答案里以"既有文献"呈现，
+        # 而 writer 拿到的是完整证据表 + 新问题，会据此重新作答。
+        self.prior_evidence = list(prior_evidence or [])
+        self._prior_map = {
+            (d.get('_citation_key') or d.get('pmid')): d
+            for d in self.prior_evidence if d
+        }
+        # 只读到摘要（没拿到全文）的文献。
+        # 用户需要全文时，这张清单就是"去哪儿拿"的依据——
+        # 该提醒他开 VPN / 用交大图书馆，而不是默默用摘要凑合。
+        self.no_fulltext: list[dict] = []
+        self.cache_hits = 0
         self.t0 = time.time()
         self.stamp = datetime.now().strftime('%Y%m%d-%H%M')
 
@@ -136,6 +161,25 @@ class Run:
         else:
             self.dir = os.path.join(os.path.abspath(root), f'{self.stamp}_{_slug(self.question)}')
         os.makedirs(os.path.join(self.dir, '06_fulltext'), exist_ok=True)
+
+        # ---- 全文获取器（多来源降级 + PDF 交付 + 获取指引）----
+        # 面向交医用户的实际需求：能自动拿到就自动拿，拿不到要**告诉用户**
+        # 去哪儿拿（开 VPN / 用交大图书馆），而不是默默用摘要凑合。
+        _res = self.cfg.get('resources') or {}
+        _ftc = self.cfg.get('fulltext') or {}
+        _dl_dir = str(_ftc.get('download_dir') or '').strip()
+        if not _dl_dir:
+            # 没配就落在本次运行目录下（该目录已被 gitignore）
+            _dl_dir = os.path.join(self.dir, '07_fulltext_pdf')
+        self.ft_fetcher = ftmod.FullTextFetcher(
+            proxy=str(_ftc.get('proxy') or ''),
+            timeout=int(_ftc.get('timeout') or 60),
+            download_dir=_dl_dir,
+            keep_downloads=bool(_ftc.get('keep_downloads', True)),
+            # Unpaywall 要求带邮箱；没有就跳过那一路（不影响其他来源）
+            email=str(_res.get('unpaywall_email') or ''
+                      or (self.cfg.get('pubmed') or {}).get('email') or ''),
+        )
 
         # ---- 模型端点与路由 ----
         prov = self.cfg.get('provider') or {}
@@ -636,10 +680,35 @@ class Run:
             # 没有它就不知道"改了检索式之后少了哪些文献"。
             if found_by:
                 p['found_by'] = found_by
+            # 期刊评价元数据（影响因子 / JCR 分区 / 中科院大区）。
+            # 在抓题录这一步就打上，后续所有环节（精读提示词、证据表、答案）
+            # 都能直接用，不用反复查表。
+            try:
+                p['_jcr'] = jcr.lookup(journal=p.get('journal', ''),
+                                       issn=p.get('issn', ''),
+                                       issn_e=p.get('issn_e', ''))
+            except Exception as e:  # noqa: BLE001
+                # 分区查不到不该让整轮检索失败——它只是附加信息
+                self.err('jcr_lookup', e)
+                p['_jcr'] = {'matched': False}
             self.papers[p['pmid']] = p
             keep += 1
         self.log(f'   抓取题录 {keep} 篇（累计候选 {len(self.papers)}）')
         return keep
+
+    @staticmethod
+    def _journal_meta(paper: dict) -> str:
+        """期刊评价的一句话摘要，喂给精读模型。
+
+        目的不是让模型"崇拜高分区"，而是让它知道**证据的来源量级**——
+        一份 NEJM 的 RCT 和一份单中心小样本的会议摘要，
+        读者对后者的谨慎程度本就该更高。
+        """
+        info = paper.get('_jcr') or {}
+        label = jcr.format_label(info)
+        if not label:
+            return '未收录于 JCR 2026 索引（或该刊未被收录）'
+        return label
 
     # ---------- 5. 过滤 ----------
     def filter_papers(self) -> list[str]:
@@ -751,12 +820,33 @@ class Run:
         正文里分别用 [PMID:xxx] 与 [DOI:xxx] 引用。
         """
         p = paper if paper is not None else self.papers[key]
-        ft = {'source': 'abstract', 'text': '', 'figure_captions': []}
+
+        # ---- 连续提问模式：沿用上一轮已精读过的这篇 ----
+        # 同一篇文献重读一遍是一次完整的模型调用，而抽取结果几乎必然一样。
+        # 追问场景下这是纯浪费，直接复用上一轮的抽取结果。
+        prev = self._prior_map.get(key)
+        if prev is not None:
+            self.cache_hits += 1
+            reused = dict(prev)
+            reused['_reused'] = True
+            return reused
+
+        ft = {'source': 'abstract', 'text': '', 'figure_captions': [],
+              'figures': [], 'sections': [], 'url': '', 'note': ''}
         if self._claim_fulltext_slot():
             try:
-                ft = self.pubmed.fulltext(p)
-            except Exception:  # noqa: BLE001
-                pass
+                got = self.ft_fetcher.fetch(p)
+                if got:
+                    ft = got
+                    # 统一成"图注文本"的形状：老代码读的是 figure_captions，
+                    # 新模块给的是带 href 的 figures 列表。
+                    caps = [str(f.get('caption') or '') for f in
+                            (ft.get('figures') or []) if f.get('caption')]
+                    if caps:
+                        ft['figure_captions'] = caps
+            except Exception as e:  # noqa: BLE001
+                # 全文拿不到不是致命错误——退回摘要继续
+                self.err('fulltext', e)
         if ft.get('text'):
             body = ft['text'][:26000]
             src = 'fulltext'
@@ -769,6 +859,16 @@ class Run:
         else:
             body = p.get('abstract', '')[:5000]
             src = 'abstract'
+            # 只读到摘要的文献要记下来：用户可能需要全文，
+            # 而"只读了摘要"这件事本身必须让用户知道（见 fulltext_guide_text）。
+            self.no_fulltext.append({
+                'pmid': key,
+                'title': p.get('title', ''),
+                'journal': p.get('journal', ''),
+                'year': p.get('year', ''),
+                'doi': p.get('doi', '') or '',
+                'pmcid': p.get('pmcid', '') or '',
+            })
         if not body:
             return None
 
@@ -778,6 +878,7 @@ class Run:
                     citation_key=key,
                     is_preprint='是（预印本，未经过同行评议）' if is_preprint else '否',
                     journal=p.get('journal', ''),
+                    journal_meta=self._journal_meta(p),
                     year=p.get('year', ''),
                     title=p.get('title', ''),
                     pub_types=' / '.join(p.get('pub_types') or []),
@@ -810,10 +911,18 @@ class Run:
         data['_year'] = p.get('year', '')
         data['_title'] = p.get('title', '')
         data['_doi'] = p.get('doi', '') or ''
+        # 期刊评价元数据（IF / JCR 分区 / 中科院大区）——
+        # 从题录带过来，证据表与答案都不用再查一次索引。
+        data['_jcr'] = p.get('_jcr') or {'matched': False}
         # B7：图表说明
         caps = (ft.get('figure_captions') or [])[:8]
         if caps:
             data['_figure_captions'] = caps
+        # 带 href 的图片清单——图表识别阶段要用（要知道去哪儿下这张图）
+        figs = ft.get('figures') or []
+        if figs:
+            data['_figures_meta'] = figs[:20]
+            data['_ft_url'] = ft.get('url') or ''
         # B2：撤稿/勘误标记
         chk = pm.check_retraction(p)
         if chk['note']:
@@ -831,6 +940,9 @@ class Run:
         jobs = [(k, self.papers[k], False) for k in ids]
         jobs += [(k, self.preprints[k], True) for k in self.preprints]
         total = len(jobs)
+        if self._prior_map:
+            self.log(f'   可沿用上一轮已精读的 {len(self._prior_map)} 篇'
+                     f'（同一篇不再重复调用模型）')
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(self.read_one, k, p, is_pp): k for k, p, is_pp in jobs}
             for fut in as_completed(futs):
@@ -844,12 +956,18 @@ class Run:
                 if d:
                     self.evidence.append(d)
                     pp = '（预印本）' if d.get('_is_preprint') else ''
+                    reused = ' ↺沿用' if d.get('_reused') else ''
                     self.log(f'   [{done}/{total}] {key} 相关度 {d.get("relevance", "?")}'
-                             f'（{d["_text_source"]}）{pp}')
+                             f'（{d["_text_source"]}）{pp}{reused}')
                 else:
                     self.prisma['excluded_fulltext'] += 1
                     self.log(f'   [{done}/{total}] {key} 抽取失败')
         self.trace['timings']['read'] = round(time.time() - t0, 1)
+        self.trace['evidence_reused'] = self.cache_hits
+        if self.cache_hits:
+            saved = self.cache_hits * 1
+            self.log(f'   ↺ 沿用上一轮精读结果 {self.cache_hits} 篇'
+                     f'（省下约 {saved} 次精读模型调用）')
         self._cross_check_relevance()
         self.evidence.sort(key=lambda d: (-(d.get('relevance') or 0), str(d.get('_year') or '')))
         self.prisma['fulltext_assessed'] = total
@@ -857,6 +975,73 @@ class Run:
         self.prisma['excluded_fulltext'] = max(0, total - len(self.evidence))
         self.log(f'   精读完成：成功 {len(self.evidence)} 篇，{self.trace["timings"]["read"]}s')
         self._save_checkpoint()
+
+    def _read_figures_all(self):
+        """图表识别：用多模态模型读论文插图。
+
+        为什么单独一个阶段而不是塞进 read_one：
+        read_all 已经是 4 路并发，再在里面并发识别图片会变成 16 路并发打 API
+        ——本仓库实测过"并发打长文本/大请求会超时"，这里同理。
+        所以等精读全部结束，再单独跑一轮图表识别。
+
+        图里最值钱的东西是**效应量**（森林图上的 HR/OR/RR 与 95%CI），
+        这些经常只出现在图里而不在摘要/正文里——只看摘要会漏掉。
+        """
+        fcfg = self.cfg.get('figures') or {}
+        if not fcfg.get('enabled'):
+            return
+        targets = [d for d in self.evidence if d.get('_figures_meta')]
+        if not targets:
+            return
+        model = str(fcfg.get('model') or figmod.DEFAULT_VL_MODEL)
+        self.log(f'   · 图表识别（{len(targets)} 篇有插图，模型 {model}）')
+
+        def chat_fn(role, messages, temperature=0.2, max_tokens=900,
+                    model=None, timeout=None):
+            # 走 provider 而不是路由器：图表识别必须用多模态模型，
+            # 角色链里都是纯文本模型。
+            res = self.provider.chat(model or figmod.DEFAULT_VL_MODEL,
+                                     messages, temperature, max_tokens,
+                                     timeout=int(timeout or fcfg.get('timeout', 90)))
+            self._track_tokens('reader', res)
+            return res
+
+        reader = figmod.FigureReader(
+            chat_fn,
+            model=model,
+            max_figures=int(fcfg.get('max_figures', 6)),
+            max_bytes=int(fcfg.get('max_bytes', 4 * 1024 * 1024)),
+            timeout=int(fcfg.get('timeout', 90)),
+        )
+        t0 = time.time()
+        total_figs = 0
+        for d in targets:
+            try:
+                got = reader.read_all(
+                    {'figures': d.get('_figures_meta') or [],
+                     'url': d.get('_ft_url') or ''},
+                    caption=d.get('_title') or '')
+            except Exception as e:  # noqa: BLE001
+                self.err('figures', e)
+                continue
+            if not got:
+                continue
+            d['_figures'] = got
+            total_figs += len(got)
+            ok = sum(1 for g in got if not g.get('error'))
+            self.log(f'     {d.get("_citation_key")}：识别 {ok}/{len(got)} 张图')
+        self.trace['timings']['figures'] = round(time.time() - t0, 1)
+        self.trace['figures'] = {
+            'enabled': True, 'model': model,
+            'papers': len(targets), 'figures': total_figs,
+        }
+        # 图里读出的效应量要能进答案——它常常是摘要里没有的关键数字
+        for d in self.evidence:
+            for g in (d.get('_figures') or []):
+                if g.get('key_values'):
+                    d.setdefault('_figure_key_values', []).append(
+                        f'图{g.get("index", "?")}（{g.get("kind", "")}）：'
+                        f'{g["key_values"]}')
 
     def _cross_check_relevance(self):
         """B8：相关度交叉验证——两个不同模型各打一次分取平均。
@@ -1072,13 +1257,16 @@ class Run:
                 s = s[:limit]
             return s
 
-        rows = ['| # | 引用标识 | 年份 | 期刊 | 设计 | 样本量 | PICO | 相关度 | 来源 | 核心发现 |',
-                '|---|--------|------|------|------|--------|------|--------|------|----------|']
+        rows = ['| # | 引用标识 | 年份 | 期刊 | IF/分区 | 设计 | 样本量 | PICO | 相关度 | 来源 | 图表要点 | 核心发现 |',
+                '|---|--------|------|------|---------|------|--------|------|--------|------|----------|----------|']
         for i, d in enumerate(self.evidence, 1):
             kf = cell('；'.join((d.get('key_findings') or [])[:2]), 100)
             flag = ' ⚠撤稿' if d.get('_retraction') else ''
             if d.get('_is_preprint'):
                 flag += ' 〔预印本〕'
+            if d.get('_reused'):
+                # 连续提问模式：这条是上一轮已精读过的，标注出来让读者知道
+                flag += ' ↺沿用'
             # R13：标明这条证据实际读的是全文还是摘要。
             # 两者证据强度不同——只读了摘要的条目，"未提及某个结局"可能只是
             # 摘要没写，不能当成"该研究没做"。
@@ -1086,12 +1274,31 @@ class Run:
                 d.get('_text_source') or '', '')
             if not src and d.get('_is_preprint'):
                 src = '预印本'
+            # 期刊评价：影响因子 + JCR 分区 + 中科院大区。
+            # 放在「期刊」后面紧邻着，因为读者判断一条证据的分量时，
+            # 刊名和它的分区是要一起看的。
+            jm = jcr.format_label(d.get('_jcr') or {})
+            # 图表要点：图里读出来的效应量常常是摘要/正文里没有的关键数字。
+            # 森林图上的 HR/OR/RR 与 95%CI 往往只存在于图里。
+            figtxt = ''
+            for g in (d.get('_figures') or []):
+                if g.get('error') and not g.get('key_values'):
+                    continue
+                bits = []
+                if g.get('kind'):
+                    bits.append(str(g['kind']))
+                if g.get('key_values'):
+                    bits.append(str(g['key_values']))
+                if bits:
+                    figtxt += '；'.join(bits) + '｜'
+            figtxt = figtxt.rstrip('｜')
             rows.append(f'| {i} | {cell(d.get("_citation_key") or d.get("pmid"))}{flag} | '
                         f'{cell(d.get("_year"))} | '
-                        f'{cell(d.get("_journal"), 26)} | {cell(d.get("study_design"), 16)} | '
+                        f'{cell(d.get("_journal"), 26)} | {cell(jm, 30) or "—"} | '
+                        f'{cell(d.get("study_design"), 16)} | '
                         f'{cell(d.get("sample_size"), 14)} | '
                         f'{cell(d.get("pico_match")) or "—"} | {cell(d.get("relevance"))} | '
-                        f'{src or "—"} | {kf} |')
+                        f'{src or "—"} | {cell(figtxt, 60) or "—"} | {kf} |')
         return '\n'.join(rows)
 
     def bias_table(self) -> str:
@@ -1184,6 +1391,81 @@ class Run:
                 'sections_without_citation': no_cite,
                 'section_citation_counts': sections}
 
+    def fulltext_guide_text(self) -> str:
+        """全文获取情况说明——喂给成文模型，并落盘给用户看。
+
+        两种情况：
+        1. 所有纳入文献都拿到了全文 → 一句话说明，不用麻烦用户
+        2. 有文献只读到摘要 → 给出**可执行**的获取途径，
+           并提醒开 VPN / 用交大图书馆（这是用户真正需要的帮助）
+        """
+        missing = list(self.no_fulltext)
+        if not missing:
+            return '（本轮纳入的文献均已获得全文，无需用户额外获取。）'
+        res = (self.cfg.get('resources') or {})
+        library_name = res.get('library_name') or '交大图书馆'
+        library_url = res.get('library_url') or ''
+        vpn_notice = res.get('vpn_notice') or (
+            '若提示付费墙或连接失败，请开启 网络代理 / 交大医学院 VPN，'
+            '或通过交大图书馆校外访问入口重试。')
+        lines = [f'有 {len(missing)} 篇文献本轮只读到了摘要（未取得全文）。'
+                 '它们的结论可能被摘要简化或遗漏，'
+                 '若结论对本问题关键，建议取得全文后再据此决策：', '']
+        for i, p in enumerate(missing, 1):
+            bits = [f'{i}. {p.get("title") or "（无题名）"}']
+            meta = '｜'.join(x for x in (p.get('journal'), p.get('year')) if x)
+            if meta:
+                bits.append(f'   {meta}')
+            links = []
+            if p.get('doi'):
+                links.append(f'DOI: https://doi.org/{p["doi"]}')
+            if p.get('pmid'):
+                links.append(f'PubMed: https://pubmed.ncbi.nlm.nih.gov/{p["pmid"]}/')
+            if p.get('pmcid'):
+                links.append(f'PMC: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{p["pmcid"]}/')
+            for lk in links:
+                bits.append(f'   {lk}')
+            lines.append('\n'.join(bits))
+        lines.append('')
+        lines.append(f'获取途径：Unpaywall / OpenAlex（开放获取，可直接下载）、'
+                     f'{library_name}校外访问'
+                     + (f'（{library_url}）' if library_url else '')
+                     + f'、期刊官网。{vpn_notice}')
+        return '\n'.join(lines)
+
+    def figures_markdown(self) -> str:
+        """图表识别结果（Markdown）。没有识别过就返回空串。"""
+        blocks = []
+        for d in self.evidence:
+            figs = d.get('_figures') or []
+            if not figs:
+                continue
+            lines = [f'## {d.get("_citation_key") or d.get("pmid")}｜'
+                     f'{d.get("_journal", "")} {d.get("_year", "")}',
+                     f'标题：{d.get("_title", "")}', '']
+            for g in figs:
+                head = f'**图 {g.get("index", "?")}**'
+                if g.get('kind'):
+                    head += f'｜类型：{g["kind"]}'
+                lines.append(head)
+                if g.get('caption'):
+                    lines.append(f'- 图注：{g["caption"]}')
+                if g.get('description'):
+                    lines.append(f'- 解读：{g["description"]}')
+                if g.get('key_values'):
+                    lines.append(f'- 关键数值：{g["key_values"]}')
+                if g.get('error'):
+                    lines.append(f'- ⚠ 未能识别：{g["error"]}')
+                lines.append('')
+            blocks.append('\n'.join(lines))
+        if not blocks:
+            return ''
+        return ('# 图表识别结果\n\n'
+                '以下内容由多模态模型从论文插图中读出。'
+                '关键数值均摘自图上标注，但**请以原图为准**——'
+                '模型识别的数字仍可能有个别误读。\n\n'
+                + '\n'.join(blocks))
+
     def write(self) -> str:
         msgs = [{'role': 'system', 'content': prompts.WRITER_SYSTEM},
                 {'role': 'user', 'content': prompts.WRITER_USER.format(
@@ -1196,7 +1478,8 @@ class Run:
                         grading.retraction_notes(list(self.papers.values()))
                     ) or '（无撤稿/勘误提示）',
                     pooled_effects=self.pooled_summary(),
-                    critique=json.dumps(self.critique, ensure_ascii=False)[:8000])}]
+                    critique=json.dumps(self.critique, ensure_ascii=False)[:8000],
+                    fulltext_guide=self.fulltext_guide_text())}]
         self.log('⑦ 撰写答案')
         try:
             res = self.router.chat('writer', msgs,
@@ -1412,6 +1695,17 @@ class Run:
                 f'{self.mech_grading.get("reason", "（未执行）")}\n')
         self._w('05b_excluded.json', json.dumps(self.excluded, ensure_ascii=False, indent=1))
 
+        # 全文获取指引（用户拿去开 VPN / 用交大图书馆的清单）
+        guide = self.fulltext_guide_text()
+        if guide:
+            self._w('06b_fulltext_guide.md',
+                    '# 全文获取指引\n\n' + guide + '\n')
+
+        # 图表识别结果：模型从插图里读出的内容，单独成文件便于核对
+        fig_md = self.figures_markdown()
+        if fig_md:
+            self._w('05c_figures.md', fig_md)
+
         bib = self.bibliography()
         answer = self.answer
         self._w('07_answer.md', answer + ('\n\n---\n\n## 关键文献（按 PubMed 原始字段生成）\n\n'
@@ -1565,6 +1859,7 @@ class Run:
 
         picked = self._timed('rerank', self.rerank, ids)
         self._timed('read', self.read_all, picked)
+        self._read_figures_all()
 
         # 只要原始证据、不写综述正文时，到此为止
         if stages == 'evidence':

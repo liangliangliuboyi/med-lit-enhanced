@@ -22,6 +22,32 @@
     "email": "",
     "_comment": "email 必须由使用者填自己的邮箱（NCBI 要求：一旦有人违规使用导致 IP 被限流，需要能联系到本人）。不要填别人的邮箱。首次运行 ask.py 会检查这一项并主动提醒补齐；也可用 --setup 由向导采集。"
   },
+  "resources": {
+    "_comment": "面向上海交大医学院用户的外部资源接入。全部为免费或机构已有资源，不需要额外付费。",
+    "unpaywall_email": "",
+    "_unpaywall_comment": "Unpaywall 的 OA 全文查询接口必须带 email 参数（他们的要求）。留空则跳过 Unpaywall 这一路全文来源（不影响其他来源）。",
+    "europe_pmc": true,
+    "openalex": true,
+    "library_url": "https://lib.sjtu.edu.cn",
+    "library_name": "上海交通大学图书馆",
+    "vpn_notice": "若提示付费墙或连接失败，请开启 网络代理 / 交大医学院 VPN，或通过交大图书馆校外访问入口重试。",
+    "jcr_index_path": ""
+  },
+  "figures": {
+    "_comment": "图表识别：用多模态模型读论文里的图（森林图、生存曲线、ROC 等）。关掉不影响主流程。",
+    "enabled": false,
+    "model": "Qwen/Qwen3-VL-8B-Instruct",
+    "max_figures": 6,
+    "max_bytes": 4194304,
+    "timeout": 90
+  },
+  "fulltext": {
+    "_comment": "全文获取策略。download_dir 为空则不落盘；keep_downloads=false 时下载后立即删除（不落地阅读）。",
+    "download_dir": "",
+    "keep_downloads": true,
+    "timeout": 60,
+    "proxy": ""
+  },
   "models": {
     "chain": {
       "planner": [
