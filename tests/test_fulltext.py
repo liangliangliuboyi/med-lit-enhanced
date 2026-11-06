@@ -1394,6 +1394,66 @@ class TestPmcHtmlSource(FullTextTestBase):
         self.assertNotIn('<b>', cap)
         self.assertNotIn('<a ', cap)
 
+    def test_caption_falls_back_to_h4_obj_head(self):
+        """figcaption 为空时要退回 `<h4 class="obj_head">`。
+
+        实测 PLOS 的版式就是这样的——figcaption 为空，标题全在 h4：
+        `<h4 class="obj_head">Fig 2. Forest plot of the effect sizes…</h4>`
+        只看 figcaption 会拿到 **5/5 张空图注**，下游多模态模型拿不到任何
+        上下文，识别质量直接崩。
+        """
+        html = ('<section class="body main-article-body">'
+                '<p>' + 'Results body paragraph with enough text to pass the '
+                'length gate for the article container. ' * 3 + '</p>'
+                '<figure><h4 class="obj_head">Fig 2. Forest plot of effect sizes.'
+                '</h4>'
+                '<img src="https://cdn.ncbi.nlm.nih.gov/pmc/blobs/x/y/pone.1.g002.jpg">'
+                '</figure></section>')
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes(html=html))
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertEqual(res['source'], 'pmc_html')
+        self.assertTrue(res['figures'])
+        fig = res['figures'][0]
+        self.assertIn('Forest plot of effect sizes', fig['caption'],
+                      'figcaption 为空时没退回 h4')
+        self.assertIn('Fig 2.', fig['label'], '没抽出图号')
+
+    def test_figcaption_takes_precedence_over_h4(self):
+        """两者都有时，figcaption 更完整，优先用它；h4 仍作为 label。"""
+        html = ('<section class="body main-article-body">'
+                '<p>' + 'Results body paragraph with enough text to pass the '
+                'length gate for the article container. ' * 3 + '</p>'
+                '<figure><h4 class="obj_head">Fig 2. Short title.</h4>'
+                '<img src="https://cdn.ncbi.nlm.nih.gov/pmc/blobs/x/y/a.g002.jpg">'
+                '<figcaption><p>Full descriptive caption text.</p></figcaption>'
+                '</figure></section>')
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes(html=html))
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        fig = res['figures'][0]
+        self.assertIn('Full descriptive caption text', fig['caption'])
+        self.assertNotIn('Short title', fig['caption'])
+        self.assertIn('Fig 2.', fig['label'])
+
+    def test_no_figure_has_empty_caption(self):
+        """每张图都要有非空图注（空图注会让下游多模态模型没有上下文）。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        for fig in res['figures']:
+            self.assertTrue((fig.get('caption') or '').strip(),
+                            '图 %s 的 caption 是空的' % fig.get('href'))
+
     def test_captcha_page_is_not_treated_as_article(self):
         """反爬挑战页必须被识别出来，不能当正文抽。"""
         self.clear_proxy_env()

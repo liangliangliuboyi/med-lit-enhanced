@@ -1040,7 +1040,23 @@ class FullTextFetcher:
         （us_flag.svg / icon-dot.svg / ncbi-logo / usa-icons）。
         不限定就会把一堆图标当成论文插图送进多模态模型。
 
-        返回 [{'href': 图片绝对地址, 'caption': 图注纯文本}, ...]
+        返回 [{'href': 图片绝对地址, 'caption': 图注纯文本, 'label': 图号}, ...]
+
+        图注从**两处**取（缺一不可）：
+          - `<figcaption>`：多数文章用它放图注；
+          - `<h4 class="obj_head">`：PLOS / JAMA 这类把「Fig 2. 森林图标题」
+            放在 h4 里、figcaption 只放补充说明（或干脆没有）的版式。
+
+        实测（真实网络）：
+          - PLOS ONE（`pone.0138511.g002.jpg`）：figcaption 为空，
+            标题全在 h4「Fig 2. Forest plot of the effect sizes…」；
+            只看 figcaption 会拿到 **5/5 张空图注**，下游多模态模型
+            拿不到任何上下文，识别质量直接崩。
+          - JAMA Pediatrics：figcaption 与 h4 都有，取 figcaption 更完整。
+
+        `label` 形如「Fig 2.」，从 h4 里抽图号——下游要按图号去出版商页找
+        **原图**（PMC 归档图只有出版社原图的一半分辨率，实测 690×1310 vs
+        1381×2621），图号是那条路的关键。
         """
         out: list = []
         seen: set = set()
@@ -1056,14 +1072,29 @@ class FullTextFetcher:
             if not re.match(r'^https?://', src, re.I):
                 src = urllib.parse.urljoin(base_url, src)
             cap = ''
-            cm = re.search(r'<figcaption[^>]*>(.*?)</figcaption>', block,
-                           flags=re.S | re.I)
-            if cm:
-                cap = self._strip_tags(cm.group(1))
+            label = ''
+            # 先看 figcaption（正文说明），再看 h4（PLOS/JAMA 的图标题）
+            for pat, is_label in (
+                (r'<figcaption[^>]*>(.*?)</figcaption>', False),
+                (r'<h4[^>]*class="[^"]*obj_head[^"]*"[^>]*>(.*?)</h4>', True),
+            ):
+                cm = re.search(pat, block, flags=re.S | re.I)
+                if not cm:
+                    continue
+                text = self._strip_tags(cm.group(1))
+                if not text:
+                    continue
+                if is_label:
+                    label = text
+                    # h4 里的标题比空 figcaption 有用得多
+                    if not cap:
+                        cap = text
+                elif not cap:
+                    cap = text
             if src in seen:
                 continue
             seen.add(src)
-            out.append({'href': src, 'caption': cap})
+            out.append({'href': src, 'caption': cap, 'label': label})
         return out
 
     def _try_europepmc(self, pmcid: str, pmid: str) -> dict | None:
