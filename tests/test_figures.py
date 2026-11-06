@@ -642,6 +642,95 @@ class TestPrompt(unittest.TestCase):
         text = chat.seen_messages[0][0]['content'][0]['text']
         self.assertIn('本文研究他汀类药物', text)
 
+    def test_prompt_covers_both_forest_plot_shapes(self):
+        """提示词要区分两种森林图，否则会漏读。
+
+        实测教训（2026-11-06）：原先只写「只报汇总那一行」，结果：
+          - 227 行研究、有汇总行的图 → 对（只报合并效应量）
+          - 9 行结局、没有汇总行的图 → **漏读 4 个结局**
+        所以两个分支都要写进去，且都要给具体写法示例。
+        """
+        p = figures.FIGURE_PROMPT
+        self.assertIn('汇总', p)
+        self.assertIn('Combined effect size', p)
+        # 无汇总行的分支
+        self.assertIn('没有汇总行', p)
+        # 两类都要有示例（示例是模型照抄格式的依据）
+        self.assertIn('-0.227', p)
+        self.assertIn('-0.44', p)
+        # 明确禁止逐条罗列几百行研究
+        self.assertIn('不要去读各条研究行的数字', p)
+
+
+# ---------------------------------------------------------------------------
+# 12. 验收夹具（真实模型实测得到的形状）
+# ---------------------------------------------------------------------------
+class TestAcceptanceFixture(unittest.TestCase):
+    """用真实论文的森林图实测得到的模型返回形状做夹具。
+
+    来源：PMC12439189（JAMA Pediatrics 2025，GLP-1 RA 儿童青少年系统综述）
+    的森林图，Qwen3-VL-8B-Instruct 实测返回 9 个结局的 ETD 与 95%CI，
+    **key_values 是数组**。这些数字摘要和正文里都没有，只存在于图里。
+    """
+
+    REAL_KEY_VALUES = [
+        'Glycated hemoglobin, %: ETD -0.44 (-0.68 to -0.21)',
+        'Fasting plasma glucose, mg/dL: ETD -9.92 (-16.20 to -3.64)',
+        'BMI: ETD -1.45 (-2.40 to -0.49)',
+        'BMI percentile, %: ETD -7.24 (-12.97 to -1.51)',
+        'BMI SDS: ETD -0.20 (-0.36 to -0.05)',
+        'Body weight, kg: ETD -3.02 (-4.98 to -1.06)',
+        'Waist circumference, cm: ETD -3.81 (-6.76 to -0.87)',
+        'Diastolic BP, mm Hg: ETD -1.21 (-2.81 to 0.39)',
+        'Systolic BP, mm Hg: ETD -2.73 (-4.04 to -1.43)',
+    ]
+
+    def test_array_of_real_output_normalized(self):
+        """真实的数组返回 → 顿号连接，不带 Python 字面量。"""
+        import json
+        raw = {
+            'kind': 'forest_plot',
+            'description': '这张森林图展示了GLP-1受体激动剂与安慰剂的疗效比较。',
+            'key_values': self.REAL_KEY_VALUES,
+        }
+        chat = StubChat(content=json.dumps(raw, ensure_ascii=False))
+        out = _reader(chat).read_all(_fulltext(1))
+        item = out[0]
+        self.assertEqual(item['error'], '')
+        self.assertEqual(item['kind'], 'forest_plot')
+        kv = item['key_values']
+        self.assertNotIn('[', kv)
+        self.assertNotIn("'", kv)
+        self.assertIn('；', kv)
+        # 9 个结局一个都不能少
+        self.assertEqual(len(kv.split('；')), 9)
+        for v in self.REAL_KEY_VALUES:
+            self.assertIn(v, kv)
+        # 每个数值都要原样保留（不能被截断或改写）
+        self.assertIn('-0.44 (-0.68 to -0.21)', kv)
+        self.assertIn('-9.92 (-16.20 to -3.64)', kv)
+        self.assertIn('-2.73 (-4.04 to -1.43)', kv)
+
+    def test_empty_array_becomes_empty_string(self):
+        """空数组不能变成 '[]'。"""
+        import json
+        raw = {'kind': 'forest_plot', 'description': 'd', 'key_values': []}
+        chat = StubChat(content=json.dumps(raw, ensure_ascii=False))
+        item = _reader(chat).read_all(_fulltext(1))[0]
+        self.assertEqual(item['key_values'], '')
+        self.assertEqual(item['error'], '')
+
+    def test_description_array_normalized(self):
+        """description 若是数组，同样用；连接。"""
+        import json
+        raw = {'kind': 'bar_chart',
+               'description': ['横轴是时间', '纵轴是事件率'],
+               'key_values': 'x'}
+        chat = StubChat(content=json.dumps(raw, ensure_ascii=False))
+        item = _reader(chat).read_all(_fulltext(1))[0]
+        self.assertEqual(item['description'], '横轴是时间；纵轴是事件率')
+        self.assertNotIn('[', item['description'])
+
 
 # ---------------------------------------------------------------------------
 # 11. 杂项
