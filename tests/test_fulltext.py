@@ -1185,6 +1185,24 @@ class TestPdfTextExtraction(FullTextTestBase):
         self.assertTrue(res['temp_removed'])
         self.assertNotIn('_used_temp', res)
 
+    def test_no_temp_removed_when_no_file_was_ever_downloaded(self):
+        """压根没下载过 PDF 时，不该报 temp_removed。
+
+        否则会让人误以为「下载并删除过一份」，与事实不符。
+        """
+        self.clear_proxy_env()
+        self.patch_network(routes=[
+            ('pmcoa.cgi', b'{"documents": [{"passages": ['
+                          b'{"infons": {"section_type": "INTRO"}, "text": "x"}]}]}',
+             'application/json'),
+        ])
+        fetcher = FullTextFetcher(email='u@example.org', timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC123', 'doi': '10.1/x',
+                             'title': 'T', 'journal': 'J', 'year': '2020'})
+        self.assertEqual(res['source'], 'pmc_bioc')
+        self.assertNotIn('temp_removed', res)
+        self.assertNotIn('_used_temp', res)
+
 
 if __name__ == '__main__':
     unittest.main()

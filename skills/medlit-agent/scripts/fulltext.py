@@ -99,6 +99,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 
 UA_DEFAULT = 'medlit-agent/2.2 (fulltext retrieval)'
 
@@ -106,6 +107,13 @@ BIOC = 'https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_json
 EPMC = 'https://www.ebi.ac.uk/europepmc/webservices/rest'
 UNPAYWALL = 'https://api.unpaywall.org/v2'
 OPENALEX = 'https://api.openalex.org/works'
+
+# PMC 的 HTML 全文页（有 PMCID 就能试）。
+# 新旧两个域名内容一致，都留着：主域名偶尔被风控挡，老域名是备份。
+PMC_HTML = (
+    'https://pmc.ncbi.nlm.nih.gov/articles/PMC%s/',
+    'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC%s/',
+)
 
 # PMC 图片的规范地址：/pmc/articles/{PMCID}/bin/{文件名}
 PMC_FIG_BASE = 'https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/bin/'
@@ -125,6 +133,16 @@ PROBE_HOSTS = (
 
 # PDF 大小上限：超过就不下载了（避免个别超大文件把磁盘/内存打满）
 MAX_PDF_BYTES = 80 * 1024 * 1024
+
+# PMC HTML 页面上限：有的文章 1~2MB，超限就放弃这一级继续降级。
+# 设 3MB 是权衡：够覆盖绝大多数文章，又不至于把内存/带宽打满。
+MAX_HTML_BYTES = 3 * 1024 * 1024
+
+# PMC HTML 的正文容器 class（实测 PMC 新版页面）：
+#   <section class="body main-article-body">
+# 同一篇的老页面（<div class="body">）也认，所以按 class 里含 'main-article-body'
+# 或精确等于 'body' 来找。找不到就退回 `<article>` 标签。
+PMC_BODY_CLASS_HINTS = ('main-article-body', 'body')
 
 # 代理 / 访问相关的提示语（用户能直接照做的动作）
 VPN_HINT = ('若提示付费墙、403 或连接失败，请先开启 网络代理 / 交大医学院 VPN / '
@@ -185,6 +203,158 @@ def _node_text(node) -> str:
 
     walk(node)
     return _clean(''.join(parts))
+
+
+# ---------------------------------------------------------------------
+# HTML 解析（PMC 的 HTML 全文页）
+# ---------------------------------------------------------------------
+#
+# 为什么自己写而不用第三方库：项目零第三方依赖，装不了 bs4/lxml。
+# 但 PMC 的 HTML 结构相当规整，用 `html.parser`（标准库）做**标签级事件流**
+# 解析就够了——比正则稳（正则处理嵌套标签必然错位），又比建完整 DOM 树轻
+# （1~2MB 的页面不用建树）。
+#
+# 关键设计：解析器要能回答三个问题——
+#   1. 这段文字在不在**正文容器**里？（不在就丢：导航、推荐阅读不能进正文）
+#   2. 这个 <img> 在不在 <figure> 里？（不在就丢：页面里到处是图标）
+#   3. 这段文字是不是标题？（决定进 sections 还是正文）
+
+# 这些标签里的内容整块跳过（脚本、样式、模板）
+_HTML_SKIP_TAGS = ('script', 'style', 'noscript', 'template', 'svg')
+
+# 这些标签里的文字不算正文（图注单独抽、表格单独抽）
+_HTML_SKIP_TEXT = ('figcaption', 'table', 'thead', 'tfoot', 'script', 'style',
+                    'noscript', 'template', 'svg')
+
+# 标题标签：h1~h4 都算章节标题
+_HTML_HEADINGS = ('h1', 'h2', 'h3', 'h4')
+
+
+class _PmcHtmlParser(HTMLParser):
+    """把 PMC 文章页抽成「正文 + 章节 + 图片」。
+
+    只取正文容器（`main-article-body` / `body`）里的内容；
+    找不到容器时退回 `<article>` 标签；再不行就当失败（由调用方判定）。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.text_parts: list[str] = []
+        self.sections: list[str] = []
+        self.figures: list[dict] = []
+        self.in_body = False          # 是否已进入正文容器
+        self.body_found = False       # 是否找到过正文容器
+        self._depth = 0               # 正文容器内的嵌套深度
+        self._skip = 0                # 在 script/style 等里的深度
+        self._tsd = 0                 # 在 table/thead 等「文字要跳过」的标签里
+        self._fig: dict | None = None  # 当前正在处理的 <figure>
+        self._heading: list[str] = []
+        self._in_heading = False
+        self._caption: list[str] = []
+        self._in_caption = False
+
+    # ---- 容器定位 ----
+    @staticmethod
+    def _is_body_container(attrs: dict) -> bool:
+        """判断这个标签是不是正文容器。"""
+        cls = (attrs.get('class') or '').lower()
+        if not cls:
+            return False
+        names = set(cls.split())
+        for hint in PMC_BODY_CLASS_HINTS:
+            if hint in names:
+                return True
+        return False
+
+    # ---- HTMLParser 回调 ----
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or '') for k, v in attrs}
+        if tag in _HTML_SKIP_TAGS:
+            self._skip += 1
+            return
+        if tag in _HTML_SKIP_TEXT:
+            self._tsd += 1
+        if not self.in_body:
+            # 找正文容器：优先 class，其次 <article>
+            if self._is_body_container(a):
+                self.body_found = True
+                self.in_body = True
+                self._depth = 1
+                return
+            if tag == 'article' and not self.body_found:
+                self.body_found = True
+                self.in_body = True
+                self._depth = 1
+                return
+            return
+        self._depth += 1
+        if tag == 'figure':
+            self._fig = {'href': '', 'caption': ''}
+            return
+        if tag == 'figcaption':
+            self._in_caption = True
+            self._caption = []
+            return
+        if tag == 'img' and self._fig is not None and not self._fig['href']:
+            src = (a.get('src') or '').strip()
+            # data: 是内联 base64（占位图或小图），下游没法当图片下载，跳过
+            if src and not src.lower().startswith('data:'):
+                self._fig['href'] = src
+            return
+        if tag in _HTML_HEADINGS:
+            self._in_heading = True
+            self._heading = []
+
+    def handle_endtag(self, tag):
+        if tag in _HTML_SKIP_TAGS:
+            if self._skip > 0:
+                self._skip -= 1
+            return
+        if tag in _HTML_SKIP_TEXT:
+            if self._tsd > 0:
+                self._tsd -= 1
+        if not self.in_body:
+            return
+        if tag == 'figcaption' and self._in_caption:
+            self._in_caption = False
+            if self._fig is not None:
+                self._fig['caption'] = _clean(' '.join(self._caption))
+            self._caption = []
+        elif tag == 'figure' and self._fig is not None:
+            if self._fig['href']:
+                self.figures.append({'href': self._fig['href'],
+                                      'caption': self._fig.get('caption', '')})
+            self._fig = None
+        elif tag in _HTML_HEADINGS and self._in_heading:
+            self._in_heading = False
+            title = _clean(' '.join(self._heading))
+            if title:
+                self.sections.append(title)
+            self._heading = []
+        if self._depth > 0:
+            self._depth -= 1
+            if self._depth == 0:
+                self.in_body = False
+
+    def handle_data(self, data):
+        if self._skip or not self.in_body:
+            return
+        if self._in_caption:
+            self._caption.append(data)
+            return
+        if self._in_heading:
+            self._heading.append(data)
+            return
+        if self._tsd:
+            return          # 表格里的文字不要（图注/表格另算）
+        txt = _clean(data)
+        if txt:
+            self.text_parts.append(txt)
+
+    def handle_startendtag(self, tag, attrs):
+        """自闭合标签（<img ... />）没有对应的 endtag，要在这里配平。"""
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
 
 def _fig_url(pmcid: str, filename: str) -> str:
@@ -627,6 +797,8 @@ class FullTextFetcher:
 
         # 临时目录：只有真的要落盘时才建；用完整体删掉并复查。
         tmpdir = ''
+        # 记录临时目录**是否真的被创建过**：没下载过 PDF 时不该报 temp_removed。
+        tmpdir_used: list[bool] = []
         # **要不要留下 PDF 文件**：只有「用户明确要留 + 给了目录」才留。
         # 其余情况（不落地模式、keep_downloads=False、或压根没给下载目录）
         # 一律走临时目录：下载 → 抽正文 → 删掉。
@@ -641,6 +813,7 @@ class FullTextFetcher:
             nonlocal tmpdir
             if not tmpdir:
                 tmpdir = tempfile.mkdtemp(prefix='medlit-ft-')
+                tmpdir_used.append(True)
             return tmpdir
 
         def _cleanup_tmp() -> bool:
@@ -702,7 +875,30 @@ class FullTextFetcher:
                 if not failed:
                     notes.append('Europe PMC 未提供可用全文。')
 
-            # ---------------- 3. Unpaywall ----------------
+            # ---------------- 3. PMC HTML（最稳的一条源）----------------
+            # 放在 Unpaywall 之前：PMC 的 HTML 页既能出正文，
+            # **还能给出图片直链**——图表识别模块就靠它拿到森林图。
+            # 实测（2026-11-06，PMC12439189）：
+            #   PMC BioC   → 200 但内容是错误页 "[Error] : No result can be found."
+            #   Europe PMC → 500 / 404
+            #   PMC HTML   → 200，233KB，正文与 4 张插图直链全拿到
+            if pmcid:
+                failed = False
+                try:
+                    got = self._try_pmc_html(pmcid)
+                except Exception as e:  # noqa: BLE001
+                    got = None
+                    failed = True
+                    notes.append('PMC HTML 请求失败（%s）' % type(e).__name__)
+                if got:
+                    res.update(got)
+                    res['ok'] = True
+                    res['note'] = '已从 PMC 全文页取得正文。'
+                    return res
+                if not failed:
+                    notes.append('PMC 全文页未提供可用全文。')
+
+            # ---------------- 4. Unpaywall ----------------
             # email 是 Unpaywall 的**必填**参数，没有就跳过（不编造）。
             if doi and self.email:
                 failed = False
@@ -720,7 +916,7 @@ class FullTextFetcher:
             elif doi and not self.email:
                 notes.append('未配置邮箱，跳过 Unpaywall（该接口的 email 参数必填）。')
 
-            # ---------------- 4. OpenAlex ----------------
+            # ---------------- 5. OpenAlex ----------------
             if doi:
                 failed = False
                 try:
@@ -744,8 +940,10 @@ class FullTextFetcher:
             if want_temp:
                 removed = _cleanup_tmp()
                 res['temp_removed'] = removed
-                # 标记走过临时路径：fetch() 据此决定要不要多返回 temp_removed
-                res['_used_temp'] = True
+                # 标记走过临时路径：fetch() 据此决定要不要多返回 temp_removed。
+                # 只有**真的建过临时目录**才算——压根没下载过 PDF 时，
+                # 报一个 temp_removed=True 会让人误以为「下载并删除过」。
+                res['_used_temp'] = bool(tmpdir_used)
                 if not removed:
                     res['note'] = ((res.get('note') or '') +
                                    '；警告：临时文件未能确认删除，请手动检查').strip('；')
@@ -789,6 +987,186 @@ class FullTextFetcher:
             return None
         return {'source': 'pmc_bioc', 'text': text, 'sections': sections,
                 'figures': figures}
+
+    # ---------------- PMC HTML 全文页 ----------------
+    #
+    # 为什么单独加这一级（实测 2026-11-06，PMC12439189）：
+    #   PMC BioC   → HTTP 200 但内容是错误页 "[Error] : No result can be found."
+    #   Europe PMC → HTTP 500（fullTextXML）/ 404（MED 形式）
+    #   PMC HTML   → HTTP 200，233KB，正文与插图直链全拿到
+    #
+    # 而且它是**唯一能给出图片直链**的免费全文源：
+    # 插图地址形如
+    #   https://cdn.ncbi.nlm.nih.gov/pmc/blobs/.../xxx-g002.jpg
+    # 图表识别模块（scripts/figures.py）就靠它下载图片送给多模态模型。
+    #
+    # PMC 的 HTML 有新旧两套版式，容器类名不同：
+    #   新版：<section class="body main-article-body">
+    #   旧版：<div id="main-content"> / <div class="article-body">
+    # 所以容器要按多个候选依次尝试，**不能硬编码一个**。
+
+    PMC_HTML = 'https://pmc.ncbi.nlm.nih.gov/articles/PMC%s/'
+    PMC_HTML_MAX_BYTES = 6 * 1024 * 1024
+    # 正文容器的候选（按可靠性排序）
+    _PMC_BODY_PATTERNS = (
+        r'<section[^>]*class="[^"]*\bbody\b[^"]*main-article-body[^"]*"[^>]*>',
+        r'<div[^>]*class="[^"]*\bmain-article-body\b[^"]*"[^>]*>',
+        r'<div[^>]*id="main-content"[^>]*>',
+        r'<div[^>]*class="[^"]*\barticle-body\b[^"]*"[^>]*>',
+        r'<article[^>]*>',
+    )
+
+    def _try_pmc_html(self, pmcid: str) -> dict | None:
+        """从 PMC 的 HTML 全文页取正文与插图。失败返回 None（交给下一级）。"""
+        url = self.PMC_HTML % pmcid
+        try:
+            status, body, ctype = self._request(url)
+        except Exception:  # noqa: BLE001
+            return None
+        if status != 200 or not body:
+            return None
+        if len(body) > self.PMC_HTML_MAX_BYTES:
+            # 太大了就不硬啃：超限时截断容易切坏结构，反而抽不出东西
+            return None
+        html = body.decode('utf-8', 'ignore')
+        if not self._looks_like_article(html):
+            # PMC 偶尔返回 404 页或反爬提示页——别把错误页当正文
+            return None
+        container = self._extract_article_html(html)
+        if not container:
+            return None
+        text, sections = self._html_to_text(container)
+        if len(text) < 400:
+            return None
+        figures = self._html_figures(html, url)
+        return {
+            'source': 'pmc_html',
+            'text': text,
+            'sections': sections,
+            'figures': figures,
+            'url': url,
+        }
+
+    @staticmethod
+    def _looks_like_article(html: str) -> bool:
+        """判断拿到的 HTML 是不是正文页，而不是 404/反爬页。"""
+        head = html[:6000].lower()
+        if 'captcha' in head or 'recaptcha' in head:
+            return False
+        # 正文页至少有这些标志之一
+        for mark in ('main-article-body', 'article-body', 'id="main-content"',
+                     '<article', '<figure'):
+            if mark in html:
+                return True
+        return False
+
+    @staticmethod
+    def _extract_article_html(html: str) -> str:
+        """切出正文容器那一段 HTML。找不到就返回空串。"""
+        for pat in FullTextFetcher._PMC_BODY_PATTERNS:
+            m = re.search(pat, html, re.I)
+            if not m:
+                continue
+            start = m.end()
+            # 找配对的结束标签（容器都是 div/section/article）
+            tag = re.match(r'<(div|section|article)\b', m.group(0), re.I)
+            if not tag:
+                continue
+            name = tag.group(1).lower()
+            depth = 1
+            pos = start
+            open_pat = re.compile(r'<%s\b' % name, re.I)
+            close_pat = re.compile(r'</%s>' % name, re.I)
+            while depth > 0 and pos < len(html):
+                no = open_pat.search(html, pos)
+                nc = close_pat.search(html, pos)
+                if nc is None:
+                    break
+                if no is not None and no.start() < nc.start():
+                    depth += 1
+                    pos = no.end()
+                else:
+                    depth -= 1
+                    pos = nc.end()
+                    if depth == 0:
+                        return html[start:nc.start()]
+        return ''
+
+    @staticmethod
+    def _strip_tags(fragment: str) -> str:
+        """把一段 HTML 片段转成纯文本。"""
+        s = re.sub(r'<(script|style)\b.*?</\1>', ' ', fragment,
+                   flags=re.S | re.I)
+        s = re.sub(r'<[^>]+>', ' ', s)
+        s = (s.replace('&nbsp;', ' ').replace('&amp;', '&')
+              .replace('&lt;', '<').replace('&gt;', '>')
+              .replace('&quot;', '"').replace('&#39;', "'")
+              .replace('&#x2013;', '-').replace('&#8211;', '-'))
+        s = re.sub(r'&#(\d+);',
+                   lambda m: chr(int(m.group(1))) if int(m.group(1)) < 65536
+                   else ' ', s)
+        return re.sub(r'\s+', ' ', s).strip()
+
+    def _html_to_text(self, fragment: str) -> tuple:
+        """HTML 正文 → (纯文本, 章节标题列表)。
+
+        保留段落边界（用换行），否则整篇挤成一行会让模型读着费劲。
+        """
+        s = re.sub(r'<(script|style|nav|header|footer)\b.*?</\1>', ' ',
+                   fragment, flags=re.S | re.I)
+        sections: list[str] = []
+        buf: list[str] = []
+
+        def _flush(tag: str) -> None:
+            txt = self._strip_tags(tag)
+            if not txt:
+                return
+            if tag.strip().lower().startswith(('<h1', '<h2', '<h3', '<h4')):
+                sections.append(txt)
+                buf.append('\n## ' + txt)
+            else:
+                buf.append(txt)
+
+        for m in re.finditer(r'<(h[1-4]|p)\b[^>]*>(.*?)</\1>', s,
+                             flags=re.S | re.I):
+            _flush(m.group(0))
+        text = '\n'.join(x for x in buf if x.strip())
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+        return text, sections
+
+    def _html_figures(self, html: str, base_url: str) -> list:
+        """从 HTML 里抽插图：**只取 `<figure>` 里的 `<img>`**。
+
+        为什么必须限定在 `<figure>` 内：
+        PMC 页面里 `<img>` 有 37 个，其中绝大多数是导航图标
+        （us_flag.svg / icon-dot.svg / ncbi-logo / usa-icons）。
+        不限定就会把一堆图标当成论文插图送进多模态模型。
+
+        返回 [{'href': 图片绝对地址, 'caption': 图注纯文本}, ...]
+        """
+        out: list = []
+        seen: set = set()
+        for fm in re.finditer(r'<figure\b.*?</figure>', html, flags=re.S | re.I):
+            block = fm.group(0)
+            im = re.search(r'<img[^>]+src="([^"]+)"', block, re.I)
+            if not im:
+                continue
+            src = (im.group(1) or '').strip()
+            if not src or src.startswith('data:'):
+                # 内联 base64 图跳过：体积大且没必要
+                continue
+            if not re.match(r'^https?://', src, re.I):
+                src = urllib.parse.urljoin(base_url, src)
+            cap = ''
+            cm = re.search(r'<figcaption[^>]*>(.*?)</figcaption>', block,
+                           flags=re.S | re.I)
+            if cm:
+                cap = self._strip_tags(cm.group(1))
+            if src in seen:
+                continue
+            seen.add(src)
+            out.append({'href': src, 'caption': cap})
+        return out
 
     def _try_europepmc(self, pmcid: str, pmid: str) -> dict | None:
         """Europe PMC 的 JATS fullTextXML。
@@ -886,6 +1264,86 @@ class FullTextFetcher:
         text = '\n\n'.join(x for x in lines if x).strip()
         return {'source': 'europe_pmc', 'text': text, 'sections': sections,
                 'figures': figures}
+
+    # ---------------- PMC HTML 全文页 ----------------
+    def _try_pmc_html(self, pmcid: str) -> dict | None:
+        """PMC 的 HTML 全文页——目前**最稳**的全文源。
+
+        为什么需要这一级：实测有些文章（PMC 有编号、但不在 BioC 覆盖范围内）
+        三条老路全断：
+          - PMC BioC      → 200 但返回 "[Error] : No result can be found."
+          - Europe PMC XML→ HTTP 500
+          - Europe PMC MED→ HTTP 404
+        而 **HTML 全文页照样能拿到正文**（实测 PMC12439189 一篇 233KB 的 HTML
+        里有完整正文 + 4 张图）。所以这一级不是「锦上添花」，是**兜底**。
+
+        HTML 源还有两个别的源给不了的好处：
+          1. **图片是 CDN 上的绝对 URL**（`cdn.ncbi.nlm.nih.gov/pmc/blobs/…`），
+             下游图表识别模块可以直接下载，不用自己拼路径；
+          2. 正文已经排版好过一遍，比 PDF 好剥得多。
+
+        防御（实测踩到的）：
+          - PMC **会间歇性返回 reCAPTCHA 挑战页**（21KB 的 Google 页面，
+            同一个 URL 连抓 4 次有 2 次中招）。必须检查正文标志，
+            否则会把挑战页当正文抽出来——那会得到一大段 JS 噪声。
+          - HTML 可能很大（1~2MB），超过 3MB 直接放弃这一级。
+        """
+        if not pmcid:
+            return None
+        for tpl in PMC_HTML:
+            url = tpl % pmcid
+            try:
+                raw = self._get_text(url, timeout=min(self.timeout, 90))
+            except Exception:  # noqa: BLE001 —— 换下一个域名
+                continue
+            if not raw or len(raw) > MAX_HTML_BYTES:
+                continue
+            got = self._parse_pmc_html(raw, pmcid)
+            if got:
+                got['source'] = 'pmc_html'
+                return got
+        return None
+
+    @staticmethod
+    def _parse_pmc_html(html: str, pmcid: str) -> dict | None:
+        """解析 PMC 的 HTML 全文页。解析不出正文返回 None（由调用方降级）。
+
+        关键：**先确认这是文章页**，再抽内容。
+        判断依据是正文标志（正文容器 class / `<article>` 标签），
+        没有就当失败——reCAPTCHA 页、404 页都没有这些标志。
+        """
+        low = html.lower()
+        # 反爬页的显式特征：出现了就立刻否掉（省得解析完才发现是 JS）
+        if 'recaptcha' in low or 'challengepage' in low:
+            return None
+
+        parser = _PmcHtmlParser()
+        try:
+            parser.feed(html)
+            parser.close()
+        except Exception:  # noqa: BLE001 —— HTML 畸形不该炸掉整条链
+            return None
+
+        if not parser.body_found:
+            return None      # 不是文章页（404 页 / 空页）
+
+        text = '\n'.join(parser.text_parts).strip()
+        if len(text) < 200:
+            return None      # 正文太短，多半是空壳页或抽错了地方
+
+        # 图片 src 可能是相对路径（少数页面），拼成绝对
+        base = PMC_HTML[0] % pmcid
+        figures = []
+        for f in parser.figures:
+            href = f.get('href') or ''
+            if not href:
+                continue
+            if not href.lower().startswith('http'):
+                href = urllib.parse.urljoin(base, href)
+            figures.append({'href': href, 'caption': f.get('caption') or ''})
+
+        return {'source': 'pmc_html', 'text': text,
+                'sections': parser.sections, 'figures': figures}
 
     def _try_unpaywall(self, paper: dict, doi: str, ensure_tmp, want_temp: bool) -> dict | None:
         """Unpaywall：免费无 key（email 必填）。返回开放获取副本信息。"""

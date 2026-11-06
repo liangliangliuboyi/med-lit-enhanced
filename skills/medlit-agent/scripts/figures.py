@@ -295,6 +295,60 @@ def _norm_kind(raw: Any) -> str:
     return alias.get(s, 'other')
 
 
+def _pmc_id_from_url(url: str) -> str:
+    """从图片地址里认出 PMCID（纯数字，不含 PMC 前缀）。
+
+    认出来的作用：Europe PMC 的「打包下载」端点是
+    `/rest/{PMCID}/supplementaryFiles`，返回该文全部图片的 zip。
+    当 PMC 的 /bin/ 直链拿不到图时（实测：对部分文献返回 404 或一个
+    HTML 的反爬页而不是图片），可以从这个 zip 里按文件名取图。
+    """
+    m = re.search(r'PMC(\d{5,})', url or '', re.I)
+    return m.group(1) if m else ''
+
+
+def _package_zip_url(pmcid: str) -> str:
+    """Europe PMC 的文章资源打包端点（含全部图片）。"""
+    return ('https://www.ebi.ac.uk/europepmc/webservices/rest/PMC%s'
+            '/supplementaryFiles' % pmcid)
+
+
+def _image_from_zip(blob: bytes, url: str, max_bytes: int) -> tuple[bytes, str]:
+    """从文章打包 zip 里按文件名取出对应的图。
+
+    zip 里的文件名与 JATS 的 graphic href 一致（如
+    `pone.0138511.g002.jpg`），所以拿地址末段去匹配即可。
+    """
+    import io
+    import zipfile
+
+    zf = zipfile.ZipFile(io.BytesIO(blob))
+    fname = urllib.parse.unquote((url or '').rstrip('/').split('/')[-1]) or ''
+    names = zf.namelist()
+    target = None
+    for cand in (fname, fname.replace('.gif', '.jpg'),
+                 fname.replace('.jpg', '.gif')):
+        if not cand:
+            continue
+        for nm in names:
+            if nm == cand or nm.rsplit('/', 1)[-1] == cand:
+                target = nm
+                break
+        if target:
+            break
+    if not target:
+        raise ValueError('打包文件里没有 %s' % (fname or '该图'))
+    with zf.open(target) as f:
+        data = f.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError('图片过大（超过上限 %d 字节）' % max_bytes)
+    ext = target.rsplit('.', 1)[-1].lower() if '.' in target else 'png'
+    mime = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+            'gif': 'image/gif', 'webp': 'image/webp', 'tif': 'image/tiff',
+            'tiff': 'image/tiff', 'svg': 'image/svg+xml'}.get(ext, 'image/png')
+    return data, mime
+
+
 def _download_image(url: str, max_bytes: int, timeout: int) -> tuple[bytes, str]:
     """下载一张图片，返回 (字节, content-type)。
 
@@ -397,8 +451,54 @@ class FigureReader:
         self.workers = max(1, min(int(workers or DEFAULT_WORKERS), MAX_WORKERS_CAP))
         self.role = role or FIGURE_ROLE
         self.downloader = downloader
+        # 打包 zip 缓存：PMCID -> zip 字节。一篇论文的图共用一份，
+        # 免得每张图都下几十 MB。
+        self._pkg_cache: dict[str, bytes] = {}
+        self._pkg_lock = threading.Lock()
 
     # ---- 单张图 ----
+    def _fetch_image(self, url: str) -> tuple[bytes, str]:
+        """下载一张图；直链拿不到就退回 Europe PMC 的文章打包 zip。
+
+        为什么需要兜底（这是实测踩出来的坑，不是杞人忧天）：
+        PMC 的规范图床地址 `ncbi.nlm.nih.gov/pmc/articles/{PMCID}/bin/{file}`
+        对相当一部分文献**取不到图片**——要么 404，要么返回一个 HTML
+        反爬页（Content-Type 是 text/html，体积 20KB 左右）。
+        而 Europe PMC 的 `/rest/{PMCID}/supplementaryFiles` 端点稳定可用，
+        返回该文全部图片的 zip，文件名与 JATS 的 graphic href 一致。
+
+        打包 zip 可能十几 MB，所以**缓存整篇的 zip**，多张图只下一次——
+        否则每张图都下几十 MB，这一轮的成本会失控。
+        """
+        if self.downloader is not None:
+            return self.downloader(url)
+        try:
+            return _download_image(url, self.max_bytes,
+                                   min(self.timeout, DOWNLOAD_TIMEOUT))
+        except Exception as first:  # noqa: BLE001
+            pmcid = _pmc_id_from_url(url)
+            if not pmcid:
+                raise
+            try:
+                return self._fetch_from_package(url, pmcid)
+            except Exception:  # noqa: BLE001
+                # 兜底也失败 → 报直链的原始错误，那条更有诊断价值
+                raise first
+
+    def _fetch_from_package(self, url: str, pmcid: str) -> tuple[bytes, str]:
+        """从缓存的打包 zip 里取图（zip 只下一次，缓存在实例上）。"""
+        with self._pkg_lock:
+            blob = self._pkg_cache.get(pmcid)
+            if blob is None:
+                zurl = _package_zip_url(pmcid)
+                req = urllib.request.Request(zurl, headers={'User-Agent': UA,
+                                                            'Accept': '*/*'})
+                with urllib.request.urlopen(
+                        req, timeout=max(self.timeout, 60)) as resp:
+                    blob = resp.read()
+                self._pkg_cache[pmcid] = blob
+        return _image_from_zip(blob, url, self.max_bytes)
+
     @staticmethod
     def _unmark_href(seen_hrefs: set, key: str, lock: threading.Lock) -> None:
         """下载失败时把地址从去重表里摘掉。
@@ -447,19 +547,11 @@ class FigureReader:
                 return out
             seen_hrefs.add(key)
 
-        # 下载
+        # 下载（直链失败时会自动走打包兜底，见 _fetch_image）
         try:
-            if self.downloader is not None:
-                data, ctype = self.downloader(url)
-            else:
-                data, ctype = _download_image(url, self.max_bytes,
-                                               min(self.timeout, DOWNLOAD_TIMEOUT))
-        except urllib.error.HTTPError as e:
-            out['error'] = '下载失败：HTTP %s' % e.code
-            self._unmark_href(seen_hrefs, key, lock)
-            return out
+            data, ctype = self._fetch_image(url)
         except Exception as e:  # noqa: BLE001
-            out['error'] = '下载失败：%s' % str(e)[:120]
+            out['error'] = '下载失败：%s' % str(e)[:140]
             self._unmark_href(seen_hrefs, key, lock)
             return out
         if not data:

@@ -1476,42 +1476,43 @@ class Run:
 
         两种情况：
         1. 所有纳入文献都拿到了全文 → 一句话说明，不用麻烦用户
-        2. 有文献只读到摘要 → 给出**可执行**的获取途径，
-           并提醒开 VPN / 用交大图书馆（这是用户真正需要的帮助）
+        2. 有文献只读到摘要 → 交给 `fulltext.acquisition_guide()` 生成
+           **可执行**的获取途径，并提醒开 VPN / 用交大图书馆
+
+        指引的生成逻辑只有一份（在 fulltext 模块里），这里不重复实现——
+        两份实现迟早会走偏，之前就埋过"看起来能跑但内容不對"的坑。
         """
         missing = list(self.no_fulltext)
         if not missing:
             return '（本轮纳入的文献均已获得全文，无需用户额外获取。）'
-        res = (self.cfg.get('resources') or {})
-        library_name = res.get('library_name') or '交大图书馆'
-        library_url = res.get('library_url') or ''
-        vpn_notice = res.get('vpn_notice') or (
-            '若提示付费墙或连接失败，请开启 网络代理 / 交大医学院 VPN，'
-            '或通过交大图书馆校外访问入口重试。')
-        lines = [f'有 {len(missing)} 篇文献本轮只读到了摘要（未取得全文）。'
-                 '它们的结论可能被摘要简化或遗漏，'
-                 '若结论对本问题关键，建议取得全文后再据此决策：', '']
+        try:
+            guide = self.ft_fetcher.acquisition_guide(missing)
+        except Exception as e:  # noqa: BLE001
+            self.err('fulltext_guide', e)
+            guide = ''
+        if guide:
+            # 模块给的是完整的 markdown（含标题），成文提示词里只需要正文部分
+            lines = [ln for ln in guide.split('\n')
+                     if not ln.startswith('# ') and ln.strip()]
+            return '\n'.join(lines).strip()
+        # 兜底：模块出问题时至少把题录列出来
+        out = [f'有 {len(missing)} 篇文献本轮只读到了摘要（未取得全文）。'
+               '它们的结论可能被摘要简化或遗漏，'
+               '若结论对本问题关键，建议取得全文后再据此决策：', '']
         for i, p in enumerate(missing, 1):
-            bits = [f'{i}. {p.get("title") or "（无题名）"}']
-            meta = '｜'.join(x for x in (p.get('journal'), p.get('year')) if x)
-            if meta:
-                bits.append(f'   {meta}')
-            links = []
+            out.append(f'{i}. {p.get("title") or "（无题名）"}'
+                       f'｜{p.get("journal") or ""} {p.get("year") or ""}')
             if p.get('doi'):
-                links.append(f'DOI: https://doi.org/{p["doi"]}')
+                out.append(f'   DOI: https://doi.org/{p["doi"]}')
             if p.get('pmid'):
-                links.append(f'PubMed: https://pubmed.ncbi.nlm.nih.gov/{p["pmid"]}/')
-            if p.get('pmcid'):
-                links.append(f'PMC: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{p["pmcid"]}/')
-            for lk in links:
-                bits.append(f'   {lk}')
-            lines.append('\n'.join(bits))
-        lines.append('')
-        lines.append(f'获取途径：Unpaywall / OpenAlex（开放获取，可直接下载）、'
-                     f'{library_name}校外访问'
-                     + (f'（{library_url}）' if library_url else '')
-                     + f'、期刊官网。{vpn_notice}')
-        return '\n'.join(lines)
+                out.append(f'   PubMed: https://pubmed.ncbi.nlm.nih.gov/{p["pmid"]}/')
+        res = (self.cfg.get('resources') or {})
+        out.append('')
+        out.append(f'获取途径：Unpaywall / OpenAlex（开放获取，可直接下载）、'
+                   f'{res.get("library_name") or "交大图书馆"}校外访问'
+                   f'（{res.get("library_url") or ""}）、期刊官网。'
+                   f'{res.get("vpn_notice") or ""}')
+        return '\n'.join(out)
 
     def figures_markdown(self) -> str:
         """图表识别结果（Markdown）。没有识别过就返回空串。"""

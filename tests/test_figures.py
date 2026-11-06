@@ -627,6 +627,69 @@ class TestMisc(unittest.TestCase):
         reader = figures.FigureReader(lambda *a, **k: {})
         self.assertEqual(reader.model, 'Qwen/Qwen3-VL-8B-Instruct')
 
+    def test_pmc_id_parsed_from_url(self):
+        """从图片地址里认出 PMCID——打包兜底要用。"""
+        self.assertEqual(
+            figures._pmc_id_from_url(
+                'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4580597/bin/x.jpg'),
+            '4580597')
+        self.assertEqual(
+            figures._pmc_id_from_url(
+                'https://www.ebi.ac.uk/europepmc/webservices/rest/PMC1234567/x'),
+            '1234567')
+        self.assertEqual(figures._pmc_id_from_url('https://example.org/a.jpg'), '')
+        self.assertEqual(figures._pmc_id_from_url(''), '')
+
+    def test_package_zip_url(self):
+        self.assertEqual(
+            figures._package_zip_url('4580597'),
+            'https://www.ebi.ac.uk/europepmc/webservices/rest/'
+            'PMC4580597/supplementaryFiles')
+
+    def test_image_from_zip_picks_matching_entry(self):
+        """从打包 zip 里按文件名取图。"""
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w') as zf:
+            zf.writestr('pone.0138511.g002.jpg', b'\xff\xd8\xffJPEGPAYLOAD')
+            zf.writestr('pone.0138511.g003.gif', b'GIF89aPAYLOAD')
+        data, mime = figures._image_from_zip(
+            buf.getvalue(),
+            'https://x/pmc/articles/PMC4580597/bin/pone.0138511.g002.jpg',
+            1024)
+        self.assertEqual(data, b'\xff\xd8\xffJPEGPAYLOAD')
+        self.assertEqual(mime, 'image/jpeg')
+
+    def test_image_from_zip_missing_entry_raises(self):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w') as zf:
+            zf.writestr('other.jpg', b'x')
+        with self.assertRaises(Exception):
+            figures._image_from_zip(buf.getvalue(),
+                                    'https://x/bin/nope.jpg', 1024)
+
+    def test_image_from_zip_respects_size_cap(self):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w') as zf:
+            zf.writestr('big.jpg', b'x' * 500)
+        with self.assertRaises(Exception):
+            figures._image_from_zip(buf.getvalue(), 'https://x/bin/big.jpg', 100)
+
+    def test_injected_downloader_bypasses_package_fallback(self):
+        """自带 downloader 时不走打包兜底（离线测试必须完全离线）。"""
+        chat = StubChat()
+        reader = figures.FigureReader(chat, downloader=_fake_downloader())
+        out = reader.read_all(_fulltext(2))
+        self.assertEqual(len(out), 2)
+        for item in out:
+            self.assertEqual(item['error'], '')
+        self.assertEqual(chat.calls, 2)
+
     def test_never_raises_on_weird_input(self):
         """再离谱的输入也不能抛异常——这是本模块的第一原则。"""
         chat = StubChat()

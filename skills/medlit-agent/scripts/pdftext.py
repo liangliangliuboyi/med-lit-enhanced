@@ -100,6 +100,13 @@ _PREDEFINED_CMAP_CODEC = {
     'UniJIS-UCS2-H': 'utf-16-be', 'UniJIS-UCS2-V': 'utf-16-be',
 }
 
+# 会产生中日韩文字的编码：这些字体排出来的文本里词间没有空格，
+# 不能因为「横向挪了位置」就补空格（否则每个汉字后面都跟一个空格）。
+_CJK_CODECS = frozenset((
+    'gbk', 'gb2312', 'big5', 'big5hkscs', 'shift_jis', 'euc_jp',
+    'euc_kr', 'cp949', 'gb18030',
+))
+
 # 词法记号。正则切分比逐字符扫描快一个量级（内容流动辄上百 KB）。
 _TOKEN_RE = re.compile(rb"""
       (?P<ws>[\x00\t\n\x0c\r ]+)
@@ -1148,7 +1155,11 @@ def _extract_content_text(content: bytes, fonts, global_info) -> str:
     stack = []        # 操作数栈
     arrays = []       # 正在构造的数组（嵌套用）
     cur_font = None
-    last_tm = None
+    # 当前行起点（文本空间坐标）。Tm 绝对设置，TD/Td/T* 相对累加。
+    line_x = None
+    line_y = None
+    font_size = 0.0
+    leading = 0.0
 
     def resolve(raw: bytes) -> str:
         info = fonts.get(cur_font) if fonts else None
@@ -1161,12 +1172,56 @@ def _extract_content_text(content: bytes, fonts, global_info) -> str:
             return _decode_with_codec(raw, codec)
         return _decode_bytes(raw, cmap, width, global_info[0], global_info[1])
 
+    def is_cjk_font() -> bool:
+        """当前字体是不是中日韩字体。
+
+        中文排版里词与词之间**没有空格**（"中国科学院" 不是 "中 国 科 学
+        院"），而且 OCR 出来的中文 PDF 常常给每个字单独一个 Tm 定位。
+        所以遇到中日韩字体时，绝不能因为「横向挪了位置」就补空格，
+        否则会得到每个字都带空格的烂文本。
+        """
+        info = fonts.get(cur_font) if fonts else None
+        if info is None:
+            info = global_info
+        codec = info[2]
+        if codec and codec in _CJK_CODECS:
+            return True
+        return _is_cjk_context(out)
+
     def push(item):
         # 数组里的元素要进数组，不能直接进操作数栈
         if arrays:
             arrays[-1].append(item)
         else:
             stack.append(item)
+
+    def _set_line(x, y):
+        """Tm：绝对设置行起点。"""
+        nonlocal line_x, line_y
+        if line_y is not None:
+            if abs(y - line_y) > 0.5:
+                out.append('\n')
+            elif abs(x - line_x) > 0.5:
+                # 横向挪了位置：多半是换了个词。但中日韩排版里词间本来
+                # 就没有空格（每个字还可能单独定位），所以中日韩字体不补空格。
+                if not is_cjk_font():
+                    out.append(' ')
+        line_x, line_y = x, y
+
+    def _move_line(dx, dy):
+        """Td/TD/T*：相对当前行起点位移。"""
+        nonlocal line_x, line_y
+        if line_x is None:
+            # BT 之后的第一个 Td：此时文本矩阵是单位矩阵，
+            # 所以这个位移就是绝对坐标。
+            line_x, line_y = dx, dy
+            return
+        if abs(dy) > 1e-6:
+            out.append('\n')
+        elif abs(dx) > 0.5 and not is_cjk_font():
+            out.append(' ')
+        line_x += dx
+        line_y += dy
 
     for kind, val in _tokens(content):
         if kind == 'name':
@@ -1196,6 +1251,8 @@ def _extract_content_text(content: bytes, fonts, global_info) -> str:
         if op == 'Tf':
             if len(stack) >= 2 and stack[-2][0] == 'name':
                 cur_font = stack[-2][1]
+            if stack and stack[-1][0] == 'num':
+                font_size = stack[-1][1]
             stack = []
         elif op == 'Tj':
             if stack and stack[-1][0] == 'str':
@@ -1207,8 +1264,14 @@ def _extract_content_text(content: bytes, fonts, global_info) -> str:
                     if item[0] == 'str':
                         out.append(resolve(item[1]))
                     elif item[0] == 'num':
-                        # 字间距调整量：绝对值够大就说明这里该断词了
-                        if abs(item[1]) >= TJ_SPACE_THRESHOLD:
+                        # 字间距调整量。PDF 规范里这个数是「往回拉的量」：
+                        # **负数** = 把后面的字往右推 = 这里原本有个空隙
+                        # （LaTeX 排版时一个词间空格正好是 -250）；
+                        # **正数** = 把后面的字往左挤 = 字距微调（kerning），
+                        # 例如 "Y" 与 "ou" 之间的 111。
+                        # 所以只有负数才代表词间空格，正数不能补空格，
+                        # 否则会把 "You" 拆成 "Y ou"。
+                        if item[1] <= -TJ_SPACE_THRESHOLD:
                             out.append(' ')
             stack = []
         elif op in ("'", '"'):
@@ -1217,35 +1280,75 @@ def _extract_content_text(content: bytes, fonts, global_info) -> str:
                 out.append('\n')
             stack = []
         elif op in ('Td', 'TD'):
-            # 竖直位移 = 换行；纯横向位移 = 同一行里的空隙
-            ty = 0.0
+            # Td/TD 是相对**当前行起点**的位移。行起点由 Tm 绝对设置，
+            # 由 Td/TD 累加（BT 之后第一个 Td 是相对单位矩阵的绝对值）。
+            tx = ty = 0.0
+            if len(stack) >= 2 and stack[-1][0] == 'num' \
+                    and stack[-2][0] == 'num':
+                tx, ty = stack[-2][1], stack[-1][1]
+            if op == 'TD':
+                leading = -ty
+            _move_line(tx, ty)
+            stack = []
+        elif op == 'TL':
+            # 设置行距：T* 用它往下走一行
             if stack and stack[-1][0] == 'num':
-                ty = stack[-1][1]
-            out.append('\n' if abs(ty) > 1e-6 else ' ')
+                leading = stack[-1][1]
             stack = []
         elif op == 'T*':
-            out.append('\n')
+            # 换到下一行
+            _move_line(0.0, -leading)
             stack = []
         elif op == 'Tm':
             nums = [x[1] for x in stack if x[0] == 'num']
             if len(nums) >= 6:
-                x, y = nums[4], nums[5]
-                if last_tm is not None:
-                    if abs(y - last_tm[1]) > 0.5:
-                        out.append('\n')
-                    elif abs(x - last_tm[0]) > 0.5:
-                        out.append(' ')
-                last_tm = (x, y)
+                _set_line(nums[4], nums[5])
             stack = []
         elif op == 'ET':
             out.append('\n')
             stack = []
         elif op == 'BT':
+            # 新段落：行起点重置，下一个 Tm/Td 会重新定位
+            line_x = None
+            line_y = None
             stack = []
         else:
             # 其余操作符（q/Q/cm/gs/Do/re/...）：清掉操作数栈
             stack = []
     return ''.join(out)
+
+
+def _is_cjk_context(out) -> bool:
+    """判断已输出的文字是不是中日韩上下文。
+
+    中文 PDF（尤其是 OCR 出来的）每个汉字都会用单独的 Tm 定位，
+    横向位置一直在变。如果不加区分地按「横向挪位 = 换词」处理，
+    就会得到「中 国 科 学 院」这种每个字都带空格的烂文本。
+    这里看已输出内容的末尾是不是中日韩字符：是就不补空格。
+    """
+    for chunk in reversed(out):
+        if not chunk:
+            continue
+        for ch in reversed(chunk):
+            if ch.isspace():
+                continue
+            return _is_cjk_char(ch)
+    return False
+
+
+def _is_cjk_char(ch: str) -> bool:
+    """是不是中日韩表意文字（含中日韩标点与全角符号）。"""
+    if not ch:
+        return False
+    code = ord(ch[0])
+    return (
+        0x4E00 <= code <= 0x9FFF      # CJK 统一表意文字
+        or 0x3400 <= code <= 0x4DBF   # 扩展 A
+        or 0xF900 <= code <= 0xFAFF   # 兼容表意文字
+        or 0x3000 <= code <= 0x303F   # CJK 标点
+        or 0xFF00 <= code <= 0xFFEF   # 全角形式
+        or 0x20000 <= code <= 0x2A6DF  # 扩展 B
+    )
 
 
 def _decode_with_codec(raw: bytes, codec: str) -> str:

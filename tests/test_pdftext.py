@@ -109,6 +109,20 @@ class TestPlainStream(unittest.TestCase):
             self._pdf(b'BT [(A) -30 (B)] TJ ET'))['text']
         self.assertNotIn('A B', text)
 
+    def test_positive_tj_is_kerning_not_a_space(self):
+        # PDF 规范：TJ 里的正数是把后面的字往左挤（kerning），
+        # 不是词间空格。LaTeX 排版 "You" 时 Y 与 ou 之间是 +111，
+        # 如果按绝对值判断就会得到 "Y ou"。
+        text = pdftext.extract_text(
+            self._pdf(b'BT [(All)-250(Y)111(ou)-250(Need)] TJ ET'))['text']
+        self.assertIn('All You Need', text)
+        self.assertNotIn('Y ou', text)
+
+    def test_negative_tj_above_threshold_is_a_space(self):
+        text = pdftext.extract_text(
+            self._pdf(b'BT [(Attention)-250(Is)-250(All)] TJ ET'))['text']
+        self.assertIn('Attention Is All', text)
+
     def test_quotes_operator(self):
         text = pdftext.extract_text(
             self._pdf(b'BT (line one) \' (line two) \' ET'))['text']
@@ -282,6 +296,59 @@ class TestMaxChars(unittest.TestCase):
         res = pdftext.extract_text(pdf, max_chars=1000)
         self.assertIn('short', res['text'])
         self.assertNotIn('截断', res['note'])
+
+
+class TestPredefinedCMap(unittest.TestCase):
+    """预定义 CMap（GBK-EUC-H 之类）：老排版/OCR 生成的中文 PDF。
+
+    这类 PDF 没有 /ToUnicode，字符码本身就是 GBK 字节，
+    只能靠 Python 标准库的 gbk codec 解。
+    """
+
+    def _pdf(self, encoding=b'GBK-EUC-H'):
+        # 「中国科学院」的 GBK 编码
+        content = (b'BT /F0 12 Tf 1 0 0 1 100 700 Tm '
+                   b'(\xd6\xd0\xb9\xfa\xbf\xc6\xd1\xa7\xd4\xba) Tj ET')
+        return build_pdf([
+            (1, b'<< /Type /Font /Subtype /Type0 '
+                b'/BaseFont /STSong-Light-' + encoding +
+                b' /Encoding /' + encoding + b' >>'),
+            (2, b'<< /Type /Page /Parent 3 0 R /Resources '
+                b'<< /Font << /F0 1 0 R >> >> /Contents 4 0 R >>'),
+            (3, b'<< /Type /Pages /Kids [2 0 R] /Count 1 >>'),
+            (4, stream_obj(content)),
+        ])
+
+    def test_gbk_decodes_to_chinese(self):
+        text = pdftext.extract_text(self._pdf())['text']
+        self.assertIn('中国科学院', text)
+
+    def test_no_space_between_cjk_glyphs(self):
+        # 中日韩排版词间没有空格；OCR 出来中文 PDF 常常给每个字
+        # 单独一个 Tm 定位，不能因为横向挪位就补空格。
+        content = (b'BT /F0 12 Tf 1 0 0 1 100 700 Tm (\xd6\xd0) Tj '
+                   b'1 0 0 1 112 700 Tm (\xb9\xfa) Tj ET')
+        pdf = build_pdf([
+            (1, b'<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light '
+                b'/Encoding /GBK-EUC-H >>'),
+            (2, b'<< /Type /Page /Resources << /Font << /F0 1 0 R >> >> '
+                b'/Contents 3 0 R >>'),
+            (3, stream_obj(content)),
+        ])
+        text = pdftext.extract_text(pdf)['text']
+        self.assertIn('中国', text)
+        self.assertNotIn('中 国', text)
+
+    def test_latin_in_cjk_font_still_decodes(self):
+        content = b'BT /F0 12 Tf (Hello) Tj ET'
+        pdf = build_pdf([
+            (1, b'<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light '
+                b'/Encoding /GBK-EUC-H >>'),
+            (2, b'<< /Type /Page /Resources << /Font << /F0 1 0 R >> >> '
+                b'/Contents 3 0 R >>'),
+            (3, stream_obj(content)),
+        ])
+        self.assertIn('Hello', pdftext.extract_text(pdf)['text'])
 
 
 class TestRealWorldShapes(unittest.TestCase):
