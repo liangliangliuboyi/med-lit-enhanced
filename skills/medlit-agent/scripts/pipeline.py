@@ -771,9 +771,16 @@ class Run:
         docs = [f'{self.papers[i].get("title", "")}. {self.papers[i].get("abstract", "")[:1600]}'
                 for i in ids]
         model = rr.get('model', '')
-        self.log(f'④ 语义重排（{model}）：{len(ids)} → {limit}')
+        # **多取一些再挑**：重排接口按 top_n 返回。如果只要 limit 条，
+        # 后面的多样性平衡就看不到更靠后的原始研究了
+        #（实测：候选池里有 3 篇 NEJM 的 RCT，却因为 top_n=5 全被挡在外面，
+        #   证据池最后全是系统综述）。
+        # 多返回几条**不额外花钱**——同样的打分，只是多返回结果。
+        fetch_n = min(len(ids), max(limit * 4, limit + 5))
+        self.log(f'④ 语义重排（{model}）：{len(ids)} → {limit}'
+                 f'（取 {fetch_n} 条候选做多样性选择）')
         try:
-            res = self.provider.rerank(model, q, docs, top_n=limit,
+            res = self.provider.rerank(model, q, docs, top_n=fetch_n,
                                         endpoint=rr.get('endpoint'))
             ranked = [ids[int(r['index'])] for r in res
                       if 0 <= int(r['index']) < len(ids)]
@@ -786,7 +793,7 @@ class Run:
         except Exception as e:  # noqa: BLE001
             self.log(f'   ! 重排失败，退回原始顺序：{e}')
             self.err('rerank', e)
-            return ids[:limit]
+            return self._diversify(ids, limit)
 
     def _design_group(self, paper: dict) -> str:
         """把文献归成两类：原始研究 / 综述类。
@@ -1545,6 +1552,10 @@ class Run:
                 '以下内容由多模态模型从论文插图中读出。'
                 '关键数值均摘自图上标注，但**请以原图为准**——'
                 '模型识别的数字仍可能有个别误读。\n\n'
+                '> **分辨率提示**：PMC 归档的插图分辨率通常只有出版社原图的一半。'
+                '实测在一张 227 行的密集森林图上，模型把 −0.227 读成了 −0.219。'
+                '所以：**行数很多的森林图，其数值只能当参考，不能直接引用**；'
+                '关键数字请回原图或正文核对。\n\n'
                 + '\n'.join(blocks))
 
     def write(self) -> str:

@@ -90,3 +90,31 @@ class TestFormatCostLine(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestVisionModelPricing(unittest.TestCase):
+    """多模态模型（图表识别用）也要计价。
+
+    背景（2026-11-06 实测）：开启图表识别后，
+    trace 里出现 `unpriced_models: ["Qwen/Qwen3-VL-8B-Instruct"]`，
+    占总 token 的一半（25200 / 44186）——**成本被严重低估**。
+    图片是 base64 内联进 prompt 的，输入 token 会被图片放大，
+    所以单价不能按普通 8B 文本模型算。
+    """
+
+    def test_vl_model_has_a_price(self):
+        for m in ('Qwen/Qwen3-VL-8B-Instruct',
+                  'Qwen/Qwen3-VL-30B-A3B-Instruct',
+                  'Qwen/Qwen3-VL-32B-Instruct'):
+            self.assertGreater(pricing.lookup_price(m), 0.0,
+                               f'{m} 应当有单价')
+
+    def test_vl_price_is_not_zero(self):
+        self.assertNotEqual(pricing.lookup_price('Qwen/Qwen3-VL-8B-Instruct'),
+                            0.0)
+
+    def test_vl_price_is_higher_than_plain_8b(self):
+        """图片放大 token，VL 单价应高于同规模的纯文本模型。"""
+        vl = pricing.lookup_price('Qwen/Qwen3-VL-8B-Instruct')
+        text = pricing.lookup_price('Qwen/Qwen3-14B')
+        self.assertGreater(vl, text)

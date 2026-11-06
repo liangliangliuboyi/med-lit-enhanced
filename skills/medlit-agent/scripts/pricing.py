@@ -42,6 +42,16 @@ DEFAULT_PRICE_TABLE: dict[str, float] = {
     # ---- Qwen2.5 系列 ----
     'Qwen/Qwen2.5-72B-Instruct': 2.4,
     'Qwen/Qwen2.5-7B-Instruct': 0.3,
+    # ---- 多模态（图表识别用）----
+    # 图片是 base64 内联进 prompt 的，**输入 token 会被图片放大**
+    # （一张森林图的 base64 大约折合上千 token），所以单价要按"贵"估，
+    # 不能当成普通 8B 文本模型算。
+    'Qwen/Qwen3-VL-8B-Instruct': 1.5,
+    'Qwen/Qwen3-VL-8B-Thinking': 1.5,
+    'Qwen/Qwen3-VL-30B-A3B-Instruct': 2.0,
+    'Qwen/Qwen3-VL-30B-A3B-Thinking': 2.0,
+    'Qwen/Qwen3-VL-32B-Instruct': 2.5,
+    'Qwen/Qwen3-VL-32B-Thinking': 2.5,
 }
 
 
