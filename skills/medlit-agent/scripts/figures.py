@@ -395,6 +395,19 @@ class FigureReader:
         self.downloader = downloader
 
     # ---- 单张图 ----
+    @staticmethod
+    def _unmark_href(seen_hrefs: set, key: str, lock: threading.Lock) -> None:
+        """下载失败时把地址从去重表里摘掉。
+
+        为什么：去重表是用来防"同一张图被送模型两次"的，但如果这次
+        下载是**失败**的（比如 404、图床超时），那么它根本没进过模型，
+        不该占着这个坑——否则后面同一地址的图会被误判成"重复"而被
+        静默跳过，把真正的下载错误掩盖掉。摘掉它，后面的图就能
+        自己再试一次并报出真实原因。
+        """
+        with lock:
+            seen_hrefs.discard(key)
+
     def _read_one(self, fig: dict, base: str, extra_caption: str,
                   seen_hrefs: set, seen_hashes: set, lock: threading.Lock) -> dict:
         """识别一张图。**任何异常都在这里兜住**，不让单张失败掀翻整批。
@@ -439,23 +452,28 @@ class FigureReader:
                                                min(self.timeout, DOWNLOAD_TIMEOUT))
         except urllib.error.HTTPError as e:
             out['error'] = '下载失败：HTTP %s' % e.code
+            self._unmark_href(seen_hrefs, key, lock)
             return out
         except Exception as e:  # noqa: BLE001
             out['error'] = '下载失败：%s' % str(e)[:120]
+            self._unmark_href(seen_hrefs, key, lock)
             return out
         if not data:
             out['error'] = '下载失败：内容为空'
+            self._unmark_href(seen_hrefs, key, lock)
             return out
         # 大小与类型再校验一遍：自带 downloader（自定义站点 / 测试替身）
         # 可能绕过 _download_image 里的检查，这两道防线必须对所有路径生效。
         if len(data) > self.max_bytes:
             out['error'] = ('图片过大（%d 字节，超过上限 %d）'
                             % (len(data), self.max_bytes))
+            self._unmark_href(seen_hrefs, key, lock)
             return out
         ctype = str(ctype or '').split(';')[0].strip().lower()
         if not ctype.startswith('image/'):
             out['error'] = '下载失败：返回的不是图片（Content-Type=%s）' % (
                 ctype or '未知')
+            self._unmark_href(seen_hrefs, key, lock)
             return out
 
         # 去重（2）：内容层面。同一张图可能挂在不同地址下（CDN 换域名、

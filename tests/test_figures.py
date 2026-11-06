@@ -251,6 +251,32 @@ class TestFailureIsolation(unittest.TestCase):
 # 4. 去重
 # ---------------------------------------------------------------------------
 class TestDeduplication(unittest.TestCase):
+    def test_failed_download_does_not_poison_dedup(self):
+        """下载失败不该占住去重表——否则后面的同地址图会被误判成"重复"，
+        把真正的下载错误掩盖掉。"""
+        attempts = []
+
+        def dl(url):
+            attempts.append(url)
+            raise OSError('图床超时')
+
+        chat = StubChat()
+        reader = figures.FigureReader(chat, downloader=dl)
+        out = reader.read_all({
+            'figures': [
+                {'href': 'https://example.org/a.jpg', 'caption': '图1'},
+                {'href': 'https://example.org/a.jpg', 'caption': '图1副本'},
+            ],
+            'url': 'https://example.org/',
+        })
+        self.assertEqual(len(out), 2)
+        for item in out:
+            self.assertTrue(item['error'])
+            self.assertNotIn('重复', item['error'],
+                             '下载失败不应被报成"重复"')
+            self.assertIn('图床超时', item['error'])
+        self.assertEqual(len(attempts), 2, '同地址应当各自试一次')
+
     def test_same_href_sent_to_model_only_once(self):
         """同一张图出现两次（href 相同）→ 只送模型一次。"""
         chat = StubChat()

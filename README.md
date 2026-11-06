@@ -125,6 +125,63 @@ python scripts/ask.py "GLP-1 受体激动剂对青少年肥胖的效果如何？
 | 安装成本 | `pip install biopython httpx ...` | **零第三方依赖**，`git clone` 就能跑 |
 | 服务端点 | 绑定单一厂商 | **任意 OpenAI 兼容端点**，rerank 可选 |
 
+## 面向交医用户的三个专门能力
+
+### 1. 期刊评价：影响因子 + JCR 分区 + 中科院大区
+
+每条证据都会标注它发表的刊物的量级：
+
+| 期刊 | IF | JCR 分区 | 中科院大区 |
+|---|---|---|---|
+| N Engl J Med | 84.5 | Q1 | 1 区 |
+| Lancet | 109 | Q1 | 1 区 |
+| JAMA | 65.4 | Q1 | 1 区 |
+| PLoS One | 2.8 | Q2 | 3 区 |
+
+- 数据来自 **JCR 2026**（22,643 本刊）与**中科院分区表**，由
+  `scripts/build_jcr_index.py` 合并成一份索引（`assets/jcr_2026_index.json`）。
+- **JCR 分位（Q1–Q4）与中科院大区（1–4）是两套体系**，索引里分列两个字段，
+  绝不混在一列——那是国内学术评价里最常见的误读来源。
+- 对齐靠 **ISSN**（唯一稳定的连接键），刊名匹配只作兜底；查不到就留空，**绝不猜**。
+- 实测真实 PubMed 题录 59 篇样本，命中 54 篇（91%），全部走 ISSN。
+
+### 2. 全文获取：拿不到就告诉你去哪儿拿
+
+自动降级链：**PMC 开放全文 → Europe PMC → Unpaywall → OpenAlex**。
+
+- **能下载就下载**：OA 论文的 PDF 会存到本次运行目录的 `07_fulltext_pdf/`。
+- **只想读不想留文件**：`--no-download` 让全文只在临时目录待一下，读完立刻删除
+  （并确认删除成功，不留任何残留）。
+- **拿不到就给可执行的指引**：答案里单列一节，逐条给出题名、DOI、
+  PubMed / PMC 链接，并提醒——
+  > 若提示付费墙或连接失败，请开启 网络代理 / 交大医学院 VPN，
+  > 或通过交大图书馆校外访问入口获取。
+
+代理自动探测：环境变量优先，其次 Windows 注册表的系统代理；也可用
+`--fulltext-proxy http://127.0.0.1:7890` 手动指定。
+
+### 3. 图表识别：把只存在于图里的效应量读出来
+
+森林图上的 HR/OR/RR 与 95%CI、生存曲线、ROC 曲线——这些数字**常常只存在于图里**，
+摘要和正文都没写，只看摘要会漏掉。
+
+- 开启：`--figures`（默认关，因为每张图是一次多模态模型调用）
+- 模型：默认 `Qwen/Qwen3-VL-8B-Instruct`（可 `--vl-model` 换成
+  `Qwen/Qwen3-VL-30B-A3B-Instruct` 等更强的）
+- 提示词明确要求「只抄图上真实出现的数值，读不清就写未见明确标注」——
+  循证场景里编造效应量是严重错误
+- 结果进证据表的「图表要点」列，完整内容另存 `05c_figures.md`
+
+### 4. 连续提问：文献池是累积的
+
+`--chat` 模式下追问同一课题时：
+
+- 沿用上一轮的**检索式**（不重新从零检索）
+- 沿用上一轮**已精读过的文献**（同一篇重读一次是一次完整的模型调用，
+  而抽取结果几乎必然一样）——证据表里标 `↺沿用`
+- 成本因此从「检索 + 全量精读 + 审稿 + 成文」降到
+  「检索 + 只精读新文献 + 审稿 + 成文」
+
 ## 工具自己会做的检索增强
 
 不需要用户要求，每次运行自动执行：
@@ -151,7 +208,10 @@ runs/20261105-1830_GLP1受体激动剂对青少年肥胖/
   04_evidence.json      抽取的结构化证据（含偏倚要素、PICO 匹配度）
   05_evidence_table.md  ★ 证据总表 + 偏倚要素表 + 合并效应量 + GRADE 机械定级
   05b_excluded.json     被排除文献及排除理由
+  05c_figures.md        图表识别结果（模型从插图里读出的内容与数值）
   06_fulltext/PMID*.txt 抓到的 PMC 开放全文
+  06b_fulltext_guide.md ★ 全文获取指引（哪些只读了摘要、去哪儿拿全文）
+  07_fulltext_pdf/      下载到本地的开放获取 PDF（--no-download 时不会有）
   07_answer.md          ★ 答案正文（每条论断挂 PMID）+ 关键文献
   08_bibliography.md    参考文献（脚本生成，非模型）
   09_log.txt            带时间戳的执行日志
@@ -183,6 +243,9 @@ python scripts/ask.py "问题" --no-cache                  # 不用检索缓存�
 python scripts/ask.py "问题" --no-animal-exclusion       # 不排除纯动物实验
 python scripts/ask.py --models                            # 看模型路由链
 python scripts/ask.py --pubmed-only '检索式'              # 只检索不调模型
+python scripts/ask.py "问题" --figures                   # 开启图表识别（读图里的效应量）
+python scripts/ask.py "问题" --no-download               # 全文读完即删，本地不留副本
+python scripts/ask.py "问题" --fulltext-proxy http://127.0.0.1:7890   # 指定抓全文的代理
 ```
 
 ### 几个容易被忽略的行为

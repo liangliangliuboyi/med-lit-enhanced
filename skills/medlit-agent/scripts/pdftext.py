@@ -17,7 +17,7 @@ pdfplumber / pypdf / PyMuPDF，于是「只拿到 PDF」时全文长度为 0，
    过的文件，都会让 xref 偏移量对不上。反过来，「文件里出现
    `N G obj` 就说明这里有一个间接对象」是**自洽**的：即使 xref 全坏，
    也能把对象全找出来。所以这里用正则扫全文切对象，容错性远好于解析
-   xref（增量更新时取最后一次出现的版本，正好也是正确版本）。
+   xref（增量更新时取最后一次出现的版本，正好也是当前生效的版本）。
 
 2. **必须支持 ToUnicode CMap**。
    PDF 里的字符串字节**不等于** Unicode：现代 PDF（尤其是中文文献，
@@ -65,27 +65,48 @@ MAX_STREAM_BYTES = 8 * 1024 * 1024
 # 「探测型」内容流的最大个数：只有当页面 /Contents 解析不出来时才会用到
 MAX_PROBE_STREAMS = 64
 
-# 空白字符集（PDF 规定为 0x00 0x09 0x0A 0x0C 0x0D 0x20）
-_WS = frozenset(b'\x00\x09\x0a\x0c\x0d\x20')
-# 分隔符
-_DELIM = frozenset(b'()<>[]{}/%')
-# 数字可能出现的字符
-_NUMCHARS = frozenset(b'0123456789+-.')
-# 数字与运算符之间的分界（用于切出裸操作符）
-_OPCHARS = frozenset(b'0123456789abcdefghijklmnopqrstuvwxyz'
-                     b'ABCDEFGHIJKLMNOPQRSTUVWXYZ*\'"')
+# 滤镜名缩写 -> 全名。LaTeX / Word 生成的 PDF 经常用缩写。
+_FILTER_ALIASES = {
+    'Fl': 'FlateDecode',
+    'FlA': 'FlateDecode',
+    'AHx': 'ASCIIHexDecode',
+    'A85': 'ASCII85Decode',
+    'RL': 'RunLengthDecode',
+}
+
+# 词法记号。正则切分比逐字符扫描快一个量级（内容流动辄上百 KB）。
+_TOKEN_RE = re.compile(rb"""
+      (?P<ws>[\x00\t\n\x0c\r ]+)
+    | (?P<comment>%[^\r\n]*)
+    | (?P<dictopen><<)
+    | (?P<dictclose>>>)
+    | (?P<hexstr><[0-9A-Fa-f\s]*>)
+    | (?P<arropen>\[)
+    | (?P<arrclose>\])
+    | (?P<name>/[^\s\(\)\[\]<>/%]*)
+    | (?P<num>[+-]?(?:\d+\.?\d*|\.\d+))
+    | (?P<op>[A-Za-z*'"]+)
+    | (?P<skip>[{}=>])
+""", re.X)
 
 # 间接对象头：`N G obj`
 _OBJ_RE = re.compile(rb'(?<![0-9])(\d{1,10})[\x00\t\n\x0c\r ]+(\d{1,5})'
                      rb'[\x00\t\n\x0c\r ]+obj(?![A-Za-z0-9])')
-# 流关键字（排除 endstream）
-_STREAM_RE = re.compile(rb'(?<![A-Za-z0-9])stream(?![A-Za-z0-9])')
+# 流关键字。必须紧跟 EOL（PDF 规范要求），这样才不会把字符串里的
+# "stream" 这个词误认成流关键字。
+_STREAM_RE = re.compile(rb'(?<![A-Za-z0-9])stream(?![A-Za-z0-9])'
+                         rb'(?:\r\n|\n|\r)')
 # 内容流里是否出现过文本块的粗判
 _BT_RE = re.compile(rb'(?<![A-Za-z0-9])BT(?![A-Za-z0-9])')
 _SHOW_RE = re.compile(rb'(?<![A-Za-z0-9])(?:Tj|TJ)(?![A-Za-z0-9])')
 # CMap 段落
 _BFCHAR_RE = re.compile(rb'beginbfchar(.*?)endbfchar', re.S)
 _BFRANGE_RE = re.compile(rb'beginbfrange(.*?)endbfrange', re.S)
+_CIDCHAR_RE = re.compile(rb'begincidchar(.*?)endcidchar', re.S)
+_CIDRANGE_RE = re.compile(rb'begincidrange(.*?)endcidrange', re.S)
+_CODESPACE_RE = re.compile(rb'begincodespacerange(.*?)endcodespacerange', re.S)
+# 十六进制串
+_HEX_PAIR_RE = re.compile(rb'<([0-9A-Fa-f\s]*)>\s*<([0-9A-Fa-f\s]*)>')
 
 
 def is_pdf(data) -> bool:
@@ -158,7 +179,8 @@ def _extract_text(pdf_bytes, max_chars) -> dict:
     uniq = [by_num[n] for n in sorted(by_num)]
 
     pages = _count_pages(uniq)
-    global_cmap, page_fonts, page_contents = _build_font_maps(uniq, by_num)
+    global_cmap, global_width, page_fonts, page_contents, cmap_nums = \
+        _build_font_maps(uniq, by_num)
 
     chunks = []
     skipped = 0
@@ -167,11 +189,17 @@ def _extract_text(pdf_bytes, max_chars) -> dict:
         if not obj.has_stream:
             continue
         fonts = None
+        decoded = None
         if obj.num in page_contents:
             fonts = page_fonts.get(obj.num)
+            decoded = _decode_stream(obj)
+            if decoded is None:
+                skipped += 1
+                continue
         else:
             # 页面 /Contents 没解析出来时的兜底：解码后看看是不是内容流
-            if probed >= MAX_PROBE_STREAMS or not _probe_candidate(obj):
+            if probed >= MAX_PROBE_STREAMS \
+                    or not _probe_candidate(obj, cmap_nums):
                 continue
             decoded = _decode_stream(obj)
             if decoded is None:
@@ -180,18 +208,14 @@ def _extract_text(pdf_bytes, max_chars) -> dict:
             if not (_BT_RE.search(decoded) and _SHOW_RE.search(decoded)):
                 continue
             probed += 1
-        decoded = _decode_stream(obj)
-        if decoded is None:
-            skipped += 1
-            continue
-        text = _extract_content_text(decoded, fonts, global_cmap)
+        text = _extract_content_text(decoded, fonts, global_cmap, global_width)
         if text.strip():
             chunks.append(text)
 
     if not chunks:
         if encrypted:
             note = ('PDF 含 /Encrypt 加密标记，内容流需要口令才能解密，'
-                    '本次未取到文本层（可能是扫描件）')
+                    '本次未取到文本层（也可能是扫描件）')
         else:
             note = '内容流里没有文本算子，可能是扫描件（无文本层）'
         return _result('', pages, 'none', note)
@@ -238,6 +262,11 @@ def _scan_objects(data: bytes):
     为什么不用 xref 表：xref 的偏移量在增量更新、线性化 PDF、交叉引用流
     里都容易对不上，而「出现 obj 标记就是一个对象」永远成立。
     """
+    # 预先算出所有 endobj / endstream 的位置，避免每个对象都从头扫一遍
+    # （10MB 的文件有上千个对象时，那是 O(n*k) 的浪费）。
+    endobj_pos = [m.start() for m in re.finditer(rb'endobj', data)]
+    endstream_pos = [m.start() for m in re.finditer(rb'endstream', data)]
+
     objs = []
     pos = 0
     n = len(data)
@@ -245,8 +274,8 @@ def _scan_objects(data: bytes):
         m = _OBJ_RE.search(data, pos)
         if not m:
             break
-        obj = _parse_object(data, m.start(), int(m.group(1)), int(m.group(2)),
-                            m.end())
+        obj = _parse_object(data, int(m.group(1)), int(m.group(2)),
+                            m.end(), endobj_pos, endstream_pos)
         if obj is None:
             pos = m.end()
             continue
@@ -257,9 +286,22 @@ def _scan_objects(data: bytes):
     return objs
 
 
-def _parse_object(data: bytes, start: int, num: int, gen: int, body_start: int):
-    """切出 [body_start, end) 这段对象体，并解析出字典与流数据。"""
-    end_obj = data.find(b'endobj', body_start)
+def _next_pos(positions, start):
+    """positions 里的第一个 >= start 的位置（找不到返回 -1）。"""
+    lo, hi = 0, len(positions)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if positions[mid] < start:
+            lo = mid + 1
+        else:
+            hi = mid
+    return positions[lo] if lo < len(positions) else -1
+
+
+def _parse_object(data: bytes, num: int, gen: int, body_start: int,
+                  endobj_pos, endstream_pos):
+    """切出对象体，并解析出字典与流数据。"""
+    end_obj = _next_pos(endobj_pos, body_start)
     sm = _STREAM_RE.search(data, body_start)
     has_stream = bool(sm) and (end_obj < 0 or sm.start() < end_obj)
 
@@ -278,15 +320,15 @@ def _parse_object(data: bytes, start: int, num: int, gen: int, body_start: int):
     elif data[data_start:data_start + 1] in (b'\n', b'\r'):
         data_start += 1
 
-    end_stream = data.find(b'endstream', data_start)
-    length = dct.get('/Length')
-    raw = None
+    end_stream = _next_pos(endstream_pos, data_start)
+    length = dct.get('Length')
     data_end = -1
     # 优先用 /Length 定位：流数据里偶尔会出现 'endstream' 字样，
     # 按长度切才不会被误导。
     if length is not None and length[0] == 'num':
-        cand = data_start + int(length[1])
-        if 0 <= int(length[1]) <= len(data) - data_start:
+        cand_len = int(length[1])
+        if 0 <= cand_len <= len(data) - data_start:
+            cand = data_start + cand_len
             tail = data[cand:cand + 24]
             if (tail.startswith(b'\r\n') or tail.startswith(b'\n')
                     or tail.startswith(b'\r')
@@ -308,7 +350,7 @@ def _parse_object(data: bytes, start: int, num: int, gen: int, body_start: int):
     if end_stream < 0:
         obj_end = len(data)
     else:
-        after = data.find(b'endobj', end_stream)
+        after = _next_pos(endobj_pos, end_stream)
         obj_end = (after + 6) if after >= 0 else len(data)
     return _Obj(num, gen, obj_end, dct, raw, True)
 
@@ -322,91 +364,53 @@ def _tokens(data: bytes):
 
     记号类型：'name' / 'num' / 'str' / 'hex' / 'arr_open' / 'arr_close' /
     'dict_open' / 'dict_close' / 'op'。
+
+    字典的键统一**不带**前导斜杠（'Type' / 'Length'），与 PDF 里
+    `/Type` / `/Length` 一一对应，方便到处用。
     """
     i = 0
     n = len(data)
     while i < n:
-        c = data[i]
-        if c in _WS:
-            i += 1
-            continue
-        if c == 0x25:  # '%' 注释
-            j = data.find(b'\n', i)
-            i = n if j < 0 else j + 1
-            continue
-        if c == 0x28:  # '(' 字面字符串
+        if data[i] == 0x28:  # '(' 字面字符串
             s, i = _read_literal(data, i)
             yield ('str', s)
             continue
-        if c == 0x3c:  # '<'
-            if data[i:i + 2] == b'<<':
-                yield ('dict_open', '')
-                i += 2
-                continue
-            j = data.find(b'>', i)
-            if j < 0:
-                yield ('hex', data[i + 1:].decode('ascii', 'ignore'))
-                i = n
-                continue
-            yield ('hex', data[i + 1:j].decode('ascii', 'ignore'))
-            i = j + 1
-            continue
-        if c == 0x3e:  # '>'
-            if data[i:i + 2] == b'>>':
-                yield ('dict_close', '')
-                i += 2
-            else:
-                i += 1
-            continue
-        if c == 0x5b:  # '['
-            yield ('arr_open', '')
+        m = _TOKEN_RE.match(data, i)
+        if not m:
             i += 1
             continue
-        if c == 0x5d:  # ']'
-            yield ('arr_close', '')
-            i += 1
+        kind = m.lastgroup
+        if kind in ('ws', 'comment', 'skip'):
+            i = m.end()
             continue
-        if c in (0x7b, 0x7d):  # '{' '}'（PDF 1.2 的 PostScript 函数体）
-            i += 1
-            continue
-        if c == 0x2f:  # '/' 名字
-            j = i + 1
-            while j < n and data[j] not in _WS and data[j] not in _DELIM:
-                j += 1
-            yield ('name', data[i + 1:j].decode('latin-1'))
-            i = j
-            continue
-        if c in (0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-                 0x2b, 0x2d, 0x2e):  # 数字
-            j = i
-            while j < n and data[j] in _NUMCHARS:
-                j += 1
-            if j == i:
-                j = i + 1
+        if kind == 'name':
+            yield ('name', m.group()[1:].decode('latin-1'))
+        elif kind == 'num':
             try:
-                yield ('num', float(data[i:j]))
+                yield ('num', float(m.group()))
             except ValueError:
                 pass
-            i = j
+        elif kind == 'hexstr':
+            yield ('hex', m.group()[1:-1].decode('ascii', 'ignore'))
+        elif kind == 'arr_open':
+            yield ('arr_open', '')
+        elif kind == 'arr_close':
+            yield ('arr_close', '')
+        elif kind == 'dict_open':
+            yield ('dict_open', '')
+        elif kind == 'dict_close':
+            yield ('dict_close', '')
+        else:  # op
+            op = m.group().decode('latin-1')
+            yield ('op', op)
+            i = m.end()
+            if op == 'BI':
+                # 内联图片（BI ... ID <二进制> EI）：二进制里可能混着 '('
+                # 之类字符，会被误当成字符串。直接跳到 EI 之后更安全。
+                j = data.find(b'EI', i)
+                i = n if j < 0 else j + 2
             continue
-        # 裸操作符
-        j = i
-        while j < n and data[j] not in _WS and data[j] not in _DELIM \
-                and data[j] in _OPCHARS:
-            j += 1
-        if j == i:
-            j = i + 1
-        op = data[i:j].decode('latin-1')
-        yield ('op', op)
-        i = j
-        if op == 'BI':
-            # 内联图片（BI ... ID <二进制> EI）：二进制里可能混着 '(' 之类
-            # 的字符，会被误当成字符串。直接跳到 EI 之后更安全。
-            j = data.find(b'EI', i)
-            if j < 0:
-                i = n
-            else:
-                i = j + 2
+        i = m.end()
 
 
 def _read_literal(data: bytes, i: int):
@@ -485,9 +489,15 @@ def _parse_dict(raw: bytes) -> dict:
     ('dict', dict) / ('arr', list) / ('str', bytes) / ('hex', str)。
     """
     toks = list(_tokens(raw))
-    if not toks or toks[0][0] != 'dict_open':
+    # 找第一个 dict_open：从这里开始解析，容忍对象体前面有杂字符
+    idx = -1
+    for i, (kind, _val) in enumerate(toks):
+        if kind == 'dict_open':
+            idx = i
+            break
+    if idx < 0:
         return {}
-    d, _ = _parse_dict_tokens(toks, 0)
+    d, _ = _parse_dict_tokens(toks, idx)
     return d
 
 
@@ -578,9 +588,8 @@ def _parse_array_tokens(toks, i):
 def _decode_stream(obj: _Obj):
     """按 /Filter 链解码一个流；失败返回 None（调用方负责跳过并计数）。"""
     try:
-        filters = _filters_of(obj.dict)
         data = obj.stream_raw
-        for f in filters:
+        for f in _filters_of(obj.dict):
             if f == 'FlateDecode':
                 data = _inflate(data)
             elif f == 'ASCII85Decode':
@@ -590,8 +599,8 @@ def _decode_stream(obj: _Obj):
             elif f == 'RunLengthDecode':
                 data = _runlength(data)
             else:
-                # DCTDecode / JPXDecode / CCITTFaxDecode 等是图像或未实现的
-                # 滤镜：内容流不会用它们，直接放弃这个流。
+                # DCTDecode / JPXDecode / CCITTFaxDecode / LZWDecode 等是
+                # 图像或未实现的滤镜：内容流不会用它们，直接放弃这个流。
                 return None
             if data is None:
                 return None
@@ -602,18 +611,17 @@ def _decode_stream(obj: _Obj):
 
 def _filters_of(dct: dict):
     """从字典里取出 /Filter 滤镜名列表（按应用顺序）。"""
-    val = dct.get('/Filter')
+    val = dct.get('Filter')
     if val is None:
         return []
+    names = []
     if val[0] == 'name':
-        return [val[1]]
-    if val[0] == 'arr':
-        out = []
+        names = [val[1]]
+    elif val[0] == 'arr':
         for item in val[1]:
             if item[0] == 'name':
-                out.append(item[1])
-        return out
-    return []
+                names.append(item[1])
+    return [_FILTER_ALIASES.get(n, n) for n in names]
 
 
 def _inflate(data: bytes):
@@ -688,21 +696,23 @@ def _runlength(data: bytes):
     return bytes(out)
 
 
-def _probe_candidate(obj: _Obj) -> bool:
+def _probe_candidate(obj: _Obj, cmap_stream_nums) -> bool:
     """判断一个流「有可能」是内容流（避免把字体/图片也解开）。"""
+    if obj.num in cmap_stream_nums:
+        return False
     dct = obj.dict
-    t = dct.get('/Type')
+    t = dct.get('Type')
     if t is not None and t[0] == 'name' and t[1] in (
             'Font', 'FontDescriptor', 'XObject', 'Metadata', 'Catalog',
             'Pages', 'Page', 'Annot', 'Filespec'):
         return False
-    st = dct.get('/Subtype')
+    st = dct.get('Subtype')
     if st is not None and st[0] == 'name' and st[1] in (
             'Image', 'Type1C', 'CIDFontType0C', 'Type1', 'TrueType',
             'OpenType', 'CIDFontType0', 'CIDFontType2', 'Form', 'PDF'):
         return False
-    if any(k in dct for k in ('/Length1', '/Length2', '/Length3',
-                              '/FontFile', '/FontFile2', '/FontFile3')):
+    if any(k in dct for k in ('Length1', 'Length2', 'Length3',
+                              'FontFile', 'FontFile2', 'FontFile3')):
         return False
     if obj.stream_raw and len(obj.stream_raw) > 4 * 1024 * 1024:
         return False
@@ -718,13 +728,13 @@ def _count_pages(objects) -> int:
     pages = 0
     tree_count = 0
     for obj in objects:
-        t = obj.dict.get('/Type')
+        t = obj.dict.get('Type')
         if t is None or t[0] != 'name':
             continue
         if t[1] == 'Page':
             pages += 1
         elif t[1] == 'Pages':
-            c = obj.dict.get('/Count')
+            c = obj.dict.get('Count')
             if c is not None and c[0] == 'num':
                 tree_count = max(tree_count, int(c[1]))
     return max(pages, tree_count)
@@ -747,21 +757,29 @@ def _resolve_dict(val, by_num):
 def _build_font_maps(objects, by_num):
     """建立 CMap 表。
 
-    返回 (global_cmap, page_fonts, page_contents)：
+    返回 (global_cmap, global_width, page_fonts, page_contents)：
       - global_cmap：文件里所有 ToUnicode CMap 合并后的全局表（兜底用）
+      - global_width：全局表里字符码的字节数（0 表示长度不一致）
       - page_fonts：内容流 objnum -> {字体名: (cmap, 每字符字节数)}
       - page_contents：页面 /Contents 引用到的内容流 objnum 集合
     """
     global_cmap = {}
+    widths = set()
+    cmap_stream_nums = set()
     # 先把所有字体对象的 /ToUnicode 收进全局表（后出现的覆盖先出现的）
     for obj in objects:
-        dct = obj.dict
-        tu = dct.get('/ToUnicode')
+        tu = obj.dict.get('ToUnicode')
         if tu is None:
             continue
+        if tu[0] == 'ref':
+            cmap_stream_nums.add(tu[1])
         cmap = _cmap_of_ref(tu, by_num)
         if cmap:
-            global_cmap.update(cmap)
+            mapping, width = cmap
+            global_cmap.update(mapping)
+            if width:
+                widths.add(width)
+    global_width = widths.pop() if len(widths) == 1 else 0
 
     page_fonts = {}
     page_contents = set()
@@ -775,17 +793,17 @@ def _build_font_maps(objects, by_num):
             continue
         for cnum in contents:
             page_fonts.setdefault(cnum, fonts)
-    return global_cmap, page_fonts, page_contents
+    return global_cmap, global_width, page_fonts, page_contents, cmap_stream_nums
 
 
 def _is_page(obj: _Obj) -> bool:
-    t = obj.dict.get('/Type')
+    t = obj.dict.get('Type')
     return bool(t and t[0] == 'name' and t[1] == 'Page')
 
 
 def _page_contents(obj: _Obj, by_num):
     """页面的 /Contents：可能是单个引用，也可能是引用数组。"""
-    val = obj.dict.get('/Contents')
+    val = obj.dict.get('Contents')
     if val is None:
         return []
     if val[0] == 'ref':
@@ -803,12 +821,12 @@ def _resolve_resources(obj: _Obj, by_num, depth: int = 0):
     """取页面的 /Resources；页面没写就沿 /Parent 往 /Pages 继承。"""
     if obj is None or depth > 8:
         return None
-    res = obj.dict.get('/Resources')
+    res = obj.dict.get('Resources')
     if res is not None:
         d = _resolve_dict(res, by_num)
         if d is not None:
             return d
-    parent = obj.dict.get('/Parent')
+    parent = obj.dict.get('Parent')
     if parent is not None and parent[0] == 'ref':
         pobj = by_num.get(parent[1])
         if pobj is not None and pobj is not obj:
@@ -821,8 +839,7 @@ def _page_fonts(obj: _Obj, by_num):
     res = _resolve_resources(obj, by_num)
     if not res:
         return {}
-    fref = res.get('/Font')
-    fdict = _resolve_dict(fref, by_num)
+    fdict = _resolve_dict(res.get('Font'), by_num)
     if not fdict:
         return {}
     fonts = {}
@@ -830,18 +847,24 @@ def _page_fonts(obj: _Obj, by_num):
         fd = _resolve_dict(val, by_num)
         if fd is None:
             continue
-        tu = fd.get('/ToUnicode')
-        cmap = _cmap_of_ref(tu, by_num) or {}
-        fonts[name] = (cmap, _code_width(fd))
+        tu = fd.get('ToUnicode')
+        cmap = _cmap_of_ref(tu, by_num)
+        if cmap:
+            mapping, width = cmap
+        else:
+            mapping, width = {}, 0
+        if not width:
+            width = _code_width(fd)
+        fonts[name] = (mapping, width)
     return fonts
 
 
 def _code_width(fdict: dict) -> int:
     """每个字符码占几个字节：Type0 / Identity-H 是 2 字节，其余 1 字节。"""
-    st = fdict.get('/Subtype')
+    st = fdict.get('Subtype')
     if st is not None and st[0] == 'name' and st[1] == 'Type0':
         return 2
-    enc = fdict.get('/Encoding')
+    enc = fdict.get('Encoding')
     if enc is not None and enc[0] == 'name' and enc[1] in (
             'Identity-H', 'Identity-V'):
         return 2
@@ -849,66 +872,93 @@ def _code_width(fdict: dict) -> int:
 
 
 def _cmap_of_ref(val, by_num):
-    """按 /ToUnicode 引用找到 CMap 流并解析。"""
-    if val is None:
+    """按 /ToUnicode 引用找到 CMap 流并解析。
+
+    返回 (mapping, code_width)；mapping 是 {字符码字节: 文本}，
+    code_width 是字符码的字节数（0 表示推断不出来）。
+    """
+    if val is None or val[0] != 'ref':
         return None
-    if val[0] == 'ref':
-        obj = by_num.get(val[1])
-        if obj is None or not obj.has_stream:
-            return None
-        data = _decode_stream(obj)
-        if not data:
-            return None
-        return _parse_cmap(data)
-    return None
+    obj = by_num.get(val[1])
+    if obj is None or not obj.has_stream:
+        return None
+    data = _decode_stream(obj)
+    if not data:
+        return None
+    return _parse_cmap(data)
 
 
-def _parse_cmap(data: bytes) -> dict:
-    """解析 ToUnicode CMap，返回 {字符码字节: 文本}。
+def _parse_cmap(data: bytes):
+    """解析 ToUnicode CMap。
+
+    返回 (mapping, code_width)：
+      mapping     = {字符码字节: 文本}
+      code_width  = 字符码占几个字节（1 或 2）
 
     支持的段落：
-      beginbfchar   <src> <dst>            字符码 -> Unicode
-      beginbfrange  <lo> <hi> <dst>        连续区间（dst 递增）
+      beginbfchar   <src> <dst>              字符码 -> Unicode
+      beginbfrange  <lo> <hi> <dst>          连续区间（dst 递增）
                     <lo> <hi> [<d1> <d2>..]  区间 + 数组
-                    <lo> <hi> <cid>        区间 + 增量数字
-      begincidchar / begincidrange         CID 版（少见，兼容处理）
+                    <lo> <hi> <cid>          区间 + 增量数字
+      begincidchar / begincidrange           CID 版（少见，兼容处理）
     """
     mapping = {}
+    widths = set()
+
+    # 1) 码空间区间最权威：<0000> <FFFF> 说明字符码是 2 字节
+    for m in _CODESPACE_RE.finditer(data):
+        for lo_hex in re.findall(rb'<([0-9A-Fa-f\s]*)>', m.group(1)):
+            cleaned = re.sub(rb'\s', b'', lo_hex)
+            if cleaned:
+                widths.add(max(1, len(cleaned) // 2))
+
+    # 2) bfchar：<src> <dst>
     for m in _BFCHAR_RE.finditer(data):
-        body = m.group(1)
-        pairs = re.findall(rb'<([0-9A-Fa-f\s]*)>\s*<([0-9A-Fa-f\s]*)>', body)
-        for src_hex, dst_hex in pairs:
+        for src_hex, dst_hex in _HEX_PAIR_RE.findall(m.group(1)):
             src = _hex_bytes(src_hex)
-            dst = _hex_bytes(dst_hex)
             if not src:
                 continue
-            mapping[src] = _utf16_text(dst)
+            widths.add(len(src))
+            mapping[src] = _utf16_text(_hex_bytes(dst_hex))
+
+    # 3) bfrange：三种形式
     for m in _BFRANGE_RE.finditer(data):
-        _parse_bfrange(m.group(1), mapping)
-    # CID 版段落：字符码 -> CID -> Unicode（把 CID 当码点近似处理）
-    for m in re.finditer(rb'begincidchar(.*?)endcidchar', data, re.S):
-        pairs = re.findall(rb'<([0-9A-Fa-f\s]*)>\s*(\d+)', m.group(1))
-        for src_hex, cid in pairs:
+        _parse_bfrange(m.group(1), mapping, widths)
+
+    # 4) CID 版段落：字符码 -> CID -> Unicode（把 CID 当码点近似处理）
+    for m in _CIDCHAR_RE.finditer(data):
+        for src_hex, cid in re.findall(rb'<([0-9A-Fa-f\s]*)>\s*(\d+)',
+                                       m.group(1)):
             src = _hex_bytes(src_hex)
             if src:
+                widths.add(len(src))
                 mapping[src] = _utf16_text(_hex_bytes(b'%04X' % int(cid)))
-    for m in re.finditer(rb'begincidrange(.*?)endcidrange', data, re.S):
-        body = m.group(1)
+    for m in _CIDRANGE_RE.finditer(data):
         for lo_hex, hi_hex, cid in re.findall(
-                rb'<([0-9A-Fa-f\s]*)>\s*<([0-9A-Fa-f\s]*)>\s*(\d+)', body):
+                rb'<([0-9A-Fa-f\s]*)>\s*<([0-9A-Fa-f\s]*)>\s*(\d+)',
+                m.group(1)):
             lo = _hex_bytes(lo_hex)
             hi = _hex_bytes(hi_hex)
             if not lo or not hi:
                 continue
+            widths.add(len(lo))
             lo_i = int.from_bytes(lo, 'big')
             hi_i = int.from_bytes(hi, 'big')
+            nb = max(1, len(lo))
             for k in range(min(hi_i - lo_i + 1, 65536)):
-                mapping[(lo_i + k).to_bytes(len(lo), 'big')] = \
+                mapping[(lo_i + k).to_bytes(nb, 'big')] = \
                     _utf16_text(_hex_bytes(b'%04X' % (int(cid) + k)))
-    return mapping
+
+    width = 0
+    if len(widths) == 1:
+        width = widths.pop()
+    elif widths:
+        # 宽度不一致（混合字体）：取最常见的那个，另一个靠自适应解码兜底
+        width = max(widths)
+    return mapping, width
 
 
-def _parse_bfrange(body: bytes, mapping: dict):
+def _parse_bfrange(body: bytes, mapping: dict, widths):
     """解析一个 beginbfrange 段落。"""
     toks = list(_tokens(body))
     i = 0
@@ -928,38 +978,42 @@ def _parse_bfrange(body: bytes, mapping: dict):
             break
         k2, v2 = toks[i]
         if k2 == 'hex':
-            _add_range(mapping, lo_hex, hi_hex, _hex_bytes(v2))
+            # <lo> <hi> <dst>
+            _add_range(mapping, lo_hex, hi_hex, _hex_bytes(v2), widths)
             i += 1
         elif k2 == 'arr_open':
+            # <lo> <hi> [<d1> <d2> ...]：数组第 k 个元素对应 lo+k
             arr, i = _parse_array_tokens(toks, i)
             lo_i = int.from_bytes(_hex_bytes(lo_hex), 'big')
             for k, item in enumerate(arr):
                 if item[0] != 'hex':
                     continue
                 _add_range(mapping, lo_hex, hi_hex, _hex_bytes(item[1]),
-                           exact_offset=k, base=lo_i)
+                           widths, only_offset=k, base=lo_i)
         elif k2 == 'num':
-            # <lo> <hi> <cid> 增量形式：把 cid 当作码点近似
+            # <lo> <hi> <cid>：CID 增量形式（ToUnicode 里少见）
             lo_i = int.from_bytes(_hex_bytes(lo_hex), 'big')
             hi_i = int.from_bytes(_hex_bytes(hi_hex), 'big')
+            nb = max(1, len(_hex_bytes(lo_hex)))
+            widths.add(nb)
             for k in range(min(hi_i - lo_i + 1, 65536)):
-                mapping[(lo_i + k).to_bytes(max(1, len(lo_hex.strip()) // 2),
-                                           'big')] = \
+                mapping[(lo_i + k).to_bytes(nb, 'big')] = \
                     _utf16_text(_hex_bytes(b'%04X' % (int(v2) + k)))
             i += 1
         else:
             i += 1
 
 
-def _add_range(mapping: dict, lo_hex: str, hi_hex: str, dst: bytes,
-               exact_offset: int = 0, base: int = 0):
+def _add_range(mapping: dict, lo_hex: str, hi_hex: str, dst: bytes, widths,
+               only_offset: int = -1, base: int = 0):
     """把 <lo> <hi> <dst> 展开成逐个字符码的映射。
 
     dst 是 UTF-16BE 码点序列；区间内第 k 个字符码对应 dst 加上 k。
+    only_offset >= 0 时只写入那一个字符码（数组形式用）。
     """
     lo_bytes = _hex_bytes(lo_hex)
     hi_bytes = _hex_bytes(hi_hex)
-    if not lo_bytes or not hi_bytes:
+    if not lo_bytes or not hi_bytes or not dst:
         return
     lo_i = int.from_bytes(lo_bytes, 'big')
     hi_i = int.from_bytes(hi_bytes, 'big')
@@ -968,18 +1022,17 @@ def _add_range(mapping: dict, lo_hex: str, hi_hex: str, dst: bytes,
     if hi_i - lo_i > 65535:
         hi_i = lo_i + 65535
     nb = max(1, len(lo_bytes))
-    if not dst:
-        return
+    widths.add(nb)
     units = [int.from_bytes(dst[k:k + 2], 'big')
              for k in range(0, len(dst) - 1, 2)]
     if not units:
         units = [dst[0]]
     for k in range(hi_i - lo_i + 1):
-        if exact_offset:
-            if k != exact_offset:
+        if only_offset >= 0:
+            if k != only_offset:
                 continue
-            u = units
-            code = base + exact_offset
+            u = list(units)
+            code = base + only_offset
         else:
             u = list(units)
             carry = k
@@ -1025,27 +1078,29 @@ def _utf16_text(raw: bytes) -> str:
 # 文本算子
 # ----------------------------------------------------------------------
 
-def _extract_content_text(content: bytes, fonts, global_cmap: dict) -> str:
+def _extract_content_text(content: bytes, fonts, global_cmap: dict,
+                           global_width: int) -> str:
     """从一个内容流里抽文本。
 
     fonts：{字体名: (cmap, 每字符字节数)}，来自页面 /Resources；
     找不到时退回 global_cmap（所有 CMap 合并的全局表）。
     """
     out = []
-    stack = []
+    stack = []        # 操作数栈
+    arrays = []       # 正在构造的数组（嵌套用）
     cur_font = None
     last_tm = None
 
     def resolve(raw: bytes) -> str:
         info = fonts.get(cur_font) if fonts else None
         if info is None:
-            return _decode_bytes(raw, {}, 0, global_cmap)
-        return _decode_bytes(raw, info[0], info[1], global_cmap)
+            return _decode_bytes(raw, {}, 0, global_cmap, global_width)
+        return _decode_bytes(raw, info[0], info[1], global_cmap, global_width)
 
     def push(item):
         # 数组里的元素要进数组，不能直接进操作数栈
-        if stack and stack[-1][0] == 'arr':
-            stack[-1][1].append(item)
+        if arrays:
+            arrays[-1].append(item)
         else:
             stack.append(item)
 
@@ -1063,12 +1118,12 @@ def _extract_content_text(content: bytes, fonts, global_cmap: dict) -> str:
             push(('str', _hex_bytes(val)))
             continue
         if kind == 'arr_open':
-            stack.append(('arr', []))
+            arrays.append([])
             continue
         if kind == 'arr_close':
-            if stack and stack[-1][0] == 'arr':
-                arr = stack.pop()[1]
-                stack.append(('arr', arr))
+            if arrays:
+                arr = arrays.pop()
+                push(('arr', arr))
             continue
         if kind in ('dict_open', 'dict_close'):
             continue
@@ -1129,10 +1184,11 @@ def _extract_content_text(content: bytes, fonts, global_cmap: dict) -> str:
     return ''.join(out)
 
 
-def _decode_bytes(raw: bytes, cmap: dict, width: int, global_cmap: dict) -> str:
+def _decode_bytes(raw: bytes, cmap: dict, width: int, global_cmap: dict,
+                  global_width: int) -> str:
     """把内容流里的字节串解成文本。
 
-    width：每个字符码几个字节（1 或 2）；0 表示不确定，自适应尝试。
+    width：当前字体每个字符码几个字节（1 或 2）；0 表示不确定，自适应尝试。
     """
     if not raw:
         return ''
@@ -1142,20 +1198,29 @@ def _decode_bytes(raw: bytes, cmap: dict, width: int, global_cmap: dict) -> str:
     while i < n:
         step = 1
         if width in (1, 2):
-            code = raw[i:i + width]
-            if len(code) < width:
+            w = width
+            code = raw[i:i + w]
+            if len(code) < w:
+                w = len(code)
                 code = raw[i:]
-                width = len(code)
             text = _lookup(cmap, global_cmap, code)
-            if text is None and width == 2 and len(code) == 2:
+            if text is None and w == 2 and len(code) == 2:
                 # 双字节字体里偶尔混进单字节码，退一步试试
                 text = _lookup(cmap, global_cmap, code[:1])
                 if text is not None:
-                    width = 1
+                    w = 1
+            if text is None and global_width in (1, 2) and global_width != w:
+                # 当前字体的 CMap 没命中，换全局表的字符码宽度再试一次
+                gw = global_width
+                gcode = raw[i:i + gw]
+                text = _lookup({}, global_cmap, gcode)
+                if text is not None:
+                    w = gw
             if text is None:
                 text = _fallback_char(code)
-            step = max(1, len(code))
+            step = max(1, w)
         else:
+            # 宽度未知：先按 1 字节试，再按 2 字节试
             code1 = raw[i:i + 1]
             text = _lookup(cmap, global_cmap, code1)
             if text is not None:
@@ -1194,8 +1259,10 @@ def _fallback_char(code: bytes) -> str:
         return ''
     if len(code) == 1:
         b = code[0]
-        if b in (0x0a, 0x0d, 0x09):
-            return '\n' if b != 0x09 else '\t'
+        if b in (0x0a, 0x0d):
+            return '\n'
+        if b == 0x09:
+            return '\t'
         if b < 0x20:
             return ''
         try:
@@ -1222,9 +1289,8 @@ def _tidy(text: str) -> str:
     if not text:
         return ''
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    text = re.sub(r'[^\x09\x0a\x20-\x7e\xa0-￿'
-                  r'　-〿＀-￯]', '', text)
-    text = '\n'.join(line.rstrip() for line in text.split('\n'))
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    text = '\n'.join(line.strip() for line in text.split('\n'))
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 

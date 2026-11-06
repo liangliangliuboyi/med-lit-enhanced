@@ -498,6 +498,66 @@ def _do_exports(run, out_dir, fmt: str):
 
 
 # ---------------- 主入口 ----------------
+def _apply_overrides(cfg, args):
+    """把命令行开关落到配置上。
+
+    单独抽成函数是为了让 --chat 模式也能用上——
+    原来这段在 main() 里排在 --chat 的 return **之后**，
+    于是聊天模式下 --quick / --max-papers 之类的开关全部失效。
+    """
+    if args.quick:
+        # N11：快速模式只关掉「第二轮扩写」与两种链接扩展，
+        # **保留检索式质量闸门**（max_revisions）——检索式写歪了才是最大的坑，
+        # 快速模式同样要能自我修正。
+        #
+        # 另外关掉两项**后置校验**：B8 相关度交叉验证（每篇文献跑两遍模型）
+        # 与 B5 论断语义比对（最多 12 条论断各跑一遍模型）。这两项是纯成本项，
+        # 不影响检索与写作质量，留给完整模式即可。
+        cfg['retrieval'].update({'rounds': 1, 'retmax_per_query': 12,
+                                 'max_papers': 4, 'fulltext_limit': 2,
+                                 'expand_by_links': False, 'expand_by_references': False,
+                                 'cross_check_relevance': False,
+                                 'verify_claims': False})
+    if args.no_cache:
+        cfg['retrieval']['no_cache'] = True
+    if args.max_papers:
+        cfg['retrieval']['max_papers'] = args.max_papers
+    if args.fulltext_limit is not None:
+        cfg['retrieval']['fulltext_limit'] = args.fulltext_limit
+    if args.research_only:
+        cfg['retrieval']['research_only'] = True
+    if args.rounds is not None:
+        cfg['retrieval']['rounds'] = args.rounds
+    if args.no_animal_exclusion:
+        cfg['retrieval']['exclude_animals'] = False
+    if args.no_links:
+        cfg['retrieval']['expand_by_links'] = False
+    if args.no_snowball:
+        cfg['retrieval']['expand_by_references'] = False
+    if args.preprints:
+        cfg['retrieval']['include_preprints'] = True
+
+    # ---- 交医场景相关开关 ----
+    if args.figures:
+        cfg.setdefault('figures', {})['enabled'] = True
+    if args.no_figures:
+        cfg.setdefault('figures', {})['enabled'] = False
+    if args.no_download:
+        # 「读完就删」：全文只在临时目录里待一下，读完立刻删除，
+        # 本地不留副本（用户明确不想留文件时用）
+        cfg.setdefault('fulltext', {})['keep_downloads'] = False
+    if args.download_fulltext:
+        cfg.setdefault('fulltext', {})['keep_downloads'] = True
+    if args.fulltext_proxy:
+        cfg.setdefault('fulltext', {})['proxy'] = args.fulltext_proxy
+    if args.unpaywall_email:
+        cfg.setdefault('resources', {})['unpaywall_email'] = args.unpaywall_email
+    if args.vl_model:
+        cfg.setdefault('figures', {})['model'] = args.vl_model
+
+    return cfg
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='循证医学文献检索 Agent',
@@ -537,6 +597,19 @@ def main():
     ap.add_argument('--models', action='store_true', help='打印模型路由链')
     ap.add_argument('--list-cq', action='store_true', help='列出可用的临床查询过滤器')
     ap.add_argument('--pubmed-only', metavar='TERM', help='只检索 PubMed，不调模型')
+    ap.add_argument('--figures', action='store_true',
+                    help='开启图表识别：用多模态模型读论文插图里的效应量')
+    ap.add_argument('--no-figures', action='store_true', help='关闭图表识别')
+    ap.add_argument('--vl-model', metavar='NAME',
+                    help='图表识别用的多模态模型（默认 Qwen/Qwen3-VL-8B-Instruct）')
+    ap.add_argument('--no-download', action='store_true',
+                    help='全文只在临时目录读，不在本地留副本（读完即删）')
+    ap.add_argument('--download-fulltext', action='store_true',
+                    help='把下载到的 PDF 保留在本次运行目录下')
+    ap.add_argument('--fulltext-proxy', metavar='URL',
+                    help='抓全文用的代理，如 http://127.0.0.1:7890（默认读环境变量）')
+    ap.add_argument('--unpaywall-email', metavar='EMAIL',
+                    help='Unpaywall 开放获取查询用的邮箱（用于自动找免费 PDF）')
     ap.add_argument('--retmax', type=int, default=10, help='--pubmed-only 的取回条数')
     ap.add_argument('--json', action='store_true', help='以 JSON 输出结果摘要')
     ap.add_argument('--config', help='配置文件路径')
@@ -562,6 +635,10 @@ def main():
         cmd_pubmed_only(cfg, args.pubmed_only, args.retmax)
         return 0
 
+    # 参数覆盖必须在 --chat 分支**之前**做，
+    # 否则聊天模式下这些开关全都不生效（原来就是这样，已修）。
+    _apply_overrides(cfg, args)
+
     if args.chat:
         return cmd_chat(cfg, args)
 
@@ -578,39 +655,6 @@ def main():
     notice = first_run_notice()
     if notice:
         print(notice)
-
-    # ---- 参数覆盖配置 ----
-    if args.quick:
-        # N11：快速模式只关掉「第二轮扩写」与两种链接扩展，
-        # **保留检索式质量闸门**（max_revisions）——检索式写歪了才是最大的坑，
-        # 快速模式同样要能自我修正。
-        #
-        # 另外关掉两项**后置校验**：B8 相关度交叉验证（每篇文献跑两遍模型）
-        # 与 B5 论断语义比对（最多 12 条论断各跑一遍模型）。这两项是纯成本项，
-        # 不影响检索与写作质量，留给完整模式即可。
-        cfg['retrieval'].update({'rounds': 1, 'retmax_per_query': 12,
-                                 'max_papers': 4, 'fulltext_limit': 2,
-                                 'expand_by_links': False, 'expand_by_references': False,
-                                 'cross_check_relevance': False,
-                                 'verify_claims': False})
-    if args.no_cache:
-        cfg['retrieval']['no_cache'] = True
-    if args.max_papers:
-        cfg['retrieval']['max_papers'] = args.max_papers
-    if args.fulltext_limit is not None:
-        cfg['retrieval']['fulltext_limit'] = args.fulltext_limit
-    if args.research_only:
-        cfg['retrieval']['research_only'] = True
-    if args.rounds is not None:
-        cfg['retrieval']['rounds'] = args.rounds
-    if args.no_animal_exclusion:
-        cfg['retrieval']['exclude_animals'] = False
-    if args.no_links:
-        cfg['retrieval']['expand_by_links'] = False
-    if args.no_snowball:
-        cfg['retrieval']['expand_by_references'] = False
-    if args.preprints:
-        cfg['retrieval']['include_preprints'] = True
 
     run = pipeline.Run(args.question, args.constraints, cfg,
                        cq_explicit=_cq_list(args), resume_dir=args.resume)
