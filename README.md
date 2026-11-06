@@ -12,18 +12,40 @@
 
 ### 方式 A：交给智能体装
 
-把仓库地址丢给智能体，让它帮你装：
+**把仓库地址丢给智能体就行**，它读完 `SKILL.md` 自己会走完安装流程。
+可以直接这么说：
 
-```
-https://github.com/liangliangliuboyi/medlit-agent
-```
+> 「帮我安装这个循证医学文献检索技能：https://github.com/liangliangliuboyi/med-lit-enhanced 」
 
-智能体读到这个仓库的 `skills/medlit-agent/SKILL.md`，里面写了完整的安装步骤。
+或者更省事：
+
+> 「安装 https://github.com/liangliangliuboyi/med-lit-enhanced 里的技能」
+
+智能体读到这个仓库的 `skills/medlit-agent/SKILL.md`，里面写了完整的安装步骤
+（拷到 skills 目录 → 填 `.env` 的密钥 → 跑一次体检）。
+
+> ⚠️ **装之前先说一句想让它做什么**会更准：
+> 「装完顺便帮我查一下『XXX 这个问题现在有什么证据』」——
+> 这样智能体会连着装完后的首次体检和第一轮实跑一起做完，
+> 你能立刻看到效果，而不是装完还要自己配一遍。
+
+### 技能名与旧名的关系（别被绕晕）
+
+| | 名字 | 在哪 |
+|---|---|---|
+| GitHub 仓库 | `med-lit-enhanced` | 仓库名、URL |
+| 技能名 | `medlit-agent` | `SKILL.md` frontmatter 的 `name:` |
+| 旧的本机技能名 | `med-lit-enhanced` | 11-05 之前在本机用的名字 |
+
+**智能体是按 frontmatter 的 `name` 识别的**，所以对话里用
+「用 **medlit-agent** 查文献」能直接触发；
+说「med-lit-enhanced」时，智能体会去找**仓库**而不是技能——
+所以**要么用技能名 medlit-agent，要么直接把仓库地址给它**（方式 A）。
 
 ### 方式 B：一行命令
 
 ```bash
-npx -y skills add liangliangliuboyi/medlit-agent --skill medlit-agent
+npx -y skills add liangliangliuboyi/med-lit-enhanced --skill medlit-agent
 ```
 
 `skills` 是以 GitHub 为 registry 的技能包管理器（<https://skills.sh>），
@@ -32,7 +54,7 @@ npx -y skills add liangliangliuboyi/medlit-agent --skill medlit-agent
 ### 方式 C：手动拷贝
 
 ```bash
-git clone https://github.com/liangliangliuboyi/medlit-agent.git
+git clone https://github.com/liangliangliuboyi/med-lit-enhanced.git
 cd medlit-agent
 .\install\install.ps1 workbuddy      # Windows
 ./install/install.sh workbuddy       # macOS / Linux
@@ -312,7 +334,7 @@ into an auditable, evidence-based answer where **every substantive claim carries
 **Install**
 
 ```bash
-npx -y skills add liangliangliuboyi/medlit-agent --skill medlit-agent
+npx -y skills add liangliangliuboyi/med-lit-enhanced --skill medlit-agent
 ```
 
 Or copy `skills/medlit-agent/` into your agent's skills directory

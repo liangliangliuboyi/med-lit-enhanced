@@ -1,6 +1,6 @@
 ---
 name: medlit-agent
-version: 2.2.0
+version: 2.4.0
 description: >
   循证医学文献检索。当用户提出医学、临床、公共卫生、流行病学、药物疗效、诊断准确性、
   指南依据等需要循证依据的问题，或明确要求"查文献 / 找证据 / 做文献综述 / 系统评价 /
@@ -10,7 +10,7 @@ description: >
   确定性分级（程序机械定级 + 模型复核）与 PRISMA 流程计数，最后生成每条论断都挂 PMID 的答案。
   检索范围为全 PubMed，不限刊源、不限学科，适配不同专业背景的使用者。不适用于纯概念解释、
   不需要文献支撑的闲聊，以及涉及具体患者诊疗决策的场景（应提示就医）。
-repo: https://github.com/liangliangliuboyi/medlit-agent
+repo: https://github.com/liangliangliuboyi/med-lit-enhanced
 ---
 
 # 循证医学文献检索
@@ -39,7 +39,7 @@ repo: https://github.com/liangliangliuboyi/medlit-agent
 
 ## 零、安装（用户要求"安装这个技能"时照此执行）
 
-**仓库地址：<https://github.com/liangliangliuboyi/medlit-agent>**
+**仓库地址：<https://github.com/liangliangliuboyi/med-lit-enhanced>**
 
 ### 方式 A：让智能体装（推荐）
 
@@ -48,7 +48,7 @@ repo: https://github.com/liangliangliuboyi/medlit-agent
 ### 方式 B：一行命令（任意 agent 通用）
 
 ```bash
-npx -y skills add liangliangliuboyi/medlit-agent --skill medlit-agent
+npx -y skills add liangliangliuboyi/med-lit-enhanced --skill medlit-agent
 ```
 
 `skills` CLI 以 GitHub 为 registry（<https://skills.sh>），支持 Claude Code / Cursor / Codex 等。
@@ -56,7 +56,7 @@ npx -y skills add liangliangliuboyi/medlit-agent --skill medlit-agent
 ### 方式 C：手动拷贝
 
 ```bash
-git clone https://github.com/liangliangliuboyi/medlit-agent.git
+git clone https://github.com/liangliangliuboyi/med-lit-enhanced.git
 cd medlit-agent
 ./install/install.sh workbuddy        # Windows: .\install\install.ps1 workbuddy
 ```
@@ -283,3 +283,24 @@ python scripts/ask.py "问题原文" --constraints "人群/年份/地区等限�
 - 单元测试：`python tests/run_tests.py`（离线，不需密钥）
 
 ⚠️ 仓库里**不得出现任何明文密钥**。`.env` / `config.json` / `config.local.json` 都已在 `.gitignore` 中。
+
+---
+
+## 十一、日后的功能更新方向（2026-11-06 定：暂不实现，留档）
+
+当前版本 **v2.4.0** 已完成上面十节描述的全部能力。以下四项是讨论过但
+**决定暂时不做**的方向，先记在这里，等有明确需求时再启动。
+
+| # | 方向 | 当时为什么没做 | 启动条件 |
+|---|---|---|---|
+| **F1** | **完全离线版**：模型走 Ollama（DeepSeek-V3.2 + Qwen3-VL-8B），文献抓取也本地缓存 | 现在的实现"零第三方依赖"但**模型与文献库都要联网**；离线化要引入 Ollama 运行时与本地缓存层 | 有断网/保密场景，或本地推理速度可接受时 |
+| **F2** | **`--refresh-jcr`**：一键重建期刊评价索引 | JCR 数据是 2026 快照，当年不急；重建脚本（`scripts/build_jcr_index.py`）已经存在，手动跑一次即可 | 想让索引跟随新一年度的 JCR 表时 |
+| **F3** | **图表数值二次复核**：VL 读出数字后再发一次让模型只做数字确认 | 复核 = 双倍模型调用；当前提示词已要求"读不清就写未见明确标注"，误读风险主要来自**图片分辨率**（PMC 归档图只有出版社原图的一半），复核解决不了根因 | 若用户反馈"图表数值经常对不上正文" |
+| **F4** | **交医预设检索式**：按科室预置 MeSH 模板（如"XX 科室常见疾病的最新指南"） | 需要交大各科室的真实检索习惯，输入来源目前没有；拍脑袋预设反而会误导 | 拿到科室的实际检索需求清单后 |
+
+**不在此列、但也还没解决的**（属于结构性限制，不是待开发项）：
+
+- **只检索 PubMed**（+ 预印本），**不覆盖中文文献**——这是明确决定，不是缺陷。
+  答案里会明写"本轮检索未覆盖（仅检索了国际英文文献）"。
+- **CNKI / 万方 / 维普**需要机构授权，不是加代码能解决的。
+- **PMC 归档插图只有一档分辨率**（出版商原图的一半），PMC 体系内无通用原图路径。
