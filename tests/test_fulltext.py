@@ -113,6 +113,73 @@ FAKE_OPENALEX = {
 
 FAKE_PDF_BYTES = b'%PDF-1.4\nfake pdf body\n%%EOF\n'
 
+# PMC 的 HTML 全文页（照着真实页面结构写：PMC12439189）。
+# 刻意包含这些坑：
+#   - 导航区里的 <img>（图标）——不能被当成插图
+#   - <figure> 里的 <img>（真插图，CDN 绝对 URL）
+#   - data: 内联 base64 图——要跳过
+#   - 相对路径的 img src——要拼成绝对
+#   - <figcaption> 里带嵌套标签——要剥成纯文本
+#   - 正文容器 <section class="body main-article-body">
+FAKE_PMC_HTML = """<!doctype html>
+<html lang="en"><head><title>Fake article</title></head><body>
+<nav class="usa-nav">
+  <img src="/static/img/us_flag.svg" alt="flag">
+  <img src="https://cdn.ncbi.nlm.nih.gov/pmc/blobs/x/usa-icons.svg" alt="icon">
+</nav>
+<article lang="en">
+ <section aria-label="Article content">
+  <section class="body main-article-body">
+   <section class="abstract" id="abstract1"><h2>Abstract</h2>
+    <section id="ab-1"><h3 class="pmc_sec_title">Importance</h3>
+     <p>Background sentence one with enough words to matter.</p>
+     <p>Second abstract paragraph with <sup>1</sup> and a
+        <a href="#x1" class="usa-link">reference link</a> inside.</p>
+    </section>
+   </section>
+   <section id="sec-intro"><h2>Introduction</h2>
+    <p>Introduction body paragraph with enough text to pass the length gate.
+       It mentions efficacy and safety outcomes in children and adolescents.</p>
+   </section>
+   <section id="sec-results"><h2>Results</h2>
+    <p>Results body paragraph describing the pooled effect estimates and
+       confidence intervals across the included randomized trials.</p>
+    <figure class="fig xbox font-sm" id="poi1f2">
+     <h4 class="obj_head">Figure 2. Overall Estimated Treatment Differences.</h4>
+     <p class="img-box text-center">
+      <a class="tileshop" href="https://www.ncbi.nlm.nih.gov/core/lw/tileshop.html">
+       <img class="graphic zoom-in"
+            src="https://cdn.ncbi.nlm.nih.gov/pmc/blobs/9f0f/12439189/1fc/jamapediatr-e253243-g002.jpg"
+            loading="lazy" height="306" width="780" alt="Figure 2. ">
+      </a>
+     </p>
+     <figcaption><p>Breakdown by study and subgroup. <b>BMI</b> indicates body
+        mass index, and <a href="#x2">supplementary</a> data are provided.</p></figcaption>
+    </figure>
+    <figure class="fig xbox" id="poi1f3">
+     <p><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" alt="inline"/></p>
+     <figcaption><p>Inline base64 figure that must be skipped.</p></figcaption>
+    </figure>
+    <figure class="fig xbox" id="poi1f4">
+     <p><img src="../bin/relative-figure.jpg" alt="relative"/></p>
+     <figcaption><p>Relative path figure that must become absolute.</p></figcaption>
+    </figure>
+   </section>
+  </section>
+ </section>
+</article>
+</body></html>
+"""
+
+# PMC 的反爬挑战页（实测：21KB 的 Google reCAPTCHA 页面）
+FAKE_CAPTCHA_HTML = """<!doctype html>
+<html lang="en-US" dir="ltr"><head>
+<base href="https://www.google.com/recaptcha/challengepage/">
+<link rel="preconnect" href="//www.gstatic.com">
+</head><body><script nonce="x">window['ppConfig']={};</script>
+<div id="recaptcha"></div></body></html>
+"""
+
 
 class _FakeResponse:
     """模拟 urllib 的响应对象（支持 context manager）。"""
@@ -167,9 +234,13 @@ class FullTextTestBase(unittest.TestCase):
         self.orig_env = {k: os.environ.get(k) for k in
                          ('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy')}
         self.recorder = None
+        # 反爬重试要歇 1.5 秒，测试里没必要真等
+        self.orig_retry_sleep = FullTextFetcher.PMC_HTML_RETRY_SLEEP
+        FullTextFetcher.PMC_HTML_RETRY_SLEEP = 0
 
     def tearDown(self):
         FullTextFetcher._request = self.orig_request
+        FullTextFetcher.PMC_HTML_RETRY_SLEEP = self.orig_retry_sleep
         for k, v in self.orig_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -1202,6 +1273,262 @@ class TestPdfTextExtraction(FullTextTestBase):
         self.assertEqual(res['source'], 'pmc_bioc')
         self.assertNotIn('temp_removed', res)
         self.assertNotIn('_used_temp', res)
+
+
+# ---------------------------------------------------------------------
+# 11. PMC HTML 全文源
+# ---------------------------------------------------------------------
+class TestPmcHtmlSource(FullTextTestBase):
+    """PMC 的 HTML 全文页（降级链第 3 级）。
+
+    为什么需要这一级：实测有些文章（PMC 有编号、但不在 BioC 覆盖范围内）
+    前两条老路全断，HTML 页却能拿到正文——**而且能给图片直链**，
+    这是图表识别模块（scripts/figures.py）下载插图的依据。
+    """
+
+    def setUp(self):
+        super().setUp()
+
+    def _routes(self, html=FAKE_PMC_HTML, status=200):        return [('pmc.ncbi.nlm.nih.gov/articles', html.encode('utf-8'),
+                 'text/html')]
+
+    def test_pmc_html_extracts_text_and_sections(self):
+        """正文与章节标题都要抽出来。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '40952752', 'pmcid': 'PMC12439189',
+                             'doi': '10.1001/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertEqual(res['source'], 'pmc_html')
+        self.assertIn('Introduction body paragraph', res['text'])
+        self.assertIn('Results body paragraph', res['text'])
+        self.assertIn('Abstract', res['sections'])
+        self.assertIn('Introduction', res['sections'])
+        self.assertIn('Results', res['sections'])
+
+    def test_pmc_html_url_is_article_page(self):
+        """url 要指向文章页（用户手动打开用）。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertIn('PMC12439189', res['url'])
+        self.assertTrue(res['url'].startswith('http'))
+
+    def test_figures_only_take_images_inside_figure(self):
+        """**只取 <figure> 里的 <img>**——页面里到处是导航图标。
+
+        实测真实页面 37 个 <img> 里大部分是图标
+        （us_flag.svg / icon-dot.svg / ncbi-logo / usa-icons）。
+        不限定就会把图标当插图送去多模态模型。
+        """
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        hrefs = [f['href'] for f in res['figures']]
+        self.assertTrue(hrefs, '应当抽到插图')
+        for bad in ('us_flag.svg', 'usa-icons.svg', 'icon-dot.svg'):
+            self.assertFalse(any(bad in h for h in hrefs),
+                             '导航图标混进插图了：%s' % bad)
+        self.assertTrue(any('jamapediatr-e253243-g002.jpg' in h for h in hrefs))
+
+    def test_figure_href_is_the_image_itself_not_page_link(self):
+        """href 必须是**图片本身**的 URL，不能是 figure/poi.../ 那种页面链接。
+
+        下游 figures.py 只认 <img src>，给了页面链接就下不到图。
+        """
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        for f in res['figures']:
+            self.assertTrue(f['href'].startswith('http'), f['href'])
+            self.assertNotIn('/figure/poi', f['href'])
+            self.assertFalse(f['href'].startswith('data:'),
+                             '内联 base64 图不能交给下游下载')
+
+    def test_data_uri_image_is_skipped(self):
+        """data: 内联 base64 图要跳过（下游没法下载）。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        for f in res['figures']:
+            self.assertFalse(f['href'].lower().startswith('data:'))
+
+    def test_relative_image_src_becomes_absolute(self):
+        """相对路径的 img src 要拼成绝对 URL。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        rel = [f for f in res['figures'] if 'relative-figure.jpg' in f['href']]
+        self.assertTrue(rel, '相对路径的图应在列表里')
+        self.assertTrue(rel[0]['href'].startswith('http'),
+                        '相对路径没被拼成绝对：%s' % rel[0]['href'])
+
+    def test_figcaption_is_stripped_to_plain_text(self):
+        """figcaption 要剥成纯文本（里面有 <b>/<a> 等嵌套标签）。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes())
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        cap = next((f['caption'] for f in res['figures']
+                    if 'g002' in f['href']), '')
+        self.assertIn('Breakdown by study and subgroup', cap)
+        self.assertIn('BMI', cap)
+        self.assertNotIn('<b>', cap)
+        self.assertNotIn('<a ', cap)
+
+    def test_captcha_page_is_not_treated_as_article(self):
+        """反爬挑战页必须被识别出来，不能当正文抽。"""
+        self.clear_proxy_env()
+        self.patch_network(routes=self._routes(html=FAKE_CAPTCHA_HTML))
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertNotEqual(res['source'], 'pmc_html',
+                            '挑战页被当成正文了')
+        self.assertEqual(res['text'], '')
+
+    def test_falls_back_to_second_domain_when_first_is_challenged(self):
+        """第一个域名是挑战页时，要换第二个域名再试。
+
+        实测 PMC 的反爬是**随机命中**的（同一 URL 连抓 8 次，
+        新域名 6 次中招、老域名 2 次中招），所以换域名比退避重试更有效。
+        """
+        self.clear_proxy_env()
+        rec = self.patch_network(routes=[
+            ('pmc.ncbi.nlm.nih.gov/articles',
+             FAKE_CAPTCHA_HTML.encode('utf-8'), 'text/html'),
+            ('www.ncbi.nlm.nih.gov/pmc/articles',
+             FAKE_PMC_HTML.encode('utf-8'), 'text/html'),
+        ])
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertEqual(res['source'], 'pmc_html')
+        self.assertIn('Introduction body paragraph', res['text'])
+        # 两个域名都试过了
+        self.assertGreaterEqual(len(rec.urls), 2)
+
+    def test_retries_second_round_when_all_domains_challenged(self):
+        """第一轮两个域名都被挡时，要再试一轮。
+
+        实测反爬是随机命中的：1 轮成功率 70%，2 轮能到 95%+。
+        不重试的话，这一级会白白降级到 Unpaywall，丢掉图片直链。
+        """
+        self.clear_proxy_env()
+        state = {'n': 0}
+
+        def fake_request(self, url, timeout=None, method='GET', retries=2):
+            state['n'] += 1
+            # 前两次（全被挡）→ 返回挑战页；第三次起给真页面
+            if state['n'] <= 2:
+                return 200, FAKE_CAPTCHA_HTML.encode('utf-8'), 'text/html'
+            return 200, FAKE_PMC_HTML.encode('utf-8'), 'text/html'
+
+        FullTextFetcher._request = fake_request
+        try:
+            fetcher = FullTextFetcher(timeout=5)
+            res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                                 'doi': '10.1/x', 'title': 'T',
+                                 'journal': 'J', 'year': '2025'})
+        finally:
+            FullTextFetcher._request = self.orig_request
+        self.assertEqual(res['source'], 'pmc_html')
+        self.assertGreaterEqual(state['n'], 3, '应该重试到第二轮')
+
+    def test_shell_page_with_container_but_no_body_is_rejected(self):
+        """容器在、正文没渲染出来（空壳页）要被拒绝。
+
+        这类页面的容器标签是有的，所以 `_looks_like_article` 会放行；
+        真正挡住它的是**正文长度门槛**。
+        """
+        self.clear_proxy_env()
+        shell = ('<section class="body main-article-body">'
+                 '<p>Loading...</p></section>')
+        self.patch_network(routes=self._routes(html=shell))
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertNotEqual(res['source'], 'pmc_html',
+                            '空壳页不该被当成正文')
+        self.assertEqual(res['text'], '')
+
+    def test_oversized_html_is_abandoned(self):
+        """HTML 太大就放弃这一级（别把内存打满）。
+
+        实测有的文章 1~2MB，所以上限定在 6MB；超过就不硬啃——
+        截断会切坏结构，反而抽不出东西。
+        """
+        self.clear_proxy_env()
+        limit = FullTextFetcher.PMC_HTML_MAX_BYTES
+        huge = ('<section class="body main-article-body">'
+                + '<p>x</p>' * (limit // 7 + 10) + '</section>')
+        self.assertGreater(len(huge), limit)
+        self.patch_network(routes=self._routes(html=huge))
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertNotEqual(res['source'], 'pmc_html',
+                            '超大 HTML 应该被放弃而不是硬啃')
+
+    def test_pmc_html_is_before_unpaywall_in_chain(self):
+        """PMC HTML 要在 Unpaywall 之前（它能出图片直链，Unpaywall 不能）。"""
+        self.clear_proxy_env()
+        rec = self.patch_network(routes=[
+            ('pmcoa.cgi', None, None),          # PMC BioC 404
+            ('europepmc', None, None),           # Europe PMC 404
+            ('pmc.ncbi.nlm.nih.gov/articles',
+             FAKE_PMC_HTML.encode('utf-8'), 'text/html'),
+            ('unpaywall', b'{"best_oa_location": {"host_type": "repo", '
+                         b'"url_for_landing_page": "https://example.invalid/p"}}',
+             'application/json'),
+        ])
+        fetcher = FullTextFetcher(email='u@example.org', timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertEqual(res['source'], 'pmc_html')
+        self.assertFalse(any('unpaywall' in u for u in rec.urls),
+                         'PMC HTML 成功后不该再请求 Unpaywall')
+
+    def test_pmc_bioc_still_wins_over_pmc_html(self):
+        """PMC BioC 仍然优先（它更干净）。"""
+        self.clear_proxy_env()
+        rec = self.patch_network(routes=[
+            ('pmcoa.cgi', b'{"documents": [{"passages": ['
+                          b'{"infons": {"section_type": "INTRO"}, "text": "bioc"}]}]}',
+             'application/json'),
+            ('pmc.ncbi.nlm.nih.gov/articles',
+             FAKE_PMC_HTML.encode('utf-8'), 'text/html'),
+        ])
+        fetcher = FullTextFetcher(timeout=5)
+        res = fetcher.fetch({'pmid': '1', 'pmcid': 'PMC12439189',
+                             'doi': '10.1/x', 'title': 'T',
+                             'journal': 'J', 'year': '2025'})
+        self.assertEqual(res['source'], 'pmc_bioc')
+        self.assertFalse(any('articles/PMC12439189' in u for u in rec.urls),
+                         'BioC 成功后不该再请求 PMC HTML')
 
 
 if __name__ == '__main__':

@@ -351,6 +351,100 @@ class TestPredefinedCMap(unittest.TestCase):
         self.assertIn('Hello', pdftext.extract_text(pdf)['text'])
 
 
+class TestObjectStream(unittest.TestCase):
+    """PDF 1.5+ 的对象流（/Type /ObjStm）。
+
+    大量对象（字体字典、页面对象）被压缩进对象流，文件里看不到
+    `N 0 obj`。不解开就等于这些对象不存在。
+    """
+
+    def _build_with_objstm(self, extra_objs):
+        """把 extra_objs 放进一个 ObjStm，返回整个 PDF 字节。"""
+        members = b''
+        header = b''
+        offsets = []
+        for num, body in extra_objs:
+            offsets.append((num, len(members)))
+            members += body + b' '
+        for num, off in offsets:
+            header += b'%d %d ' % (num, off)
+        payload = header + members
+        first = len(header)
+        out = bytearray(b'%PDF-1.5\n')
+        out += b'1 0 obj\n' + (b'<< /Type /ObjStm /N %d /First %d /Length %d >>\n'
+                               % (len(extra_objs), first, len(payload)))
+        out += b'stream\n' + payload + b'\nendstream\nendobj\n'
+        out += b'trailer\n<< /Size 2 >>\n%%EOF\n'
+        return bytes(out)
+
+    def test_object_in_objstm_is_found(self):
+        pdf = self._build_with_objstm([
+            (7, b'<< /Type /Font /Subtype /TrueType /BaseFont /Foo >>'),
+        ])
+        objs = pdftext._scan_objects(pdf)
+        by_num = {o.num: o for o in objs}
+        pdftext._expand_object_streams(pdf, objs, by_num)
+        self.assertIn(7, by_num)
+        self.assertEqual(by_num[7].dict.get('Type'), ('name', 'Font'))
+
+    def test_font_inside_objstm_is_used(self):
+        # 页面资源指向的字体对象藏在对象流里：必须能拿到它的 ToUnicode
+        cmap = (b'begincmap\n1 beginbfchar\n<01> <4E2D>\n<02> <6587>\n'
+                b'endbfchar\nendcmap\n')
+        # ObjStm 成员不能是流（PDF 规定对象流里不含流），
+        # 所以 CMap 用普通流对象放在外面。
+        out = bytearray(b'%PDF-1.5\n')
+        out += b'1 0 obj\n' + stream_obj(cmap) + b'\nendobj\n'
+        out += b'2 0 obj\n' + stream_obj(
+            b'BT /F1 12 Tf <0102> Tj ET') + b'\nendobj\n'
+        members = [
+            (3, b'<< /Type /Page /Parent 4 0 R /Resources '
+                b'<< /Font << /F1 5 0 R >> >> /Contents 2 0 R >>'),
+            (4, b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
+            (5, b'<< /Type /Font /Subtype /TrueType /BaseFont /Foo '
+                b'/ToUnicode 1 0 R >>'),
+        ]
+        payload = b''
+        header = b''
+        for num, body in members:
+            header += b'%d %d ' % (num, len(payload))
+            payload += body + b' '
+        first = len(header)
+        blob = header + payload
+        out += b'6 0 obj\n<< /Type /ObjStm /N %d /First %d /Length %d >>\n' \
+               % (len(members), first, len(blob))
+        out += b'stream\n' + blob + b'\nendstream\nendobj\n'
+        out += b'trailer\n<< /Size 7 >>\n%%EOF\n'
+        res = pdftext.extract_text(bytes(out))
+        self.assertIn('中文', res['text'])
+        self.assertEqual(res['pages'], 1)
+
+
+class TestFontIsolation(unittest.TestCase):
+    """不同字体的字符码不能互相污染。"""
+
+    def test_font_without_tounicode_uses_latin1_not_other_cmap(self):
+        # 两个子集字体把同一个字符码映射成不同的字；
+        # 没有 ToUnicode 的那个字体必须按 latin-1 解，
+        # 不能套用别的字体的映射表。
+        cmap_a = b'begincmap\n1 beginbfchar\n<41> <4E2D>\nendbfchar\nendcmap\n'
+        pdf = build_pdf([
+            (1, b'<< /Type /Font /Subtype /TrueType /BaseFont /A '
+                b'/ToUnicode 3 0 R >>'),
+            (2, b'<< /Type /Font /Subtype /TrueType /BaseFont /B '
+                b'/Encoding /WinAnsiEncoding >>'),
+            (3, stream_obj(cmap_a)),
+            (4, b'<< /Type /Page /Resources << /Font << /FA 1 0 R /FB 2 0 R >> >> '
+                b'/Contents 5 0 R >>'),
+            (5, stream_obj(b'BT /FA 12 Tf (A) Tj /FB 12 Tf (A) Tj ET')),
+        ])
+        text = pdftext.extract_text(pdf)['text']
+        self.assertIn('中', text)
+        # 第二个 A 用的是 WinAnsi 字体，应该是字母 A 而不是「中」
+        self.assertIn('A', text)
+        self.assertEqual(text.count('中'), 1)
+
+
 class TestRealWorldShapes(unittest.TestCase):
     """接近真实排版的结构。"""
 

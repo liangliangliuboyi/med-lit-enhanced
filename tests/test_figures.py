@@ -475,6 +475,40 @@ class TestMaxFigures(unittest.TestCase):
                 self.assertIn('超出上限', item['error'])
                 self.assertEqual(item['description'], '')
 
+    def test_non_image_resources_do_not_consume_budget(self):
+        """表格 XML 之类不该占 max_figures 的名额。"""
+        chat = StubChat()
+        reader = _reader(chat, max_figures=2)
+        ft = {
+            'figures': [
+                {'href': 'https://example.org/a.t001.xml', 'caption': '表格'},
+                {'href': 'https://example.org/b.t002.xml', 'caption': '表格2'},
+                {'href': 'https://example.org/fig1.jpg', 'caption': '真图1'},
+                {'href': 'https://example.org/fig2.jpg', 'caption': '真图2'},
+                {'href': 'https://example.org/fig3.jpg', 'caption': '真图3'},
+            ],
+            'url': 'https://example.org/',
+        }
+        out = reader.read_all(ft)
+        self.assertEqual(len(out), 5)
+        self.assertEqual(chat.calls, 2, '只有真图该送模型')
+        for item in out[:2]:
+            self.assertIn('不是图片', item['error'])
+        self.assertEqual(out[2]['error'], '')
+        self.assertEqual(out[3]['error'], '')
+        self.assertIn('超出上限', out[4]['error'])
+
+    def test_is_image_resource_helper(self):
+        self.assertTrue(figures._is_image_resource('https://x/a.jpg'))
+        self.assertTrue(figures._is_image_resource('https://x/a.PNG'))
+        self.assertTrue(figures._is_image_resource('https://x/a'))
+        self.assertTrue(figures._is_image_resource('https://x/'))
+        self.assertFalse(figures._is_image_resource('https://x/a.t001.xml'))
+        self.assertFalse(figures._is_image_resource('https://x/a.pdf'))
+        self.assertFalse(figures._is_image_resource('https://x/a.XML'))
+        # 查询串里的扩展名不算
+        self.assertTrue(figures._is_image_resource('https://x/img?f=a.xml'))
+
     def test_max_figures_larger_than_available(self):
         chat = StubChat()
         reader = _reader(chat, max_figures=50)

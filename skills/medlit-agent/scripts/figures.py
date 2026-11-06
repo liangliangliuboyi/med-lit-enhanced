@@ -89,6 +89,35 @@ MAX_WORKERS_CAP = 8
 DOWNLOAD_TIMEOUT = 30
 CHUNK = 65536
 
+# 文章资源打包 zip 的体积上限。实测最大的一篇是 11.8MB，60MB 已经很宽松，
+# 设上限是为了防异常文献把内存吃光。
+MAX_PACKAGE_BYTES = 60 * 1024 * 1024
+
+# 图片扩展名黑名单。
+#
+# 为什么需要：全文模块把**表格的 XML 资源**也混在 figures 里
+# （实测一篇 PLOS meta 分析的 18 条 figures 中有 12 条是
+# `*.t001.xml` 这种表格文件）。那些不是图片——下载要么 404，要么拿到
+# 一堆 XML 文本，喂给 VL 模型纯属浪费 token，还会白占 max_figures 的名额，
+# 把真正的图挤出去。
+#
+# 判定规则：**只**排除确定不是图片的扩展名；扩展名不认识（无扩展名 /
+# 动态地址）就当真图试一次——宁可多试一次，也别因为猜错而漏掉真图。
+# 真正的兜底还是下载时的 Content-Type 检查。
+IMG_EXT_NO = ('xml', 'pdf', 'txt', 'doc', 'docx', 'xls', 'xlsx', 'csv',
+              'zip', 'gz', 'tar', 'htm', 'html', 'json', 'mp4', 'mp3',
+              'ttf', 'eps', 'ps', 'psd')
+
+
+def _is_image_resource(url: str) -> bool:
+    """判断这个地址像不像"图片资源"（只按扩展名猜，猜不出就当真图试）。"""
+    path = urllib.parse.urlparse(url).path or ''
+    name = path.rsplit('/', 1)[-1]
+    if '.' not in name:
+        return True
+    return name.rsplit('.', 1)[-1].lower() not in IMG_EXT_NO
+
+
 # 模型输出解析失败时的统一错误文案
 ERR_UNPARSED = '模型输出无法解析'
 
@@ -120,7 +149,12 @@ forest_plot（森林图/效应量汇总图）、survival_curve（生存曲线/Ka
 
 3. "key_values" **只抄图上真实印着的数值**（效应量、HR、OR、RR、95%CI、P 值、样本量、AUC、中位生存期等），多个用分号分隔。
    **绝对禁止推测、估算或编造图上没有的数字。** 如果图上没有标注、或者看不清楚，就写「图中未见明确标注」。
-   **只写关键的那几组数值，不要逐条罗列每一行研究。** 例如森林图只写「合并效应量（菱形处）：r = -0.227，95% CI [-0.242, -0.211]，Z = -27.280，P = 0.000；共纳入 30 项研究」；流程图只写各阶段的文献数量。
+   **只写关键的那几组数值，不要逐条罗列每一行研究。**
+   - 森林图：只报**汇总那一行**（标着 Combined effect size / 合并效应量 / 合计 / Overall 的那一行）的相关系数与 95%CI，
+     以及图上标明的纳入研究数 k。**不要去读各条研究行的数字**——一张可能有几百行，逐行读既读不准也会超时。
+   - 流程图：只写各阶段的文献数量。
+   - 生存曲线：只写图上标注的 HR 与 95%CI（若图上没标就写「图中未见明确标注」）。
+   - ROC 曲线：只写图上标注的 AUC。
 
 原图图注（可能为空，仅用于定位这张图，准确性一律以图上实际内容为准）：
 <<CAPTION>>
@@ -495,7 +529,22 @@ class FigureReader:
                                                             'Accept': '*/*'})
                 with urllib.request.urlopen(
                         req, timeout=max(self.timeout, 60)) as resp:
-                    blob = resp.read()
+                    # 打包 zip 可能十几 MB（实测最大 11.8MB），但也要设上限：
+                    # 异常文献的包可能很大，不能让它把内存吃光。
+                    length = resp.headers.get('Content-Length')
+                    if (length and str(length).isdigit()
+                            and int(length) > MAX_PACKAGE_BYTES):
+                        raise ValueError('文章资源包过大（%s 字节）' % length)
+                    buf = bytearray()
+                    while True:
+                        chunk = resp.read(CHUNK)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                        if len(buf) > MAX_PACKAGE_BYTES:
+                            raise ValueError('文章资源包过大（超过 %d 字节）'
+                                             % MAX_PACKAGE_BYTES)
+                    blob = bytes(buf)
                 self._pkg_cache[pmcid] = blob
         return _image_from_zip(blob, url, self.max_bytes)
 
@@ -536,6 +585,14 @@ class FigureReader:
         url = _absolute_url(href, base)
         if not url:
             out['error'] = '图片地址无法解析为绝对地址'
+            return out
+
+        # 不是图片的资源（表格 XML、补充 PDF 等）直接跳过：它们既下载不成
+        # 图像，喂给模型也没有意义，还得白占 max_figures 的名额。
+        if not _is_image_resource(url):
+            out['error'] = '不是图片资源（%s），已跳过' % (
+                url.rsplit('.', 1)[-1].lower() if '.' in url.rsplit('/', 1)[-1]
+                else '未知类型')
             return out
 
         # 去重（1）：地址层面。PMC 的同一张图常在多个位置出现。
@@ -698,9 +755,30 @@ class FigureReader:
 
         results: dict[int, dict] = {}
 
+        # 先把**确定不是图片**的资源（表格 XML、补充 PDF 等）挑出来，
+        # 它们不该占用 max_figures 的名额——否则真正的图会被挤掉。
+        # （实测一篇 PLOS meta 分析的 18 条 figures 里有 12 条是表格 XML。）
+        image_figs: list[dict] = []
+        for fig in figs:
+            href = str(fig.get('href') or '')
+            url = _absolute_url(href, base)
+            if url and not _is_image_resource(url):
+                results[fig['index']] = {
+                    'index': fig['index'],
+                    'href': href,
+                    'caption': fig.get('caption', ''),
+                    'description': '',
+                    'kind': '',
+                    'key_values': '',
+                    'model': self.model,
+                    'error': '不是图片资源，已跳过',
+                }
+            else:
+                image_figs.append(fig)
+
         # 超出 max_figures 的图不送模型，但要在结果里体现出来：
         # 调用方需要区分"因为上限没看"和"因为失败没看"。
-        for fig in figs[self.max_figures:]:
+        for fig in image_figs[self.max_figures:]:
             results[fig['index']] = {
                 'index': fig['index'],
                 'href': fig.get('href', ''),
@@ -712,7 +790,7 @@ class FigureReader:
                 'error': '超出上限未识别（max_figures=%d）' % self.max_figures,
             }
 
-        todo = figs[:self.max_figures]
+        todo = image_figs[:self.max_figures]
         if not todo:
             return [results[i] for i in sorted(results)]
 

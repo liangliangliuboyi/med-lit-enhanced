@@ -43,7 +43,6 @@ pdfplumber / pypdf / PyMuPDF，于是「只拿到 PDF」时全文长度为 0，
 from __future__ import annotations
 
 import base64
-import codecs
 import re
 import sys
 import time
@@ -211,6 +210,8 @@ def _extract_text(pdf_bytes, max_chars) -> dict:
     by_num = {}
     for obj in objects:
         by_num[obj.num] = obj
+    # PDF 1.5+ 把大量对象压进「对象流」，先展开它们
+    _expand_object_streams(pdf_bytes, objects, by_num)
     uniq = [by_num[n] for n in sorted(by_num)]
 
     pages = _count_pages(uniq)
@@ -389,6 +390,74 @@ def _parse_object(data: bytes, num: int, gen: int, body_start: int,
         after = _next_pos(endobj_pos, end_stream)
         obj_end = (after + 6) if after >= 0 else len(data)
     return _Obj(num, gen, obj_end, dct, raw, True)
+
+
+def _parse_objstm_member(num: int, body: bytes):
+    """解析对象流里的一个成员对象。
+
+    对象流里的成员**没有** `N 0 obj` 外壳，直接就是对象体。
+    """
+    sm = _STREAM_RE.search(body)
+    if not sm:
+        return _Obj(num, 0, 0, _parse_dict(body), b'', False)
+    dct = _parse_dict(body[:sm.start()])
+    data_start = sm.end()
+    length = dct.get('Length')
+    raw = b''
+    if length is not None and length[0] == 'num':
+        raw = body[data_start:data_start + int(length[1])]
+    else:
+        end = body.find(b'endstream', data_start)
+        raw = body[data_start:end if end >= 0 else len(body)]
+        if raw.endswith(b'\r\n'):
+            raw = raw[:-2]
+        elif raw.endswith(b'\n') or raw.endswith(b'\r'):
+            raw = raw[:-1]
+    return _Obj(num, 0, 0, dct, raw, True)
+
+
+def _expand_object_streams(data: bytes, objects, by_num):
+    """把 /Type /ObjStm（对象流）里压缩的对象展开出来。
+
+    PDF 1.5 起有大量对象（字体字典、页面对象、页面树……）被压缩进
+    「对象流」，文件里根本看不到 `N 0 obj`。不解开对象流，这些对象
+    对我们等于不存在——字体映射拿不到、页面数也数不对。
+    """
+    for obj in list(objects):
+        t = obj.dict.get('Type')
+        if not (t and t[0] == 'name' and t[1] == 'ObjStm'):
+            continue
+        if not obj.has_stream:
+            continue
+        payload = _decode_stream(obj)
+        if not payload:
+            continue
+        n_val = obj.dict.get('N')
+        first_val = obj.dict.get('First')
+        if not (n_val and n_val[0] == 'num' and first_val
+                and first_val[0] == 'num'):
+            continue
+        count = int(n_val[1])
+        first = int(first_val[1])
+        # 头部是 count 组 (对象号, 相对偏移) 的十进制整数
+        nums = [int(x) for x in re.findall(rb'\d+', payload[:first])]
+        if len(nums) < count * 2:
+            continue
+        for i in range(count):
+            onum = nums[2 * i]
+            offset = nums[2 * i + 1]
+            end = (nums[2 * i + 3] if i + 1 < count
+                   else len(payload) - first)
+            start = first + offset
+            if start < 0 or end < 0 or end <= start:
+                continue
+            if onum in by_num:
+                # 文件里已经有这个对象的直接版本，直接版本优先
+                continue
+            member = _parse_objstm_member(onum, payload[start:first + end])
+            if member is not None:
+                objects.append(member)
+                by_num[onum] = member
 
 
 # ----------------------------------------------------------------------
@@ -1158,19 +1227,35 @@ def _extract_content_text(content: bytes, fonts, global_info) -> str:
     # 当前行起点（文本空间坐标）。Tm 绝对设置，TD/Td/T* 相对累加。
     line_x = None
     line_y = None
-    font_size = 0.0
     leading = 0.0
 
     def resolve(raw: bytes) -> str:
+        """把一段字符码解成文本。
+
+        三条路径（优先级从高到低）：
+        1. 页面 /Resources 里精确找到这个字体 -> 只用它自己的 CMap /
+           预定义 CMap；两者都没有就是普通字体（WinAnsi 等），按
+           latin-1 解。
+        2. 找不到页面-字体对应 -> 退回全局合并 CMap（见模块说明）。
+        """
         info = fonts.get(cur_font) if fonts else None
         if info is None:
-            info = global_info
+            # 没有精确对应：用全局合并表兜底（正确率不如精确匹配，
+            # 但不会因为找不到页面资源而整篇抽不出字）
+            gmap, gwidth, _gcodec = global_info
+            return _decode_bytes(raw, gmap, gwidth, gmap, gwidth)
         cmap, width, codec = info
         if codec:
             # 预定义 CMap（GBK/Big5/Shift-JIS 等）：字符码是变长的多字节
             # 序列，必须整串解码，逐字节解会把汉字劈成两半。
             return _decode_with_codec(raw, codec)
-        return _decode_bytes(raw, cmap, width, global_info[0], global_info[1])
+        if cmap:
+            # 有自己的 ToUnicode：命中不了就按 latin-1 兜底。
+            # 绝不能在这里套用全局表——同一篇 PDF 里多个子集字体会把
+            # 相同的字符码映射成不同的字，全局表会把正确的字覆盖成别的字。
+            return _decode_bytes(raw, cmap, width, None, 0)
+        # 普通字体（WinAnsi/MacRoman/Standard 编码）：直接按 latin-1 解
+        return _decode_bytes(raw, {}, width, None, 0)
 
     def is_cjk_font() -> bool:
         """当前字体是不是中日韩字体。
@@ -1249,10 +1334,9 @@ def _extract_content_text(content: bytes, fonts, global_info) -> str:
 
         op = val
         if op == 'Tf':
+            # 操作数是 <字体名> <字号>
             if len(stack) >= 2 and stack[-2][0] == 'name':
                 cur_font = stack[-2][1]
-            if stack and stack[-1][0] == 'num':
-                font_size = stack[-1][1]
             stack = []
         elif op == 'Tj':
             if stack and stack[-1][0] == 'str':

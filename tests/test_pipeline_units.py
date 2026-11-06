@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import threading
 import unittest
 import urllib.request
 
@@ -828,3 +829,95 @@ class TestDesignDiversification(unittest.TestCase):
         out = run._diversify(['0', '1', '9'], 2)
         self.assertEqual(len(out), 2)
         self.assertEqual(len(set(out)), 2, '不能出现重复项')
+
+
+class TestEvidencePoolReuse(unittest.TestCase):
+    """连续提问模式的证据池复用。
+
+    背景：用户的真实用法是「围绕一个课题反复追问」。
+    同一篇文献重读一次是一次完整的模型调用，而抽取结果几乎必然一样——
+    沿用上一轮已精读过的文献，追问的成本因此从
+    「检索+全量精读+审稿+成文」降到「检索+只精读新文献+审稿+成文」。
+    """
+
+    def _run(self, prior=None):
+        run = pipeline.Run.__new__(pipeline.Run)
+        run.cfg = {'runtime': {'temperature_reader': 0.1},
+                   'retrieval': {}}
+        run.trace = {'timings': {}, 'models': {}, 'errors': [], 'tokens': {}}
+        run.log = lambda m: None
+        run.prior_evidence = list(prior or [])
+        run._prior_map = {
+            (d.get('_citation_key') or d.get('pmid')): d
+            for d in run.prior_evidence if d
+        }
+        run.cache_hits = 0
+        run.router = type('R', (), {'chat': lambda self, *a, **k: {
+            'content': '{}', 'model': 'm', 'elapsed': 0.1, 'tokens': 1}})()
+        run.pubmed = type('P', (), {'fulltext': lambda self, p: {
+            'source': '', 'text': '', 'figure_captions': []}})()
+        run.dir = '.'
+        run.no_fulltext = []
+        run.plan = {'core_question_en': 'Q'}
+        run.question = 'Q'
+        # 精读要走「全文名额」计数器，它靠这把锁保证并发下不超发
+        run._ft_lock = threading.Lock()
+        run._ft_claimed = 0
+        return run
+
+    def _paper(self, pmid):
+        return {'pmid': pmid, 'title': f'T{pmid}', 'journal': 'J', 'year': '2024',
+                'abstract': 'x' * 300, 'pub_types': ['Journal Article'],
+                'mesh': [], 'keywords': [], 'doi': '', 'pmcid': ''}
+
+    def test_prior_map_is_keyed_by_citation_key(self):
+        run = self._run([{'_citation_key': '111', 'pmid': '111',
+                           'key_findings': ['a']}])
+        self.assertIn('111', run._prior_map)
+
+    def test_reused_evidence_is_returned_without_model_call(self):
+        """命中已有证据时不应该再调模型。"""
+        prior = {'_citation_key': '111', 'pmid': '111', 'relevance': 5,
+                 'key_findings': ['已抽好的结论'], '_text_source': 'fulltext'}
+        run = self._run([prior])
+        called = {'n': 0}
+
+        def boom(*a, **k):
+            called['n'] += 1
+            raise RuntimeError('不该调模型')
+
+        run.router = type('R', (), {'chat': staticmethod(boom)})()
+        got = run.read_one('111', self._paper('111'))
+        self.assertIsNotNone(got)
+        self.assertEqual(called['n'], 0, '命中缓存就不该调模型')
+        self.assertEqual(run.cache_hits, 1)
+
+    def test_reused_evidence_is_marked(self):
+        """复用项要打标记，读者才知道它是上一轮的抽取结果。"""
+        prior = {'_citation_key': '111', 'pmid': '111', 'relevance': 5,
+                 'key_findings': ['a'], '_text_source': 'fulltext'}
+        run = self._run([prior])
+        got = run.read_one('111', self._paper('111'))
+        self.assertTrue(got.get('_reused'))
+
+    def test_reuse_does_not_mutate_the_original(self):
+        """不能污染上一轮的证据对象（下一轮还要继续用）。"""
+        prior = {'_citation_key': '111', 'pmid': '111', 'relevance': 5,
+                 'key_findings': ['a'], '_text_source': 'fulltext'}
+        run = self._run([prior])
+        got = run.read_one('111', self._paper('111'))
+        got['relevance'] = 99
+        self.assertEqual(prior['relevance'], 5, '原对象不该被改')
+
+    def test_new_paper_is_not_reused(self):
+        """没在上一轮出现过的文献要走正常精读流程。"""
+        run = self._run([{'_citation_key': '111', 'pmid': '111'}])
+        got = run.read_one('222', self._paper('222'))
+        # 正常精读会因为 JSON 解析失败返回 None，但**不该**命中缓存
+        self.assertIsNone(got)
+        self.assertEqual(run.cache_hits, 0)
+
+    def test_empty_prior_pool_is_fine(self):
+        run = self._run([])
+        self.assertEqual(run._prior_map, {})
+        self.assertEqual(run.cache_hits, 0)
